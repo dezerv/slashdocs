@@ -141,7 +141,7 @@ cat >"$TMP/report.html" <<EOF
   <body>
     <h1>Quarterly revenue report</h1>
     <p>Total revenue grew 42 percent.</p>
-    <img alt="chart" src="data:image/png;base64,$PNG">
+    <img id="chart" alt="chart" src="data:image/png;base64,$PNG">
   </body>
 </html>
 EOF
@@ -155,8 +155,10 @@ diff -q "$TMP/report.html" "$TMP/pulled.html" >/dev/null || fail "pulled HTML di
 pass "document pulled back and diffed clean"
 
 V1="$(cli docs show "$DOC" | jsonget current_version_id)"
-sed 's/42 percent/43 percent/' "$TMP/report.html" >"$TMP/report-v2.html"
-cli docs push "$DOC" "$TMP/report-v2.html" --summary "e2e: revise growth number" >/dev/null
+# A push sends the base that the pull recorded for the file, so the change
+# goes into the pulled file.
+sed 's/42 percent/43 percent/' "$TMP/report.html" >"$TMP/pulled.html"
+cli docs push "$DOC" "$TMP/pulled.html" --summary "e2e: revise growth number" >/dev/null
 V2="$(cli docs show "$DOC" | jsonget current_version_id)"
 [[ "$V2" == ver_* && "$V2" != "$V1" ]] || fail "new version ($V1 -> $V2)"
 VERSIONS="$(cli docs versions list "$DOC")"
@@ -222,6 +224,13 @@ pass "comment replied"
 cli docs comments resolve "$DOC" "$CMT" >/dev/null
 cli docs comments list "$DOC" --status resolved | grep -q "$CMT" || fail "comment not resolved"
 pass "comment resolved"
+
+PIN="$(cli docs comments create "$DOC" --version "$V2" --target chart --x 0.5 --y 0.25 \
+  --label "Revenue chart" --body "Label the axis." | jsonget id)"
+[[ "$PIN" == cmt_* ]] || fail "point comment create ($PIN)"
+"$TMP/slashdocs" --server "$APP" --token "$SA_TOKEN" docs comments list "$DOC" \
+  | grep -Fq "pin=Revenue chart" || fail "CLI point comment label"
+pass "point comment pinned to the chart ($PIN)"
 
 # --- Share / grants ----------------------------------------------------------
 

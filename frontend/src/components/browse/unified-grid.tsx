@@ -3,11 +3,15 @@ import { useQuery } from "@tanstack/react-query";
 import { FileText, Folder as FolderIcon, Trash2 } from "lucide-react";
 import { useDraggable, useDroppable } from "@dnd-kit/core";
 import { Button } from "@/components/ui/button";
+import { revealOnHover } from "@/components/ui/misc";
+import { RelativeTime } from "@/components/ui/relative-time";
 import { DeleteDocumentDialog } from "@/components/delete-document-dialog";
 import { api, docID, docTitle, type FolderEntry, type Principal } from "@/api";
+import { cn } from "@/lib/cn";
 import { queryKeys } from "@/lib/queryKeys";
 import { principalLabel, samePrincipal } from "@/lib/principals";
 import { DRAG_TYPE } from "./drag";
+import { AccessRequestMark } from "./access-request-mark";
 import { PinButton, PinnedMark } from "./pin-button";
 import { SearchSnippet } from "./search-snippet";
 import {
@@ -35,6 +39,7 @@ export function UnifiedGrid({
               id={e.folder.id}
               title={e.folder.title}
               owner={e.folder.owner}
+              updated={e.last_active}
               canDelete={samePrincipal(me.data?.principal, e.folder.owner)}
               pinned={pinnedIds?.has(e.folder.id)}
             />
@@ -48,6 +53,7 @@ export function UnifiedGrid({
               id={docID(e.document)}
               title={docTitle(e.document)}
               owner={e.document.owner}
+              updated={e.last_active}
               canDelete={samePrincipal(me.data?.principal, e.document.owner)}
               pinned={pinnedIds?.has(docID(e.document))}
               snippet={e.document.snippet}
@@ -65,6 +71,7 @@ function DraggableEntryCard({
   id,
   title,
   owner,
+  updated,
   canDelete,
   pinned,
   snippet,
@@ -73,6 +80,7 @@ function DraggableEntryCard({
   id: string;
   title: string;
   owner?: Principal;
+  updated?: string;
   canDelete: boolean;
   pinned?: boolean;
   snippet?: string;
@@ -105,7 +113,7 @@ function DraggableEntryCard({
     >
       <Link
         to={isFolder ? `/app/folders/${id}` : `/app/d/${id}`}
-        className="flex h-40 cursor-default flex-col p-4"
+        className="flex min-h-40 cursor-default flex-col p-4"
         draggable={false}
       >
         <span className="flex items-center gap-2">
@@ -117,18 +125,24 @@ function DraggableEntryCard({
             )}
           </span>
           {pinned && <PinnedMark />}
+          {isFolder ? null : <AccessRequestMark documentId={id} />}
         </span>
-        {snippet && (
-          <SearchSnippet text={snippet} className="mt-3 line-clamp-2 text-xs" />
-        )}
-        <span className="mt-auto min-w-0">
+        <div className="mt-auto min-w-0 pt-3">
           <span className="line-clamp-2 font-heading text-[15px] font-medium leading-snug">
             {title}
           </span>
+          {snippet && (
+            <SearchSnippet text={snippet} className="mt-1 line-clamp-2 text-xs" />
+          )}
           <span className="mt-1 block truncate text-xs text-[var(--color-fg-muted)]">
             {principalLabel(owner)}
           </span>
-        </span>
+          {updated && (
+            <span className="block truncate text-xs text-[var(--color-fg-muted)]">
+              <RelativeTime iso={updated} />
+            </span>
+          )}
+        </div>
       </Link>
       <GridCardActions
         resourceType={type}
@@ -140,6 +154,9 @@ function DraggableEntryCard({
     </div>
   );
 }
+
+// A 32px card action. The pseudo-element makes a 40px touch target.
+const CARD_ACTION = "relative h-8 w-8 after:absolute after:-inset-1";
 
 function GridCardActions({
   resourceType,
@@ -154,10 +171,13 @@ function GridCardActions({
   title: string;
   pinned?: boolean;
 }) {
-  const del = useDeleteResource(resourceType, resourceId);
+  const del = useDeleteResource(resourceType, resourceId, title);
   return (
     <div
-      className="absolute right-2 top-2 flex gap-0.5 opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100 [&_button]:cursor-pointer"
+      className={cn(
+        "absolute right-2 top-2 flex gap-2 transition-opacity [&_button]:cursor-pointer",
+        revealOnHover,
+      )}
       onClick={(e) => e.stopPropagation()}
       onPointerDown={(e) => e.stopPropagation()}
     >
@@ -165,7 +185,7 @@ function GridCardActions({
         resourceType={resourceType}
         resourceId={resourceId}
         pinned={pinned}
-        className="h-7 w-7"
+        className={CARD_ACTION}
       />
       {canDelete && (
         <DeleteDocumentDialog
@@ -178,11 +198,14 @@ function GridCardActions({
             <Button
               variant="ghost"
               size="icon"
-              className="h-7 w-7"
+              className={cn(
+                CARD_ACTION,
+                "text-[var(--color-fg-muted)] hover:text-[var(--color-danger)]",
+              )}
               aria-label="Delete"
               onClick={(e) => e.stopPropagation()}
             >
-              <Trash2 className="h-3.5 w-3.5 text-[var(--color-danger)]" />
+              <Trash2 className="h-3.5 w-3.5" />
             </Button>
           }
         />

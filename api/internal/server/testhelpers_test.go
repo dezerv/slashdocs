@@ -73,6 +73,7 @@ func principalHeader(p auth.Principal) string {
 // grants on the document.
 type testEnv struct {
 	t     *testing.T
+	srv   *server.Server
 	h     http.Handler
 	store *pgrepo.Store
 
@@ -97,7 +98,7 @@ func newConfiguredTestEnv(t *testing.T, cfg server.Config, extraOptions ...serve
 	}
 
 	var err error
-	e.doc, e.ver, err = store.CreateDocument(ctx, fixtureOwner, "fixture", []byte("<html><body>fixture</body></html>"))
+	e.doc, e.ver, err = store.CreateDocument(ctx, fixtureOwner, "fixture", "", []byte("<html><body>fixture</body></html>"))
 	if err != nil {
 		t.Fatalf("seed document: %v", err)
 	}
@@ -109,7 +110,7 @@ func newConfiguredTestEnv(t *testing.T, cfg server.Config, extraOptions ...serve
 			t.Fatalf("seed grant: %v", err)
 		}
 	}
-	e.cmt, err = store.CreateComment(ctx, e.doc.ID, e.ver.ID, "original", repo.Anchor{Quote: "fixture"}, fixtureCommenter, nil)
+	e.cmt, err = store.CreateComment(ctx, e.doc.ID, e.ver.ID, "original", repo.Anchor{Quote: "fixture"}, 0, fixtureCommenter, nil)
 	if err != nil {
 		t.Fatalf("seed comment: %v", err)
 	}
@@ -132,7 +133,8 @@ func newConfiguredTestEnv(t *testing.T, cfg server.Config, extraOptions ...serve
 		server.WithDocumentKVEvents(eventBroker),
 	}
 	options = append(options, extraOptions...)
-	e.h = server.New(cfg, options...).Handler()
+	e.srv = server.New(cfg, options...)
+	e.h = e.srv.Handler()
 	return e
 }
 

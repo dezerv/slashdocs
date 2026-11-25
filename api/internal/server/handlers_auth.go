@@ -1,12 +1,15 @@
 package server
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
+	"slices"
 	"strings"
 	"time"
 
@@ -205,8 +208,18 @@ func (h handlers) oauthCallback(c *gin.Context) {
 		c.JSON(http.StatusForbidden, errorResponse("forbidden", "account domain is not allowed", nil))
 		return
 	}
-	uid, externalSubject := oidcIdentityKeys(h.deps.oidc.Issuer, u.Sub)
-	p, err := h.deps.repository.UpsertGoogleUser(c.Request.Context(), uid, u.Email, u.Name, externalSubject, u.PictureURL)
+	p, err := h.signInOIDCUser(c.Request.Context(), u)
+	var conflict *repo.EmailIdentityConflictError
+	if errors.As(err, &conflict) {
+		slog.WarnContext(c.Request.Context(), "oidc sign-in email belongs to another identity",
+			slog.String("issuer", h.deps.oidc.Issuer),
+			slog.String("email", conflict.Email),
+			slog.String("existing_identity", conflict.ExistingIdentity),
+			slog.String("incoming_identity", conflict.IncomingIdentity))
+		incAuth(metricKind, "identity_conflict")
+		c.JSON(http.StatusConflict, errorResponse("conflict", "this email is already linked to another sign-in identity; see docs/self-hosting.md#generic-oidc-providers", nil))
+		return
+	}
 	if err != nil {
 		internalErr(c, err)
 		return
@@ -238,6 +251,36 @@ func (h handlers) oauthCallback(c *gin.Context) {
 		redir = "/"
 	}
 	c.Redirect(http.StatusFound, redir)
+}
+
+// signInOIDCUser creates or updates the user of a verified ID token.
+//
+// Generic OIDC identity keys hash the issuer URL, so a change to
+// SLASHDOCS_OIDC_ISSUER_URL gives every user a new key. When the email of the
+// token belongs to a user whose key is the same subject under one of
+// SLASHDOCS_OIDC_PREVIOUS_ISSUER_URLS, that user moves to the new key. Any
+// other key stays a conflict: a new subject with a known email can be a
+// recreated or recycled account at the IdP, which must not inherit the old
+// user's documents.
+func (h handlers) signInOIDCUser(ctx context.Context, u auth.OIDCUser) (auth.Principal, error) {
+	uid, externalSubject := oidcIdentityKeys(h.deps.oidc.Issuer, u.Sub)
+	p, err := h.deps.repository.UpsertGoogleUser(ctx, uid, u.Email, u.Name, externalSubject, u.PictureURL)
+	var conflict *repo.EmailIdentityConflictError
+	if !errors.As(err, &conflict) || !h.previousOIDCIdentity(conflict.ExistingIdentity, u.Sub) {
+		return p, err
+	}
+	switch err := h.deps.repository.RelinkUserIdentity(ctx, conflict.ExistingIdentity, externalSubject); {
+	case errors.Is(err, repo.ErrNotFound):
+		return p, conflict
+	case err != nil:
+		return auth.Principal{}, err
+	}
+	slog.WarnContext(ctx, "relinked user to a new oidc identity",
+		slog.String("issuer", h.deps.oidc.Issuer),
+		slog.String("email", u.Email),
+		slog.String("old_identity", conflict.ExistingIdentity),
+		slog.String("new_identity", externalSubject))
+	return h.deps.repository.UpsertGoogleUser(ctx, uid, u.Email, u.Name, externalSubject, u.PictureURL)
 }
 
 func oidcAuthMetricKind(issuer string) string {
@@ -274,7 +317,16 @@ func oidcIdentityKeys(issuer, subject string) (userID, externalSubject string) {
 	}
 	digest := sha256.Sum256([]byte("aidocs-oidc-subject-v1\x00" + issuer + "\x00" + subject))
 	namespace := hex.EncodeToString(digest[:])
-	return oidcUserIDPrefix + namespace, "oidc_sha256_" + namespace
+	return oidcUserIDPrefix + namespace, oidcIdentityPrefix + namespace
+}
+
+// previousOIDCIdentity reports whether identity is the key of subject under
+// one of the previous issuers.
+func (h handlers) previousOIDCIdentity(identity, subject string) bool {
+	return slices.ContainsFunc(h.deps.previousOIDCIssuers, func(issuer string) bool {
+		_, previous := oidcIdentityKeys(issuer, subject)
+		return previous == identity
+	})
 }
 
 func webOAuthStateCookieName(state string, secure bool) string {

@@ -6,7 +6,11 @@ export const queryKeys = {
   documents: () => ["documents"] as const,
   document: (id: string) => ["document", id] as const,
   versions: (doc: string) => ["versions", doc] as const,
-  render: (docId: string, version: string) => ["render", docId, version] as const,
+  // load is the number of the frame load that the render URL is for, where
+  // each load takes its own URL.
+  // frame names the frame that asks: each one has its own tokens.
+  render: (docId: string, version: string, load: number, frame: string) =>
+    ["render", docId, version, load, frame] as const,
   comments: (doc: string) => ["comments", doc] as const,
   serviceAccounts: () => ["service-accounts"] as const,
   serviceAccountKeys: (id: string) => ["service-account-keys", id] as const,
@@ -19,9 +23,17 @@ export const queryKeys = {
   folderAccessAll: () => ["folder-access"] as const,
   folderAccess: (id: string) => ["folder-access", id] as const,
   documentAccess: (id: string) => ["document-access", id] as const,
+  documentAccessRequests: (id: string) => ["document-access-requests", id] as const,
+  managedAccessRequests: () => ["access-requests"] as const,
+  inbox: () => ["inbox"] as const,
   pins: () => ["pins"] as const,
   featured: () => ["featured"] as const,
   // Prefix key matching every people search. Grants change who is a contact.
   userSearchAll: () => ["users", "search"] as const,
   userSearch: (query: string) => ["users", "search", query] as const,
+  approvers: (doc: string) => ["approvers", doc] as const,
+  approvals: (doc: string, version?: string) =>
+    ["approvals", doc, version || "current"] as const,
+  // Prefix key matching approval decisions for every version of a document.
+  approvalsAll: (doc: string) => ["approvals", doc] as const,
 };

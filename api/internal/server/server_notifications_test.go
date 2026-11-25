@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"slices"
 	"testing"
 
+	"github.com/razorpay/slashdocs/api/internal/auth"
 	"github.com/razorpay/slashdocs/api/internal/repo"
 )
 
@@ -35,13 +37,157 @@ func TestNotificationPreferencesArePersonalAndRequireDocumentAccess(t *testing.T
 	}
 }
 
-func TestDocumentLinksEnforceAccessAndDocumentMembership(t *testing.T) {
+// The server records an access request also when no notification channel is
+// set, and the people who manage access can read it until they grant access.
+func TestAccessRequestsAreRecordedWithoutNotifications(t *testing.T) {
 	e := newTestEnv(t)
-	other, ver, err := e.store.CreateDocument(context.Background(), fixtureOwner, "other", []byte("<h1>Other</h1>"))
+	path := "/v1/documents/" + e.doc.ID + "/access-requests"
+	as := func(p auth.Principal) map[string]string {
+		return map[string]string{"X-Test-Principal": principalHeader(p), "Content-Type": "application/json"}
+	}
+	rr := do(t, e.h, http.MethodPost, path, `{}`, as(fixtureStranger))
+	assertStatus(t, rr, http.StatusAccepted)
+	assertJSON(t, rr.Body.Bytes(), `{"status":"sent"}`)
+	var queued int
+	if err := e.store.Pool().QueryRow(context.Background(), "SELECT count(*) FROM document_access_request_notification_outbox").Scan(&queued); err != nil || queued != 0 {
+		t.Fatalf("queued=%d err=%v, want no notification without a channel", queued, err)
+	}
+
+	for _, p := range []auth.Principal{fixtureOwner, fixtureEditor} {
+		rr = do(t, e.h, http.MethodGet, path, "", as(p))
+		assertStatus(t, rr, http.StatusOK)
+		var got struct{ Items []repo.AccessRequest }
+		if err := json.Unmarshal(rr.Body.Bytes(), &got); err != nil {
+			t.Fatal(err)
+		}
+		if len(got.Items) != 1 || got.Items[0].Requester.ID != fixtureStranger.ID ||
+			got.Items[0].Requester.Email != fixtureStranger.Email || got.Items[0].RequestedAt == "" {
+			t.Fatalf("%s: access requests = %+v, want the stranger's request", p.ID, got.Items)
+		}
+	}
+	// Others see only their own request.
+	rr = do(t, e.h, http.MethodGet, path, "", as(fixtureViewer))
+	assertStatus(t, rr, http.StatusOK)
+	assertJSON(t, rr.Body.Bytes(), `{"items":[]}`)
+	rr = do(t, e.h, http.MethodGet, path, "", as(fixtureStranger))
+	assertStatus(t, rr, http.StatusOK)
+	var own struct{ Items []repo.AccessRequest }
+	if err := json.Unmarshal(rr.Body.Bytes(), &own); err != nil {
+		t.Fatal(err)
+	}
+	if len(own.Items) != 1 || own.Items[0].Requester.ID != fixtureStranger.ID {
+		t.Fatalf("own access requests = %+v, want the stranger's request", own.Items)
+	}
+
+	rr = do(t, e.h, http.MethodPost, "/v1/documents/"+e.doc.ID+"/grants", `{"address":"`+fixtureStranger.Email+`","role":"viewer"}`, as(fixtureOwner))
+	assertStatus(t, rr, http.StatusCreated)
+	rr = do(t, e.h, http.MethodGet, path, "", as(fixtureOwner))
+	assertStatus(t, rr, http.StatusOK)
+	assertJSON(t, rr.Body.Bytes(), `{"items":[]}`)
+}
+
+// A person who manages access can decline a request. The request goes away
+// with its notification, and the requester can ask again.
+func TestAccessRequestDecline(t *testing.T) {
+	e := newTestEnv(t)
+	e.store.SetNotificationsEnabled(true)
+	path := "/v1/documents/" + e.doc.ID + "/access-requests"
+	declinePath := path + "/user/" + fixtureStranger.ID
+	as := func(p auth.Principal) map[string]string {
+		return map[string]string{"X-Test-Principal": principalHeader(p), "Content-Type": "application/json"}
+	}
+	queued := func() (n int) {
+		if err := e.store.Pool().QueryRow(context.Background(), "SELECT count(*) FROM document_access_request_notification_outbox").Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	assertStatus(t, do(t, e.h, http.MethodPost, path, `{}`, as(fixtureStranger)), http.StatusAccepted)
+	if n := queued(); n != 1 {
+		t.Fatalf("queued=%d, want the owner's notification", n)
+	}
+
+	assertStatus(t, do(t, e.h, http.MethodDelete, declinePath, "", as(fixtureViewer)), http.StatusForbidden)
+	assertStatus(t, do(t, e.h, http.MethodDelete, path+"/anyone/x", "", as(fixtureOwner)), http.StatusBadRequest)
+	assertStatus(t, do(t, e.h, http.MethodDelete, declinePath, "", as(fixtureEditor)), http.StatusNoContent)
+	if n := queued(); n != 0 {
+		t.Fatalf("queued=%d after decline, want none", n)
+	}
+	for _, p := range []auth.Principal{fixtureOwner, fixtureStranger} {
+		rr := do(t, e.h, http.MethodGet, path, "", as(p))
+		assertStatus(t, rr, http.StatusOK)
+		assertJSON(t, rr.Body.Bytes(), `{"items":[]}`)
+	}
+
+	assertStatus(t, do(t, e.h, http.MethodPost, path, `{}`, as(fixtureStranger)), http.StatusAccepted)
+	rr := do(t, e.h, http.MethodGet, path, "", as(fixtureStranger))
+	var got struct{ Items []repo.AccessRequest }
+	if err := json.Unmarshal(rr.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Items) != 1 {
+		t.Fatalf("access requests after a new request = %+v, want one", got.Items)
+	}
+}
+
+// The list across documents names each document, and shows a request only to
+// the people who manage access, also through a folder.
+func TestManagedAccessRequestsFollowTheEditorRole(t *testing.T) {
+	e := newTestEnv(t)
+	ctx := context.Background()
+	folder, err := e.store.CreateFolder(ctx, fixtureOwner, "Team", "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	cmt, err := e.store.CreateComment(context.Background(), other.ID, ver.ID, "Other comment", repo.Anchor{Quote: "Other"}, fixtureOwner, nil)
+	inFolder, _, err := e.store.CreateDocument(ctx, fixtureOwner, "In folder", folder.ID, []byte("<h1>In folder</h1>"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.store.CreateGrant(ctx, "folder", folder.ID, fixtureViewer, repo.RoleEditor, fixtureOwner); err != nil {
+		t.Fatal(err)
+	}
+	as := func(p auth.Principal) map[string]string {
+		return map[string]string{"X-Test-Principal": principalHeader(p), "Content-Type": "application/json"}
+	}
+	for _, id := range []string{e.doc.ID, inFolder.ID} {
+		assertStatus(t, do(t, e.h, http.MethodPost, "/v1/documents/"+id+"/access-requests", `{}`, as(fixtureStranger)), http.StatusAccepted)
+	}
+
+	for _, tc := range []struct {
+		principal auth.Principal
+		want      []string
+	}{
+		{fixtureOwner, []string{"In folder", e.doc.Title}},
+		{fixtureEditor, []string{e.doc.Title}},
+		{fixtureViewer, []string{"In folder"}},
+		{fixtureStranger, nil},
+	} {
+		rr := do(t, e.h, http.MethodGet, "/v1/access-requests", "", as(tc.principal))
+		assertStatus(t, rr, http.StatusOK)
+		var got struct{ Items []repo.DocumentAccessRequest }
+		if err := json.Unmarshal(rr.Body.Bytes(), &got); err != nil {
+			t.Fatal(err)
+		}
+		var titles []string
+		for _, item := range got.Items {
+			if item.Requester.ID != fixtureStranger.ID || item.DocumentID == "" || item.RequestedAt == "" {
+				t.Fatalf("%s: request = %+v, want the stranger's request with its document", tc.principal.ID, item)
+			}
+			titles = append(titles, item.DocumentTitle)
+		}
+		if !slices.Equal(titles, tc.want) {
+			t.Fatalf("%s: titles = %v, want %v", tc.principal.ID, titles, tc.want)
+		}
+	}
+}
+
+func TestDocumentLinksEnforceAccessAndDocumentMembership(t *testing.T) {
+	e := newTestEnv(t)
+	other, ver, err := e.store.CreateDocument(context.Background(), fixtureOwner, "other", "", []byte("<h1>Other</h1>"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmt, err := e.store.CreateComment(context.Background(), other.ID, ver.ID, "Other comment", repo.Anchor{Quote: "Other"}, 0, fixtureOwner, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

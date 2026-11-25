@@ -8,10 +8,64 @@ export const Sheet = DialogPrimitive.Root;
 export const SheetTrigger = DialogPrimitive.Trigger;
 export const SheetClose = DialogPrimitive.Close;
 
+// openFocus puts the focus of a dialog that opens on the dialog itself when
+// its close button is its first control, so that it does not open with a
+// ring on Close. Tab then goes to Close. Other dialogs focus their first
+// control, as Radix does.
+function openFocus(onOpenAutoFocus?: (event: Event) => void) {
+  return (event: Event) => {
+    onOpenAutoFocus?.(event);
+    const content = event.currentTarget as HTMLElement;
+    const first = content.querySelector(
+      "a[href], button, input, select, textarea, [tabindex]:not([tabindex='-1'])",
+    );
+    if (event.defaultPrevented || !first?.hasAttribute("data-dialog-close")) return;
+    event.preventDefault();
+    content.focus();
+  };
+}
+
+// The control that opened a layer. A menu goes as its dialog opens, so for an
+// item of a menu it is the button of the menu, which stays.
+function opener(): HTMLElement | null {
+  const active = document.activeElement as HTMLElement | null;
+  const menu = active?.closest('[role="menu"]');
+  const button =
+    menu && document.getElementById(menu.getAttribute("aria-labelledby") || "");
+  return button || active;
+}
+
+// useLayerFocus focuses a layer that opens as openFocus does. When the layer
+// closes, the focus goes back to the control that opened it, if it is still
+// there.
+export function useLayerFocus({
+  onOpenAutoFocus,
+  onCloseAutoFocus,
+}: {
+  onOpenAutoFocus?: (event: Event) => void;
+  onCloseAutoFocus?: (event: Event) => void;
+}) {
+  const back = React.useRef<HTMLElement | null>(null);
+  return {
+    onOpenAutoFocus: (event: Event) => {
+      back.current = opener();
+      openFocus(onOpenAutoFocus)(event);
+    },
+    onCloseAutoFocus: (event: Event) => {
+      onCloseAutoFocus?.(event);
+      if (event.defaultPrevented || !back.current?.isConnected) return;
+      event.preventDefault();
+      back.current.focus();
+    },
+  };
+}
+
 export function SheetContent({
   className,
   children,
   side = "right",
+  onOpenAutoFocus,
+  onCloseAutoFocus,
   ...p
 }: React.ComponentPropsWithoutRef<typeof DialogPrimitive.Content> & {
   side?: "right" | "left";
@@ -27,11 +81,13 @@ export function SheetContent({
             : "left-0 border-r sheet-left",
           className,
         )}
+        {...useLayerFocus({ onOpenAutoFocus, onCloseAutoFocus })}
         {...p}
       >
         {children}
         <Tooltip label="Close panel">
           <DialogPrimitive.Close
+            data-dialog-close
             aria-label="Close panel"
             className="absolute right-2 top-0 inline-flex h-14 w-12 items-center justify-center rounded-md text-[var(--color-fg-muted)] transition-[background-color,color,transform] duration-150 ease-out active:scale-[0.96] hover:bg-[var(--color-surface-muted)] hover:text-[var(--color-fg)]"
           >
@@ -66,4 +122,18 @@ export function SheetTitle({
 }
 export function SheetBody({ className, ...p }: React.HTMLAttributes<HTMLDivElement>) {
   return <div className={cn("flex-1 overflow-y-auto p-6", className)} {...p} />;
+}
+
+// The grab handle at the top of a bottom sheet, which shows that the panel is
+// a sheet over the page.
+export function SheetHandle({ className }: { className?: string }) {
+  return (
+    <div
+      aria-hidden
+      className={cn(
+        "mx-auto mt-2 h-1 w-9 shrink-0 rounded-full bg-[var(--color-border-strong)]",
+        className,
+      )}
+    />
+  );
 }

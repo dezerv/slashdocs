@@ -69,18 +69,39 @@ Publish a new document:
   slashdocs docs create report.html --title 'Report'
 
 Push an update to an existing document:
-  slashdocs docs push <doc_id> report.html --base-version <version_id> --summary 'Address comments'
+  slashdocs docs pull <doc_id> --out report.html
+  (edit report.html)
+  slashdocs docs push <doc_id> report.html --summary 'Address comments'
+
+Change existing text without uploading the file again:
+  slashdocs docs edit <doc_id> --old 'TTL of 10 minutes' --new 'TTL of 5 minutes'
+
+Each --old must occur exactly once in the current HTML; add surrounding text to
+make it unique, or pass --all to replace every occurrence. Repeat --old/--new
+for several edits, or pass --edits edits.json. If one edit does not match,
+nothing is saved. Prefer edit for small changes: the rest of the document stays
+byte-for-byte the same and comments elsewhere stay anchored.
 
 Write one change per line in --summary; the version history shows each line
 as a list item.
 
-If you previously ran slashdocs docs pull <doc_id>, the CLI remembers that base
-version for the active context, so --base-version is optional.
+A pull with --out records which state of the document the file holds, and the
+push sends it. A push of a file with no recorded state is refused, so pull with
+--out before you edit, and push that file. When other people changed other
+text after your pull, the server merges your push with their edits, and the
+CLI writes the merged version into the file. When they changed the same text,
+the push is refused and their text stays: pull again, and make your change
+again.
 
 Publishing model:
   - Creating a document stores the uploaded HTML as version 1.
-  - Pushing HTML creates a new immutable version.
-  - The slashdocs UI is for review; agents and CLI/API publishers create versions.
+  - Pushing HTML, or editing its text, creates a new immutable version.
+  - People with the editor role edit the document live in the slashdocs UI,
+    several at once: words, paragraphs, lists, bold, italic and links. Each
+    edit reaches the document as they type, and changes only the HTML of the
+    element they edit. One sitting of edits is one version. The UI shows
+    versions as the document's history, where people preview and restore
+    them.
   - Runtime KV changes from uploaded HTML do not create versions; see:
       slashdocs guidelines interactivity kv
 
@@ -104,6 +125,11 @@ slashdocs renders uploaded HTML inside the document reader.
   - Links should be explicit and safe for a reader to open in a new tab.
   - If your document has scripts, make initialization idempotent; the render
     frame may reload as versions or theme settings change.
+  - Put text that people may fix in the HTML. Editors can change text that a
+    script shows only when it is exactly one string literal in an inline
+    script, or one string value in a <script type="application/json"> block.
+    Text that code builds, such as "Total: " + n, is read only in the browser:
+    editors ask an agent to change it.
 
 Useful next pages:
   slashdocs guidelines rendering theme
@@ -137,11 +163,18 @@ Theme: follow the reader's slashdocs theme.
 
   Notes:
   - "system" is resolved to a concrete light/dark before it reaches you.
+  - The attribute is set before your own scripts run, so read it at startup for
+    anything JS has to draw (charts, diagrams):
+      const theme = document.documentElement.getAttribute('data-slashdocs-theme');
   - The value updates live when the reader toggles; CSS reacts automatically.
-  - For JS, listen for the event on your own window:
+  - For JS, listen for the event on your own window. It fires once after the
+    page loads and again each time the reader toggles:
       window.addEventListener('slashdocs:theme', e => {
         // e.detail.theme is "light" or "dark"
       });
+  - Never call location.reload() on a theme change. Re-render the part that
+    depends on the theme instead; a reload fights the render bridge and can
+    leave the reader flickering.
   - Do NOT ship your own theme toggle. The slashdocs UI is the single control.
   - A document that never references data-slashdocs-theme keeps its hard-coded
     look, so theming is strictly opt-in.
@@ -180,9 +213,12 @@ Interactive documents are allowed.
     sets, checkboxes/toggles for binary state, inputs/sliders for numbers, and
     buttons for clear commands.
   - For links, make the target obvious in the visible text.
-  - For persisted document-local state such as approvals, tracker rows, and
-    dropdown selections, use the slashdocs KV primitive:
+  - For persisted document-local state such as tracker rows and dropdown
+    selections, use the slashdocs KV primitive:
       slashdocs guidelines interactivity kv
+  - For document sign-off, use the native approval workflow instead of
+    hand-rolled KV approval state:
+      slashdocs guidelines review approvals
   - For documents that render files from GitHub at read time, use the GitHub
     bridge rather than embedding credentials or fetching private URLs directly:
       slashdocs guidelines interactivity github
@@ -228,27 +264,28 @@ Print preparation is optional:
 	},
 	{
 		Path:    []string{"interactivity", "kv"},
-		Summary: "Persist approval states, tracker fields, dropdowns, and other document-local state.",
+		Summary: "Persist tracker fields, dropdowns, and other document-local state.",
 		Aliases: [][]string{{"kv"}, {"state"}, {"store"}, {"storage"}},
 		Body: `slashdocs guidelines: interactivity kv
 
 Uploaded HTML can use a document-scoped KV store through window.slashdocs.kv.
-This is for runtime state such as approvals, tracker fields, dropdown choices,
-checkboxes, and lightweight workflow metadata.
+This is for runtime state such as tracker fields, dropdown choices,
+checkboxes, and lightweight workflow metadata. (For document sign-off, prefer
+the native approval workflow: slashdocs guidelines review approvals.)
 
 API:
-  const value = await window.slashdocs.kv.get("approval:pm");
+  const value = await window.slashdocs.kv.get("tracker:owner");
   const all = await window.slashdocs.kv.all();
 
-  await window.slashdocs.kv.set("approval:pm", {
-    status: "approved",
+  await window.slashdocs.kv.set("tracker:owner", {
+    status: "done",
     by: "pm@example.com"
   });
 
-  await window.slashdocs.kv.delete("approval:pm");
+  await window.slashdocs.kv.delete("tracker:owner");
 
   await window.slashdocs.kv.patch({
-    "approval:pm": { status: "approved" },
+    "tracker:owner": { status: "done" },
     "tracker:old-row": null
   });
 
@@ -303,7 +340,7 @@ Small dropdown example:
   </select>
 
   <script>
-    const key = "approval:status";
+    const key = "tracker:status";
     const select = document.querySelector("#status");
 
     window.slashdocs.kv.get(key).then(value => {
@@ -447,6 +484,67 @@ Write documents for review, not just display.
   - Keep approval or tracker controls close to the content they affect.
   - Use KV for live document-local workflow state. Use versioned HTML updates for
     changes to the document template or source content.
+  - For formal sign-off, use the native approval workflow:
+      slashdocs guidelines review approvals
+
+Right after you publish for review, wait for the feedback:
+  slashdocs docs wait <doc_id>
+
+It returns the threads with new messages when the reviewer stops writing for 2
+minutes, and an approval or a rejection at once. Change the document or answer
+in each thread, reply in each thread with what you did, push, and wait again.
+Each wait gives only feedback that is new to you. Stop when the document is
+approved, or when the person tells you to stop.
+`,
+	},
+	{
+		Path:    []string{"review", "approvals"},
+		Summary: "Request and track document sign-off with the native approval workflow.",
+		Aliases: [][]string{{"approvals"}, {"approval"}, {"approve"}},
+		Body: `slashdocs guidelines: review approvals
+
+slashdocs has a first-class approval workflow. Prefer it over hand-rolled KV
+approval state: it is version-aware, server-enforced, and shows up in the
+reader UI and document listings.
+
+Model:
+  - The document owner assigns approvers. Approvers need viewer access first.
+    Anyone with access can be an approver, also a person who edited the
+    document. An approver who loses read access stops being an approver.
+  - Approvers approve or reject what the document says now. A decision vouches
+    for the content (its sha256), not for a version number.
+  - The document is "approved" only when every assigned approver approved.
+  - A new version with changed content resets every decision: the approvers
+    review it again. A version with the same content as an approved one, such
+    as a restore, shows that approval.
+  - Approvers can revoke their decision at any time.
+  - With chat notifications on (Slack or Google Chat), an approver hears when
+    they are asked, and the owner hears each approval or rejection.
+  - While other people type in the document, a decision is refused: decide
+    when they are done.
+  - A rejection needs either open comments of yours on the document (they say
+    what to change) or a reason; a note is optional when approving. Approving
+    with open comments in the UI asks you to confirm.
+
+Commands:
+  slashdocs docs approvers add <doc_id> --to reviewer@org.example
+  slashdocs docs approvers list <doc_id>
+  slashdocs docs approvers remove <doc_id> <approver_id>
+  slashdocs docs approvals list <doc_id> [--version <version_id>]
+  slashdocs docs approve <doc_id> [--version <version_id>] [--note "..."]
+  slashdocs docs reject <doc_id> [--note "what needs to change"]
+  slashdocs docs revoke-approval <doc_id> [--version <version_id>]
+
+The document response includes approval_status and approval_summary once
+approvers are assigned; use --json for machine-readable output.
+
+Over MCP, the owner's side is available (the rules above apply unchanged):
+  request_document_approval  ask a person or bot to approve (share first)
+  list_document_approvers    who was asked, with the approval-request IDs
+  list_document_approvals    what each decided on a version, and the status
+  remove_document_approver   take a request back
+Approving, rejecting and revoking are not available over MCP: an approval is the
+approver's own decision, made through the UI, the CLI or the API.
 `,
 	},
 }

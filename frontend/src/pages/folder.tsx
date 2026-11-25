@@ -7,6 +7,9 @@ import { useTitle } from "@/lib/use-title";
 import {
   ChevronRight,
   Folder as FolderIcon,
+  FolderInput,
+  KeyRound,
+  Link2,
   MoreHorizontal,
   Pencil,
   Plus,
@@ -15,8 +18,13 @@ import {
 } from "lucide-react";
 import { Page } from "@/components/layout/page";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-import { Center, Skeleton, EmptyState } from "@/components/ui/misc";
+import { Skeleton, EmptyState } from "@/components/ui/misc";
+import {
+  ErrorState,
+  LoadError,
+  LoadErrorLine,
+  PageError,
+} from "@/components/error-state";
 import {
   Dropdown,
   DropdownContent,
@@ -32,26 +40,26 @@ import {
   AlertDialogFooter,
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
-import {
-  Dialog,
-  DialogContent,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog";
-import { api, APIError, docID, type FolderEntry } from "@/api";
+import { api, type FolderEntry } from "@/api";
 import { canManageSharing } from "@/lib/constants";
 import { queryKeys } from "@/lib/queryKeys";
 import { samePrincipal } from "@/lib/principals";
-import { viewModeStore } from "@/lib/view-mode";
+import { folderSortStore, viewModeStore } from "@/lib/view-mode";
 import { ShareSheet } from "@/pages/doc-share-sheet";
 import { Sheet, SheetTrigger } from "@/components/ui/sheet";
 import { DRAG_TYPE, type ActiveDrag } from "@/components/browse/drag";
 import { BrowseDragOverlay } from "@/components/browse/drag-overlay";
 import { UnifiedGrid } from "@/components/browse/unified-grid";
 import { UnifiedTable } from "@/components/browse/unified-table";
-import { ViewModeToggle } from "@/components/browse/view-mode-toggle";
-import { AccessWarningDialog, NewFolderDialog } from "@/components/browse/dialogs";
+import { SortOrderToggle, ViewModeToggle } from "@/components/browse/view-mode-toggle";
+import {
+  AccessWarningDialog,
+  NewFolderDialog,
+  RenameFolderDialog,
+} from "@/components/browse/dialogs";
+import { MoveDialog } from "@/components/browse/move-dialog";
+import { useMoveResource } from "@/components/browse/use-resource-actions";
+import { sortEntries } from "@/components/browse/sort-entries";
 import { useBridgeHost } from "./use-bridge-host";
 import { useDocumentEvents } from "./use-document-stream";
 import {
@@ -64,8 +72,14 @@ import {
   type DragStartEvent,
 } from "@dnd-kit/core";
 
+// The route keeps the same element when only :id changes, so the key remounts
+// the page, and no dialog or late response carries over to another folder.
 export function FolderPage() {
   const { id = "" } = useParams();
+  return <FolderView key={id} id={id} />;
+}
+
+function FolderView({ id }: { id: string }) {
   const nav = useNavigate();
   const qc = useQueryClient();
 
@@ -73,11 +87,13 @@ export function FolderPage() {
     queryKey: queryKeys.folder(id),
     queryFn: () => api.getFolder(id),
     enabled: !!id,
+    meta: { suppressGlobalError: true },
   });
   const contents = useQuery({
     queryKey: queryKeys.folders(id),
     queryFn: () => api.listFolders(id),
     enabled: !!id,
+    meta: { suppressGlobalError: true },
   });
   const pins = useQuery({
     queryKey: queryKeys.pins(),
@@ -85,10 +101,11 @@ export function FolderPage() {
   });
   const me = useQuery({ queryKey: queryKeys.me(), queryFn: api.me });
   const isOwner = samePrincipal(me.data?.principal, folder.data?.owner);
+  // As for a document, the grants are asked for once the folder loads.
   const access = useQuery({
     queryKey: queryKeys.folderAccess(id),
     queryFn: () => api.folderAccess(id),
-    enabled: !!id && !!me.data?.principal && !isOwner,
+    enabled: !!folder.data && !!me.data?.principal && !isOwner,
     staleTime: 30_000,
   });
   const currentAccessRole = access.data?.current_role;
@@ -105,76 +122,27 @@ export function FolderPage() {
   const [newFolderOpen, setNewFolderOpen] = useState(false);
   const [renameOpen, setRenameOpen] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
-  const [renameTitle, setRenameTitle] = useState("");
+  const [moveOpen, setMoveOpen] = useState(false);
 
+  // A toast names the folder, so that it reaches a reader who left. Only a
+  // page that is still open closes its dialog or leaves.
   const delFolder = useMutation({
     mutationFn: () => api.deleteFolder(id),
     onSuccess: () => {
-      setDeleteOpen(false);
-      toast.success("Deleted folder.");
+      toast.success(`Deleted folder “${folder.data?.title}”.`);
       qc.invalidateQueries({ queryKey: queryKeys.foldersAll() });
       qc.invalidateQueries({ queryKey: queryKeys.documents() });
       qc.invalidateQueries({ queryKey: queryKeys.pins() });
       qc.removeQueries({ queryKey: queryKeys.folder(id) });
-      nav("/app/documents");
     },
     onError: (e) => toast.error(errorMessage(e, "Delete failed")),
-  });
-
-  const renameFolder = useMutation({
-    mutationFn: () => api.updateFolder(id, renameTitle),
-    onSuccess: () => {
-      setRenameOpen(false);
-      qc.invalidateQueries({ queryKey: queryKeys.folder(id) });
-      toast.success("Renamed.");
-    },
-    onError: (e) => toast.error(errorMessage(e, "Rename failed")),
   });
 
   const [activeDrag, setActiveDrag] = useState<ActiveDrag | null>(null);
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 8 } }),
   );
-  const [accessWarning, setAccessWarning] = useState<string | null>(null);
-
-  const moveMutation = useMutation({
-    mutationFn: async ({
-      dragType,
-      dragId,
-      targetFolderId,
-    }: {
-      dragType: string;
-      dragId: string;
-      targetFolderId: string;
-    }) => {
-      const isDoc = dragType === DRAG_TYPE.document;
-      if (targetFolderId === "__root__") {
-        if (isDoc) {
-          return api.moveDocumentToRoot(id, dragId);
-        } else {
-          return api.updateFolder(dragId, undefined, null);
-        }
-      }
-      if (!isDoc) {
-        return api.updateFolder(dragId, undefined, targetFolderId);
-      } else {
-        return api.moveDocumentToFolder(targetFolderId, dragId);
-      }
-    },
-    onSuccess: (data) => {
-      qc.invalidateQueries({ queryKey: queryKeys.foldersAll() });
-      qc.invalidateQueries({ queryKey: queryKeys.documents() });
-      qc.invalidateQueries({ queryKey: queryKeys.pins() });
-      const warning = (data as Record<string, unknown>)?.permission_warning as
-        { message?: string } | undefined;
-      if (warning?.message) {
-        setAccessWarning(warning.message);
-      } else {
-        toast.success("Moved.");
-      }
-    },
-    onError: (e) => toast.error(errorMessage(e, "Move failed")),
-  });
+  const { move, warning, clearWarning } = useMoveResource();
 
   if (folder.isLoading || contents.isLoading) {
     return (
@@ -184,19 +152,17 @@ export function FolderPage() {
       </Page>
     );
   }
-  if (folder.error || contents.error) {
-    const dependencyError = [folder.error, contents.error].some(
-      (error) =>
-        error instanceof APIError && error.code === "group_membership_unavailable",
-    );
+  if (folder.error)
     return (
-      <Center>
-        {dependencyError
-          ? "Google Group access is temporarily unavailable. Try again shortly; stale group content has not been shown."
-          : "Could not load folder."}
-      </Center>
+      <Page backdrop={false}>
+        <PageError
+          error={folder.error}
+          what="folder"
+          denied={<FolderAccessDenied />}
+          retry={folder}
+        />
+      </Page>
     );
-  }
 
   const f = folder.data!;
   const items = contents.data?.items || [];
@@ -229,7 +195,18 @@ export function FolderPage() {
     const targetFolderId = (over.id as string).replace("drop:", "");
     if (dragType === DRAG_TYPE.folder && dragId === targetFolderId) return;
     if (targetFolderId === id) return;
-    moveMutation.mutate({ dragType, dragId, targetFolderId });
+    const toRoot = targetFolderId === "__root__";
+    move.mutate({
+      type: dragType === DRAG_TYPE.folder ? "folder" : "document",
+      id: dragId,
+      from: id,
+      to: toRoot ? null : targetFolderId,
+      toTitle: toRoot
+        ? "Documents"
+        : [...breadcrumbs, ...items.flatMap((e) => (e.folder ? [e.folder] : []))].find(
+            (f) => f.id === targetFolderId,
+          )?.title,
+    });
   }
 
   return (
@@ -240,7 +217,8 @@ export function FolderPage() {
     >
       <Page>
         {/* Breadcrumbs */}
-        <nav className="mb-4 flex min-w-0 items-center gap-1 overflow-x-auto whitespace-nowrap text-sm text-[var(--color-fg-muted)]">
+        {/* The negative margin lines up the first crumb's text with the title. */}
+        <nav className="-ml-1.5 mb-4 flex min-w-0 items-center gap-1 overflow-x-auto whitespace-nowrap text-sm text-[var(--color-fg-muted)]">
           <DroppableBreadcrumb
             dropId="drop:__root__"
             to="/app/documents"
@@ -278,17 +256,17 @@ export function FolderPage() {
             </div>
           </div>
           <div className="flex items-center gap-2">
+            <SortOrderToggle folderId={id} />
             <ViewModeToggle />
             <Button
               variant="outline"
               size="md"
               onClick={() => setNewFolderOpen(true)}
-              aria-label="New folder"
-              tooltip="New folder"
+              aria-label="New subfolder"
               className="shrink-0 px-3 sm:px-4"
             >
               <Plus className="h-3.5 w-3.5 sm:mr-1.5" />
-              <span className="hidden sm:inline">New folder</span>
+              <span className="hidden sm:inline">New subfolder</span>
             </Button>
             <Sheet>
               <SheetTrigger asChild>
@@ -296,7 +274,6 @@ export function FolderPage() {
                   variant="outline"
                   size="sm"
                   aria-label="Share folder"
-                  tooltip="Share folder"
                   className="shrink-0 px-2.5 sm:px-3"
                 >
                   <Share2 className="h-3.5 w-3.5 sm:mr-1.5" />
@@ -311,21 +288,19 @@ export function FolderPage() {
             </Sheet>
             <Dropdown>
               <DropdownTrigger asChild>
-                <Button variant="ghost" size="icon" aria-label="More folder actions">
+                <Button variant="outline" size="icon" aria-label="More folder actions">
                   <MoreHorizontal className="h-4 w-4" />
                 </Button>
               </DropdownTrigger>
               <DropdownContent>
-                <DropdownItem
-                  onSelect={() => {
-                    setRenameTitle(f.title);
-                    setRenameOpen(true);
-                  }}
-                >
+                <DropdownItem onSelect={() => setRenameOpen(true)}>
                   <Pencil className="h-4 w-4" /> Rename
                 </DropdownItem>
                 <DropdownItem onSelect={() => setNewFolderOpen(true)}>
                   <Plus className="h-4 w-4" /> New subfolder
+                </DropdownItem>
+                <DropdownItem onSelect={() => setMoveOpen(true)}>
+                  <FolderInput className="h-4 w-4" /> Move folder
                 </DropdownItem>
                 <DropdownItem
                   onSelect={() => window.setTimeout(() => setDeleteOpen(true), 0)}
@@ -351,7 +326,12 @@ export function FolderPage() {
                 variant="danger"
                 onClick={(e) => {
                   e.preventDefault();
-                  delFolder.mutate();
+                  delFolder.mutate(undefined, {
+                    onSuccess: () => {
+                      setDeleteOpen(false);
+                      nav("/app/documents");
+                    },
+                  });
                 }}
               >
                 Delete
@@ -361,13 +341,44 @@ export function FolderPage() {
         </AlertDialog>
 
         {/* Contents */}
-        {visibleItems.length === 0 && !readme ? (
+        {contents.isRefetchError ? (
+          <LoadErrorLine boxed query={contents}>
+            Could not refresh what is in this folder. It may be out of date.
+          </LoadErrorLine>
+        ) : null}
+        {pins.isError && visibleItems.length ? (
+          <LoadErrorLine boxed query={pins}>
+            Could not load your pins. Pinned items show in their usual place.
+          </LoadErrorLine>
+        ) : null}
+        {contents.error && !contents.data ? (
+          <LoadError
+            title="Could not load what is in this folder"
+            error={contents.error}
+            query={contents}
+          />
+        ) : visibleItems.length === 0 && !readme ? (
           <EmptyState
+            icon={<FolderIcon className="h-5 w-5" />}
             title="Empty folder"
-            description="Add documents or create subfolders."
+            description={
+              <>
+                Publish into it with {/* The command breaks only at its spaces. */}
+                <code className="font-mono">
+                  slashdocs docs create file.html{" "}
+                  <span className="whitespace-nowrap">--folder-id</span> {id}
+                </code>
+                , or open a document and choose Move to folder in its More menu.
+              </>
+            }
+            action={
+              <Button variant="outline" onClick={() => setNewFolderOpen(true)}>
+                <Plus className="h-4 w-4" /> New subfolder
+              </Button>
+            }
           />
         ) : (
-          <FolderContents items={visibleItems} pinnedIds={pinnedIds} />
+          <FolderContents folderId={id} items={visibleItems} pinnedIds={pinnedIds} />
         )}
         {readme ? <FolderReadme document={readme} /> : null}
 
@@ -378,49 +389,53 @@ export function FolderPage() {
           parentFolderId={id}
         />
 
-        {/* Rename dialog */}
-        <Dialog open={renameOpen} onOpenChange={setRenameOpen}>
-          <DialogContent>
-            <DialogHeader>
-              <DialogTitle>Rename folder</DialogTitle>
-            </DialogHeader>
-            <form
-              onSubmit={(e) => {
-                e.preventDefault();
-                if (renameTitle.trim()) renameFolder.mutate();
-              }}
-            >
-              <Input
-                value={renameTitle}
-                onChange={(e) => setRenameTitle(e.target.value)}
-                autoFocus
-              />
-              <DialogFooter className="mt-4">
-                <Button
-                  type="button"
-                  variant="ghost"
-                  onClick={() => setRenameOpen(false)}
-                >
-                  Cancel
-                </Button>
-                <Button
-                  type="submit"
-                  disabled={!renameTitle.trim() || renameFolder.isPending}
-                >
-                  Rename
-                </Button>
-              </DialogFooter>
-            </form>
-          </DialogContent>
-        </Dialog>
-
-        <AccessWarningDialog
-          warning={accessWarning}
-          onClose={() => setAccessWarning(null)}
+        <RenameFolderDialog
+          open={renameOpen}
+          onOpenChange={setRenameOpen}
+          id={id}
+          title={f.title}
         />
+
+        <MoveDialog
+          open={moveOpen}
+          onOpenChange={setMoveOpen}
+          type="folder"
+          id={id}
+          title={f.title}
+          parentId={f.parent_folder_id}
+        />
+
+        <AccessWarningDialog warning={warning} onClose={clearWarning} />
       </Page>
       <BrowseDragOverlay activeDrag={activeDrag} viewMode={viewMode} />
     </DndContext>
+  );
+}
+
+// Folders take no access requests, so the reader sends the link to the
+// person who shared it.
+function FolderAccessDenied() {
+  const copyLink = () =>
+    navigator.clipboard.writeText(window.location.href).then(
+      () => toast.success("Folder link copied."),
+      () => toast.error("Could not copy the folder link."),
+    );
+  return (
+    <ErrorState
+      title="You don't have access to this folder"
+      description="Ask the folder owner to share it with you. Copy the link to send with your request."
+      icon={<KeyRound aria-hidden="true" className="h-5 w-5" />}
+      action={
+        <div className="flex flex-wrap justify-center gap-2">
+          <Button onClick={copyLink}>
+            <Link2 className="h-4 w-4" /> Copy link
+          </Button>
+          <Button asChild variant="outline">
+            <Link to="/app/documents">Go to documents</Link>
+          </Button>
+        </div>
+      }
+    />
   );
 }
 
@@ -437,7 +452,9 @@ function FolderReadme({
   });
   // The README is a full document: it follows the theme and reads and
   // writes its KV state, live, like on the document page.
-  const bridge = useBridgeHost(document.id, token.data?.url);
+  const bridge = useBridgeHost(document.id, token.data?.url, {
+    refresh: token.refetch,
+  });
   useDocumentEvents(document.id, { kv: bridge.deliverKV });
   return (
     <section className="mt-8 overflow-hidden rounded-xl border border-[var(--color-border)] bg-[var(--color-surface)]">
@@ -450,17 +467,24 @@ function FolderReadme({
           <Link to={`/app/d/${document.id}`}>Open document</Link>
         </Button>
       </div>
-      {bridge.frameSrc ? (
+      {token.error || bridge.failed ? (
+        <LoadError
+          title="Could not render README.html"
+          error={token.error}
+          query={token.error ? token : bridge.retry}
+        />
+      ) : bridge.frameSrc ? (
         <iframe
           ref={bridge.ref}
           title="Folder README"
           src={bridge.frameSrc}
+          onLoad={bridge.onLoad}
           className="h-[min(70vh,760px)] w-full border-0"
           sandbox="allow-scripts allow-same-origin allow-popups allow-popups-to-escape-sandbox"
         />
       ) : (
         <div className="p-6 text-sm text-[var(--color-fg-muted)]">
-          {token.error ? "Could not render README.html." : "Preparing README.html…"}
+          Preparing README.html…
         </div>
       )}
     </section>
@@ -468,30 +492,19 @@ function FolderReadme({
 }
 
 function FolderContents({
+  folderId,
   items,
   pinnedIds,
 }: {
+  folderId: string;
   items: FolderEntry[];
   pinnedIds: Set<string>;
 }) {
   const me = useQuery({ queryKey: queryKeys.me(), queryFn: api.me });
   const viewMode = viewModeStore.useStore();
+  const order = folderSortStore.useStore()[folderId];
 
-  const entries = [...items].sort((a, b) => {
-    const aid = a.folder?.id || (a.document ? docID(a.document) : "");
-    const bid = b.folder?.id || (b.document ? docID(b.document) : "");
-    const ap = pinnedIds.has(aid);
-    const bp = pinnedIds.has(bid);
-    if (ap !== bp) return ap ? -1 : 1;
-    const ta = a.last_active || "";
-    const tb = b.last_active || "";
-    if (ta && tb) return tb.localeCompare(ta);
-    if (tb) return 1;
-    if (ta) return -1;
-    return (a.folder?.title || a.document?.title || "").localeCompare(
-      b.folder?.title || b.document?.title || "",
-    );
-  });
+  const entries = sortEntries(items, pinnedIds, order);
 
   return viewMode === "list" ? (
     <UnifiedTable

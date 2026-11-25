@@ -30,6 +30,30 @@ func TestViewerCannotUploadVersion(t *testing.T) {
 	}`)
 }
 
+func TestUploadWithoutASummaryNamesItsFirstChange(t *testing.T) {
+	e := newTestEnv(t)
+	docID, verID := e.createDocument("Cards", "<html><body><h2>Card A</h2><h2>Card B</h2></body></html>", fixtureOwner)
+	body, contentType := multipartBody(t, map[string]string{
+		"base_version_id": verID,
+	}, "file", "cards.html", "<html><body><h2>Card A</h2></body></html>")
+
+	rr := doRaw(t, e.h, http.MethodPost, "/v1/documents/"+docID+"/versions", body, map[string]string{
+		"Content-Type":     contentType,
+		"X-Test-Principal": principalHeader(fixtureOwner),
+	})
+
+	assertStatus(t, rr, http.StatusCreated)
+	var out struct {
+		ChangeSummary string `json:"change_summary"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	if want := "Removed the section “Card B”"; out.ChangeSummary != want {
+		t.Fatalf("change_summary = %q, want %q", out.ChangeSummary, want)
+	}
+}
+
 func TestVersionConflict(t *testing.T) {
 	e := newTestEnv(t)
 	body, contentType := multipartBody(t, map[string]string{
@@ -42,12 +66,12 @@ func TestVersionConflict(t *testing.T) {
 		"X-Test-Principal": principalHeader(fixtureEditor),
 	})
 
-	assertStatus(t, rr, http.StatusConflict)
+	assertStatus(t, rr, http.StatusUnprocessableEntity)
 	assertJSON(t, rr.Body.Bytes(), fmt.Sprintf(`{
 	  "error": {
-	    "code": "version_conflict",
-	    "message": "base_version_id is stale",
-	    "details": { "current_version_id": %q }
+	    "code": "base_version_not_found",
+	    "message": "base_version_id is not a version of this document. Get the document again and make the change again.",
+	    "details": { "current_version_id": %q, "seq": 1 }
 	  }
 	}`, e.ver.ID))
 }
@@ -142,7 +166,7 @@ func TestRenderRouteReturnsWrapperNotRawHTML(t *testing.T) {
 	wrapperBody := rr.Body.String()
 	if !strings.Contains(wrapperBody, `<iframe id="slashdocs-doc"`) ||
 		!strings.Contains(wrapperBody, "slashdocs-bootstrap") ||
-		!strings.Contains(wrapperBody, "&lt;html&gt;") ||
+		!strings.Contains(wrapperBody, "&lt;html data-slashdocs-source=&#34;0&#34;&gt;") ||
 		!strings.Contains(wrapperBody, "&lt;/html&gt;") {
 		t.Fatalf("body = %q, want render wrapper with escaped srcdoc", rr.Body.String())
 	}

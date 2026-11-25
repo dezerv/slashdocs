@@ -4,7 +4,7 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { Upload } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
+import { Field, Input } from "@/components/ui/input";
 import { DropdownItem } from "@/components/ui/dropdown";
 import {
   Dialog,
@@ -14,8 +14,10 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { HtmlFileInput, useStagedFile } from "@/components/ui/upload";
+import { HtmlFileInput } from "@/components/ui/upload";
+import { DraftNotice } from "@/components/draft-notice";
 import { api } from "@/api";
+import { useEditDraft } from "@/lib/edit-drafts";
 import { errorMessage } from "@/lib/errors";
 import { queryKeys } from "@/lib/queryKeys";
 
@@ -26,7 +28,7 @@ import { queryKeys } from "@/lib/queryKeys";
 export function UploadBackupMenuItem({ onSelect }: { onSelect: () => void }) {
   return (
     <DropdownItem onSelect={onSelect}>
-      <Upload className="h-4 w-4" /> Upload HTML (backup)
+      <Upload className="h-4 w-4" /> Upload an HTML file
     </DropdownItem>
   );
 }
@@ -38,13 +40,41 @@ export function UploadBackupDialog({
   open: boolean;
   onOpenChange: (open: boolean) => void;
 }) {
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>Upload an HTML file</DialogTitle>
+          <DialogDescription>
+            Agents normally publish via the CLI. Use this only as a manual fallback.
+          </DialogDescription>
+        </DialogHeader>
+        <UploadBackupForm onClose={() => onOpenChange(false)} />
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+// The form mounts each time the dialog opens. The typed title is a draft
+// (`upload-title`) that Esc, a click outside, a failure and a reload keep,
+// and Cancel discards. A file cannot outlive the page, so a title that came
+// back asks for its file again. An upload that ends after Cancel names its
+// document in a toast, but does not open it.
+function UploadBackupForm({ onClose }: { onClose: () => void }) {
   const q = useQueryClient();
   const nav = useNavigate();
-  const [title, setTitle] = useState("");
-  const { file, setFile, reset } = useStagedFile();
+  const typed = useEditDraft("upload-title", "");
+  const [file, setFile] = useState<File | null>(null);
+  // The title that a file gives itself, once it is read. It shows as the
+  // placeholder, so that it never takes the place of typed words, and it
+  // counts only for its own file.
+  const [found, setFound] = useState<{ file: File; title: string }>();
+  const title = typed.value.trim() || (found?.file === file && found.title) || "";
   const m = useMutation({
-    mutationFn: () => api.createDocument(title || file?.name || "Untitled", file!),
-    onSuccess: (r) => {
+    mutationFn: ({ title, file }: { title: string; file: File }) =>
+      api.createDocument(title, file),
+    onSuccess: (r, { title }) => {
+      typed.sent(title);
       q.invalidateQueries({ queryKey: queryKeys.documents() });
       if (r.default_grant) {
         const verb =
@@ -54,51 +84,70 @@ export function UploadBackupDialog({
               ? "read and comment on"
               : "read";
         toast.info(
-          `Uploaded — shared by default: everyone on this server can ${verb} this document. Manage access from the document's share menu.`,
+          `Uploaded “${title}” — shared by default: everyone on this server can ${verb} this document. Manage access from the document's share menu.`,
           { duration: 8000 },
         );
       } else {
-        toast.success("Document uploaded.");
+        toast.success(`Uploaded “${title}”.`);
       }
-      onOpenChange(false);
-      setTitle("");
-      reset();
-      nav(`/app/d/${r.id}`);
     },
     onError: (e) => toast.error(errorMessage(e, "Upload failed")),
   });
+  const pick = (next: File | null) => {
+    setFile(next);
+    if (next) void htmlTitle(next).then((title) => setFound({ file: next, title }));
+  };
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent>
-        <DialogHeader>
-          <DialogTitle>Upload HTML (backup)</DialogTitle>
-          <DialogDescription>
-            Agents normally publish via the CLI. Use this only as a manual fallback.
-          </DialogDescription>
-        </DialogHeader>
-        <form
-          className="space-y-3"
-          onSubmit={(e) => {
-            e.preventDefault();
-            if (file) m.mutate();
+    <form
+      className="space-y-3"
+      onSubmit={(e) => {
+        e.preventDefault();
+        if (file && !m.isPending)
+          m.mutate(
+            { title: title || file.name, file },
+            {
+              onSuccess: (r) => {
+                onClose();
+                nav(`/app/d/${r.id}`);
+              },
+            },
+          );
+      }}
+    >
+      <Field label="Title">
+        <Input
+          placeholder={title || file?.name || "Untitled"}
+          value={typed.value}
+          onChange={(e) => typed.setValue(e.target.value)}
+        />
+      </Field>
+      <DraftNotice
+        draft={typed}
+        cameBack="Your title from earlier came back. Choose the file again."
+      />
+      <HtmlFileInput file={file} onFile={pick} />
+      <DialogFooter>
+        <Button
+          type="button"
+          variant="ghost"
+          onClick={() => {
+            typed.discard();
+            onClose();
           }}
         >
-          <Input
-            placeholder="Title"
-            value={title}
-            onChange={(e) => setTitle(e.target.value)}
-          />
-          <HtmlFileInput file={file} onFile={setFile} />
-          <DialogFooter>
-            <Button type="button" variant="ghost" onClick={() => onOpenChange(false)}>
-              Cancel
-            </Button>
-            <Button type="submit" disabled={!file || m.isPending}>
-              {m.isPending ? "Uploading…" : "Upload"}
-            </Button>
-          </DialogFooter>
-        </form>
-      </DialogContent>
-    </Dialog>
+          Cancel
+        </Button>
+        <Button type="submit" disabled={!file} busy={m.isPending}>
+          Upload
+        </Button>
+      </DialogFooter>
+    </form>
   );
+}
+
+// The title of an HTML file: its <title>, or else its first <h1>.
+async function htmlTitle(file: File) {
+  const doc = new DOMParser().parseFromString(await file.text(), "text/html");
+  const h1 = doc.querySelector("h1")?.textContent?.replace(/\s+/g, " ");
+  return (doc.title || h1 || "").trim();
 }

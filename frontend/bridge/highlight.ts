@@ -10,8 +10,20 @@
 //
 // Spans inside SVG content cannot be wrapped (non-SVG children of `<text>`
 // don't render), so those get a `<rect>` overlay behind the text instead.
+import { holds, scrollBehavior, viewOf } from "./dom.ts";
 
 const SVG_NS = "http://www.w3.org/2000/svg";
+
+/**
+ * Scroll the highlight `el` to the center of the part of the view that the app
+ * leaves clear, unless all of it shows there already, as text that the reader
+ * just selected does: then the document stays where the reader looks.
+ */
+export function reveal(el: Element): void {
+  const d = el.ownerDocument;
+  if (holds(viewOf(d, true), el.getBoundingClientRect())) return;
+  el.scrollIntoView({ block: "center", behavior: scrollBehavior(d) });
+}
 
 /**
  * Returns true if any part of `node` lies within `range`.
@@ -130,7 +142,7 @@ function svgHighlight(
   el.parentNode!.insertBefore(rect, el);
   el.classList.add("slashdocs-svg-mark-text");
   if (active && scroll) {
-    el.scrollIntoView({ block: "center", behavior: "smooth" });
+    reveal(el);
   }
   return 1;
 }
@@ -207,39 +219,15 @@ export function highlightRange(
     count += 1;
   }
 
-  if (active && scroll && scrollTarget) {
-    scrollTarget.scrollIntoView({ block: "center", behavior: "smooth" });
-  }
+  if (active && scroll && scrollTarget) reveal(scrollTarget);
   return count;
 }
 
 /**
- * Remove every highlight artifact previously created by `highlightRange` and
- * merge the text nodes that wrapping split apart.
- */
-export function clearHighlights(d: Document): void {
-  const parents = new Set<Node>();
-  d.querySelectorAll("mark.slashdocs-mark").forEach((m) => {
-    if (m.parentNode) {
-      parents.add(m.parentNode);
-    }
-    m.replaceWith(...m.childNodes);
-  });
-  d.querySelectorAll(".slashdocs-svg-mark-rect").forEach((r) => r.remove());
-  d.querySelectorAll<HTMLElement>(".slashdocs-svg-mark-text").forEach((t) => {
-    t.classList.remove("slashdocs-svg-mark-text");
-    delete t.dataset.cid;
-  });
-  // Merge only the text nodes our wrapping split apart. A whole-body
-  // normalize() would also merge or drop text nodes created by the
-  // document's own scripts, breaking any references those scripts hold.
-  parents.forEach((p) => p.normalize());
-}
-
-/**
  * Remove only the artifacts of one comment, leaving every other highlight
- * untouched. Used by mutation-driven repair so an unrelated DOM change never
- * rebuilds the whole overlay. Returns the number of artifacts removed.
+ * untouched, and merge the text nodes that wrapping split apart, so an
+ * unrelated change never rebuilds the whole overlay. Returns the number of
+ * artifacts removed.
  */
 export function clearHighlightsFor(d: Document, id: string): number {
   const cid = CSS.escape(id);

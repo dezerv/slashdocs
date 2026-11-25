@@ -76,7 +76,6 @@ func TestRenderWrapperPreservesInlineScriptClosingTag(t *testing.T) {
 func TestBridgeImplementsThemeContract(t *testing.T) {
 	bridge := requireEmbeddedBridge(t)
 	for _, needle := range []string{
-		"data-slashdocs-theme",
 		"slashdocs_theme",
 		"slashdocs:theme",
 	} {
@@ -84,6 +83,9 @@ func TestBridgeImplementsThemeContract(t *testing.T) {
 			t.Fatalf("bridge.js missing theme-handshake hook %q", needle)
 		}
 	}
+	// The bridge stamps data-<name>-theme for each public name, slashdocs first.
+	requireBridgePattern(t, `PUBLIC_NAMES\s*=\s*\[\s*["']slashdocs["']`)
+	requireBridgePattern(t, "setAttribute\\(`data-\\$\\{name\\}-theme`")
 	requireBridgePattern(t, `readyState\s*!==\s*["']loading["']`)
 }
 
@@ -117,6 +119,41 @@ func TestBridgePreservesWireMessageFamilies(t *testing.T) {
 		if !strings.Contains(bridge, messageType) {
 			t.Fatalf("embedded bridge is missing wire message %q", messageType)
 		}
+	}
+}
+
+func TestBridgePreludeThemesBeforeDocumentScriptsRun(t *testing.T) {
+	userHTML := `<html data-aidocs-theme="light"><head><script>window.__slashdocsThemeAtStartup=document.documentElement.getAttribute("data-slashdocs-theme")</script></head><body></body></html>`
+	withPrelude := userHTMLWithBridgePrelude([]byte(userHTML))
+
+	stamp := strings.Index(withPrelude, "__slashdocsTheme")
+	authorScript := strings.Index(withPrelude, "__slashdocsThemeAtStartup")
+	if stamp < 0 {
+		t.Fatalf("bridge prelude never stamps the reader's theme: %s", withPrelude)
+	}
+	if authorScript < 0 || stamp > authorScript {
+		t.Fatalf("bridge prelude must stamp the theme before the document's own scripts run")
+	}
+	for _, needle := range []string{"data-slashdocs-theme", "data-aidocs-theme"} {
+		if !strings.Contains(withPrelude[:authorScript], needle) {
+			t.Fatalf("bridge prelude is missing theme attribute %q before the document scripts", needle)
+		}
+	}
+}
+
+func TestRenderWrapperExposesThemeBeforeTheDocumentLoads(t *testing.T) {
+	out := string(Wrap([]byte(`<html><head></head><body></body></html>`), "https://app.example"))
+
+	headEnd := strings.Index(out, "</head>")
+	if headEnd < 0 {
+		t.Fatalf("rendered wrapper has no head: %s", out)
+	}
+	exposed := strings.Index(out[:headEnd], "window.__slashdocsTheme")
+	if exposed < 0 {
+		t.Fatal("rendered wrapper does not expose the reader's theme before the document iframe")
+	}
+	if !strings.Contains(out[:headEnd], "slashdocs_theme") {
+		t.Fatal("rendered wrapper does not read the theme from its URL")
 	}
 }
 
@@ -201,7 +238,7 @@ func TestBridgeImplementsDocumentKVUndoRedoContract(t *testing.T) {
 		"kvRedoStack",
 		"kvInversePatch",
 		"handleKVUndoRedoShortcut",
-		"isTextEditingTarget",
+		"isEditableTarget",
 		"ev.ctrlKey",
 		"ev.metaKey",
 		"ev.shiftKey",

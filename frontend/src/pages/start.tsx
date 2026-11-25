@@ -1,14 +1,22 @@
 import { useTitle } from "@/lib/use-title";
 import { useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
-import { ArrowRight, Check, ChevronDown, Circle, PartyPopper, X } from "lucide-react";
+import {
+  ArrowRight,
+  Check,
+  ChevronDown,
+  Circle,
+  PartyPopper,
+  RotateCcw,
+  X,
+} from "lucide-react";
 import { publicURL } from "@/lib/config";
 import { Button } from "@/components/ui/button";
 import { Page } from "@/components/layout/page";
 import { beat } from "@/lib/enter";
-import { CodeBlock } from "@/components/ui/misc";
+import { CodeBlock, Collapse } from "@/components/ui/misc";
 import { cn } from "@/lib/cn";
-import { Segmented } from "@/components/ui/segmented";
+import { Segmented, tabPanel } from "@/components/ui/segmented";
 import { McpConnect } from "@/components/mcp-connect";
 import {
   onboardingProgress,
@@ -26,7 +34,7 @@ const PATHS: { value: SetupPath; label: string }[] = [
 
 export function StartPage() {
   useTitle("Get started");
-  const { state, setStep, setPath, skip } = useOnboarding();
+  const { state, setStep, setPath, skip, reset } = useOnboarding();
   const loginCmd = `slashdocs auth login ${publicURL()}`;
   const { done, total } = onboardingProgress(state);
   const nav = useNavigate();
@@ -43,7 +51,12 @@ export function StartPage() {
 
   return (
     <Page lane="focus" backdrop="halo">
-      <div className="flex justify-end">
+      <div className="flex justify-end gap-1">
+        {Object.values(state.steps).some(Boolean) && (
+          <Button variant="ghost" size="sm" onClick={reset}>
+            <RotateCcw className="h-3.5 w-3.5" /> Start again
+          </Button>
+        )}
         <Button variant="ghost" size="sm" onClick={skipTutorial}>
           Skip tutorial <X className="h-3.5 w-3.5" />
         </Button>
@@ -63,7 +76,9 @@ export function StartPage() {
           style={beat(2)}
         >
           slashdocs is meant to be driven by your AI agent — Claude Code, Codex, Cursor,
-          Pi, OpenCode, Aider, or anything else. These steps wire it up.
+          Pi, OpenCode, Aider, or anything else. These steps wire it up. People then
+          comment on what it publishes, and editors fix the words in place: they press
+          E, or pick Edit in the document bar, and type.
         </p>
       </header>
 
@@ -91,80 +106,83 @@ export function StartPage() {
         value={state.path}
         onChange={setPath}
         options={PATHS}
+        panel="setup-steps"
         className="enter mb-4"
       />
 
-      <div
-        className="enter mb-4 flex items-center gap-3 text-xs text-[var(--color-fg-muted)]"
-        style={beat(3)}
-      >
-        <div className="h-1.5 flex-1 overflow-hidden rounded-full bg-[var(--color-surface-muted)] ring-1 ring-[var(--color-border)] dark:ring-transparent">
-          <div
-            className="h-full rounded-full bg-[image:var(--razorsense-border)] bg-[length:240%_100%] transition-[width] duration-500 ease-[var(--ease-slash)]"
-            style={{ width: `${(done / total) * 100}%` }}
-          />
+      <div {...tabPanel("setup-steps")}>
+        <div
+          className="enter mb-4 flex items-center gap-3 text-xs text-[var(--color-fg-muted)]"
+          style={beat(3)}
+        >
+          <div className="h-1.5 flex-1 overflow-hidden rounded-full bg-[var(--color-surface-muted)] ring-1 ring-[var(--color-border)] dark:ring-transparent">
+            <div
+              className="h-full rounded-full bg-[image:var(--razorsense-border)] bg-[length:240%_100%] transition-[width] duration-500 ease-[var(--ease-slash)]"
+              style={{ width: `${(done / total) * 100}%` }}
+            />
+          </div>
+          <span className="font-mono tabular-nums">
+            {done}/{total} complete
+          </span>
         </div>
-        <span className="font-mono tabular-nums">
-          {done}/{total} complete
-        </span>
-      </div>
 
-      <ol className="enter space-y-3" style={beat(4)}>
-        {state.path === "mcp" ? (
-          <Step
-            n={1}
-            title="Add slashdocs to your agent app"
-            stepKey="agent_configured"
-            {...step}
-          >
-            <McpConnect />
-          </Step>
-        ) : (
-          <>
+        <ol className="enter space-y-3" style={beat(4)}>
+          {state.path === "mcp" ? (
             <Step
               n={1}
-              title="Install the CLI and slashdocs skill"
-              stepKey="cli_installed"
+              title="Add slashdocs to your agent app"
+              stepKey="agent_configured"
               {...step}
             >
-              <p className="mb-3 text-sm text-[var(--color-fg-muted)]">
-                One-time, on the machine where your agent runs. This installs the
-                slashdocs CLI plus the bundled agent skill, so your agent knows when to
-                publish docs to slashdocs.
-              </p>
-              <CodeBlock>{`curl -fsSL ${publicURL()}/install.sh | sh`}</CodeBlock>
-              <p className="mt-3 text-xs text-[var(--color-fg-muted)]">
-                Works on macOS and Linux. The skill is fetched from this slashdocs
-                server and installed into the standard agent skills directory and
-                Claude's skills directory — no GitHub auth or npx step required.
-              </p>
+              <McpConnect />
             </Step>
+          ) : (
+            <>
+              <Step
+                n={1}
+                title="Install the CLI and slashdocs skill"
+                stepKey="cli_installed"
+                {...step}
+              >
+                <p className="mb-3 text-sm text-[var(--color-fg-muted)]">
+                  One-time, on the machine where your agent runs. This installs the
+                  slashdocs CLI plus the bundled agent skill, so your agent knows when
+                  to publish docs to slashdocs.
+                </p>
+                <CodeBlock>{`curl -fsSL ${publicURL()}/install.sh | sh`}</CodeBlock>
+                <p className="mt-3 text-xs text-[var(--color-fg-muted)]">
+                  Works on macOS and Linux. The skill is fetched from this slashdocs
+                  server and installed into the standard agent skills directory and
+                  Claude's skills directory — no GitHub auth or npx step required.
+                </p>
+              </Step>
 
-            <Step
-              n={2}
-              title="Sign in once from your terminal"
-              stepKey="cli_authed"
-              {...step}
-            >
-              <p className="mb-3 text-sm text-[var(--color-fg-muted)]">
-                One-time. After this, your agent can publish documents on your behalf —
-                no keys or tokens to copy around.
-              </p>
-              <CodeBlock>{loginCmd}</CodeBlock>
-            </Step>
-          </>
-        )}
+              <Step
+                n={2}
+                title="Sign in once from your terminal"
+                stepKey="cli_authed"
+                {...step}
+              >
+                <p className="mb-3 text-sm text-[var(--color-fg-muted)]">
+                  One-time. After this, your agent can publish documents on your behalf
+                  — no keys or tokens to copy around.
+                </p>
+                <CodeBlock>{loginCmd}</CodeBlock>
+              </Step>
+            </>
+          )}
 
-        <Step
-          n={requiredSteps[state.path].length + 1}
-          title="Try it end-to-end"
-          stepKey="first_doc_seen"
-          {...step}
-          optional
-        >
-          <TryItOut path={state.path} />
-        </Step>
-      </ol>
+          <Step
+            n={requiredSteps[state.path].length + 1}
+            title="Try it end-to-end"
+            stepKey="first_doc_seen"
+            {...step}
+            optional
+          >
+            <TryItOut path={state.path} />
+          </Step>
+        </ol>
+      </div>
     </Page>
   );
 }
@@ -188,7 +206,9 @@ function Step({
   optional?: boolean;
   children: React.ReactNode;
 }) {
-  const done = state.steps[stepKey];
+  // An optional step is a thing to try, not a step to finish: it shows no
+  // check, so it cannot look done before the required steps are.
+  const done = !optional && state.steps[stepKey];
   const [forced, setForced] = useState<boolean | null>(null);
   const expanded = forced ?? open === stepKey;
   return (
@@ -230,31 +250,33 @@ function Step({
           </span>
           <ChevronDown
             className={cn(
-              "h-4 w-4 text-[var(--color-fg-muted)] transition-transform",
+              "h-4 w-4 text-[var(--color-fg-muted)] transition-transform duration-200 ease-out",
               expanded && "rotate-180",
             )}
           />
         </button>
-        {expanded && (
+        <Collapse open={expanded}>
           <div className="px-5 pb-5 pl-[60px]">
             {children}
-            <div className="mt-4 flex justify-end">
-              {done ? (
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  onClick={() => setStep(stepKey, false)}
-                >
-                  <Circle className="h-3.5 w-3.5" /> Mark incomplete
-                </Button>
-              ) : (
-                <Button size="sm" onClick={() => setStep(stepKey, true)}>
-                  <Check className="h-3.5 w-3.5" /> Mark done
-                </Button>
-              )}
-            </div>
+            {optional ? null : (
+              <div className="mt-4 flex justify-end">
+                {done ? (
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => setStep(stepKey, false)}
+                  >
+                    <Circle className="h-3.5 w-3.5" /> Mark incomplete
+                  </Button>
+                ) : (
+                  <Button size="sm" onClick={() => setStep(stepKey, true)}>
+                    <Check className="h-3.5 w-3.5" /> Mark done
+                  </Button>
+                )}
+              </div>
+            )}
           </div>
-        )}
+        </Collapse>
       </div>
     </li>
   );

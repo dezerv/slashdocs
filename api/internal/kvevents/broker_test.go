@@ -655,7 +655,7 @@ func TestPostgresListenerDeliversOnlyCommittedNotifications(t *testing.T) {
 func TestPostgresPatchNotifiesOnceAndNoOpDoesNotNotify(t *testing.T) {
 	store, databaseURL := openTestStore(t)
 	owner := auth.Principal{Type: auth.PrincipalUser, ID: "owner_notify", Email: "owner-notify@example.com", Name: "Owner"}
-	document, _, err := store.CreateDocument(context.Background(), owner, "notify", []byte("<html></html>"))
+	document, _, err := store.CreateDocument(context.Background(), owner, "notify", "", []byte("<html></html>"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -718,7 +718,7 @@ func TestPostgresPatchNotifiesOnceAndNoOpDoesNotNotify(t *testing.T) {
 func TestPostgresDeleteNotifiesAndClosesBrokerSubscribers(t *testing.T) {
 	store, databaseURL := openTestStore(t)
 	owner := auth.Principal{Type: auth.PrincipalUser, ID: "owner_delete_notify", Email: "owner-delete-notify@example.com", Name: "Owner"}
-	document, _, err := store.CreateDocument(context.Background(), owner, "delete notify", []byte("<html></html>"))
+	document, _, err := store.CreateDocument(context.Background(), owner, "delete notify", "", []byte("<html></html>"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -887,5 +887,32 @@ func TestBrokerRelayInPollModeKeepsRoomForStoredEvents(t *testing.T) {
 	}
 	if got := receiveEvent(t, events); got.Kind != repo.DocumentEventCursor {
 		t.Fatalf("event = %#v, want a cursor event", got)
+	}
+}
+
+// An event of no document reaches the subscribers of every document, as a
+// change of a folder reaches the documents under it with one relay.
+func TestBrokerRelaysAnEventOfNoDocumentToEveryDocument(t *testing.T) {
+	broker, err := newBroker(context.Background(), Config{Mode: ModePoll, PollInterval: time.Hour, Logger: testLogger()}, newTestSource(), nil, newManualClock())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(broker.Close)
+	var streams []<-chan repo.DocumentKVEvent
+	for _, id := range []string{"doc_a", "doc_b"} {
+		events, unsubscribe, err := broker.Subscribe(context.Background(), id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(unsubscribe)
+		streams = append(streams, events)
+	}
+	if err := broker.Relay(context.Background(), repo.DocumentKVEvent{Kind: repo.DocumentEventAccess}); err != nil {
+		t.Fatal(err)
+	}
+	for _, events := range streams {
+		if got := receiveEvent(t, events); got.Kind != repo.DocumentEventAccess {
+			t.Fatalf("event = %#v, want an access event", got)
+		}
 	}
 }

@@ -1,0 +1,302 @@
+package textedit
+
+import (
+	"bytes"
+	crand "crypto/rand"
+	"errors"
+	"math/rand/v2"
+	"runtime"
+	"strings"
+	"testing"
+	"time"
+)
+
+// at returns the replacement of the first old in base with with.
+func at(base, old, with string) Replacement {
+	start := strings.Index(base, old)
+	return Replacement{Start: start, End: start + len(old), OldHTML: old, NewHTML: with}
+}
+
+func TestPatchAppliesByPositionOnTheBase(t *testing.T) {
+	base := "<p>Try it.</p><p>Try it.</p><p>Try it.</p>"
+	// The second of three equal labels, and an insertion after the last.
+	got, err := Patch([]byte(base), []Replacement{
+		{Start: 17, End: 24, OldHTML: "Try it.", NewHTML: "Run it."},
+		{Start: len(base), End: len(base), NewHTML: "<p>New</p>"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "<p>Try it.</p><p>Run it.</p><p>Try it.</p><p>New</p>"; string(got) != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
+func TestTransformMovesReplacementsOntoALaterState(t *testing.T) {
+	base := "<h1>Café 😀</h1>\n<p>One.</p>\n<p>Two.</p>\n<p>Three.</p>"
+	ours := []Replacement{at(base, "One.", "Uno."), at(base, "Three.", "Tres.")}
+	cases := []struct{ name, latest, want string }{
+		// Multi-byte text before the ranges grows, so byte and rune offsets differ.
+		{"before", strings.Replace(base, "Café 😀", "Crème brûlée 😀😀", 1),
+			"<h1>Crème brûlée 😀😀</h1>\n<p>Uno.</p>\n<p>Two.</p>\n<p>Tres.</p>"},
+		{"between", strings.Replace(base, "Two.", "Dos, señor.", 1),
+			"<h1>Café 😀</h1>\n<p>Uno.</p>\n<p>Dos, señor.</p>\n<p>Tres.</p>"},
+		{"after", base + "\n<p>Four.</p>",
+			"<h1>Café 😀</h1>\n<p>Uno.</p>\n<p>Two.</p>\n<p>Tres.</p>\n<p>Four.</p>"},
+		{"removed before", strings.Replace(base, "<h1>Café 😀</h1>\n", "", 1),
+			"<p>Uno.</p>\n<p>Two.</p>\n<p>Tres.</p>"},
+		{"inserted at the edge of a range", strings.Replace(base, "One.", "One.!", 1),
+			"<h1>Café 😀</h1>\n<p>Uno.!</p>\n<p>Two.</p>\n<p>Tres.</p>"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := merge(t, base, tc.latest, ours); got != tc.want {
+				t.Fatalf("got %q\nwant %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestNormalRefusesReplacementsThatDoNotFitTheBase(t *testing.T) {
+	base := "<p>é and e</p>"
+	ok := at(base, "and", "or")
+	cases := []struct {
+		name   string
+		rs     []Replacement
+		index  int
+		reason string
+	}{
+		{"mismatch", []Replacement{ok, {Start: 10, End: 11, OldHTML: "x", NewHTML: "y"}}, 1, ReasonMismatch},
+		{"out of order", []Replacement{at(base, "e<", "E<"), ok}, 1, ReasonRange},
+		{"overlapping", []Replacement{ok, {Start: ok.End - 1, End: ok.End + 1, OldHTML: "d ", NewHTML: ""}}, 1, ReasonRange},
+		{"past the end", []Replacement{{Start: len(base), End: len(base) + 1, OldHTML: "x"}}, 0, ReasonRange},
+		{"negative", []Replacement{{Start: -1, End: 0, NewHTML: "x"}}, 0, ReasonRange},
+		{"inside a character", []Replacement{{Start: 4, End: 4, NewHTML: "x"}}, 0, ReasonRange},
+		{"invalid UTF-8", []Replacement{{Start: 3, End: 3, NewHTML: "\xff"}}, 0, ReasonInvalid},
+		{"nothing changes", []Replacement{at(base, "and", "and")}, 0, ReasonUnchanged},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Normal(Bytes(base), tc.rs)
+			var e *ReplacementError
+			if !errors.As(err, &e) || e.Index != tc.index || e.Reason != tc.reason {
+				t.Fatalf("err = %#v, want %s on replacement %d", err, tc.reason, tc.index)
+			}
+		})
+	}
+}
+
+// patch applies the changes of a diff of a and b, taking the new bytes from b.
+func patch(a, b []byte, changes []change) []byte {
+	var out []byte
+	copied, shift := 0, 0
+	for _, c := range changes {
+		out = append(out, a[copied:c.start]...)
+		out = append(out, b[c.start+shift:c.start+shift+c.size]...)
+		shift += c.size - (c.end - c.start)
+		copied = c.end
+	}
+	return append(out, a[copied:]...)
+}
+
+func TestDiffTurnsOneTextIntoTheOther(t *testing.T) {
+	//nolint:gosec // G404: a fixed seed makes the same texts on every run.
+	rng := rand.New(rand.NewPCG(1, 2))
+	for range 2000 {
+		a := make([]byte, rng.IntN(40))
+		for i := range a {
+			a[i] = "ab<>"[rng.IntN(4)]
+		}
+		b := slicesMutate(rng, a)
+		changes := diff(a, b)
+		if got := patch(a, b, changes); !bytes.Equal(got, b) {
+			t.Fatalf("diff(%q, %q) = %v patches to %q", a, b, changes, got)
+		}
+	}
+}
+
+// slicesMutate returns a copy of a with a few random edits.
+func slicesMutate(rng *rand.Rand, a []byte) []byte {
+	b := append([]byte(nil), a...)
+	for range rng.IntN(4) {
+		at := rng.IntN(len(b) + 1)
+		cut := min(rng.IntN(4), len(b)-at)
+		b = append(b[:at:at], append([]byte("xé"[:rng.IntN(3)]), b[at+cut:]...)...)
+	}
+	return b
+}
+
+func TestDiffStaysCheapOnLargeDocuments(t *testing.T) {
+	if testing.Short() {
+		t.Skip("large documents")
+	}
+	page := bytes.Repeat([]byte("<p>Some words of a long document, with é and 😀.</p>\n"), 50<<20/56)
+	// Two small changes at the two ends of 50 MiB need a long walk.
+	far := append([]byte("<p>New</p>"), page[:len(page)-4]...)
+	// Random bytes against random bytes have no short diff at all.
+	noise := func() []byte {
+		b := make([]byte, 4<<20)
+		_, _ = crand.Read(b)
+		return b
+	}
+	for name, texts := range map[string][2][]byte{"far apart": {page, far}, "unrelated": {noise(), noise()}} {
+		started := time.Now()
+		changes := diff(texts[0], texts[1])
+		took := time.Since(started)
+		if !bytes.Equal(patch(texts[0], texts[1], changes), texts[1]) {
+			t.Fatalf("%s: the diff does not turn the texts into each other", name)
+		}
+		t.Logf("%s: %d changes in %v", name, len(changes), took)
+		if took > 5*time.Second {
+			t.Fatalf("%s: diff took %v", name, took)
+		}
+	}
+}
+
+// summary names what a reader sees change when the replacements apply to base.
+func summary(base string, rs ...Replacement) string {
+	return ChangeSummary([]byte(base), apply([]byte(base), rs))
+}
+
+func TestChangeSummaryNamesWhatAReaderSeesChange(t *testing.T) {
+	base := `<html><head><style>p { color: red }</style></head><body>
+<p>Clients retry <b>twice</b> before the owner. The end.</p>
+<ul><li>Read the notes</li></ul>
+<p id="health">Build health: <b id="status"></b></p>
+<script>const LABEL = "Green"; document.getElementById("status").textContent = LABEL;</script>
+</body></html>`
+	end := strings.Index(base, "\n<p id=")
+	for _, c := range []struct {
+		name string
+		r    Replacement
+		want string
+	}{
+		{"words", at(base, "twice", "three times"), "Changed “twice” to “three times”"},
+		{"added words", at(base, "The end.", "The end. More words."), "Added “More words.”"},
+		{"removed words", at(base, " The end.", ""), "Removed “The end.”"},
+		// The editor sends the bytes that changed, which can start inside a tag.
+		{"paragraph", Replacement{Start: end - 1, End: end - 1, NewHTML: "><p>A new paragraph.</p"},
+			"Added a paragraph: “A new paragraph.”"},
+		{"list item", at(base, "</li></ul>", "</li><li>Write the notes</li></ul>"), "Added a list item: “Write the notes”"},
+		{"empty list item", at(base, "</li></ul>", "</li><li><br></li></ul>"), "Added a list item"},
+		{"split", at(base, " The end.", "</p><p>The end."), "Split a paragraph: “Clients retry twice before the owner. The end.”"},
+		{"list", at(base, "<ul><li>Read the notes</li></ul>", "<p>Read the notes</p>"), "Changed a bulleted list to paragraphs: “Read the notes”"},
+		{"link", at(base, "owner. The", `<a href="https://example.com">owner. The</a>`), "Linked “owner. The”"},
+		{"bold", at(base, "Clients", "<b>Clients</b>"), "Made “Clients” bold"},
+		{"italic", at(base, "twice", "<em>twice</em>"), "Made “twice” italic"},
+		{"unbold", at(base, "<b>twice</b>", "twice"), "Removed bold from “twice”"},
+		{"script", at(base, `"Green"`, `"Amber"`), "Changed a script"},
+		{"script and tag", at(base, `id="status"></b></p>
+<script>const LABEL = "Green";`, `>Amber</b></p>
+<script>const LABEL = "G";`), "Added “Amber”"},
+		{"style", at(base, "red", "blue"), "Changed the styles"},
+		{"attribute", at(base, `id="health"`, `id="health" class="note"`), "Changed the formatting of “Build health:”"},
+		{"bold moved", at(base, "<b>twice</b> before", "<b>twice before</b>"), "Made “twice before” bold"},
+		{"link target", at(base, "owner.", `<a href="https://a.example">owner.</a>`), "Linked “owner.”"},
+	} {
+		if got := summary(base, c.r); got != c.want {
+			t.Errorf("%s: got %q, want %q", c.name, got, c.want)
+		}
+	}
+}
+
+// A person types on while an agent pushes, so a version starts or ends in
+// the middle of a word. The summary must name the words that are new, not
+// the part of a word that was there.
+func TestChangeSummaryNamesTheNewWordsOfTextThatWasPutIn(t *testing.T) {
+	for _, tc := range []struct{ before, after, want string }{
+		{"<p>We meet on Monday at nine, in t</p>", "<p>We meet on Monday at nine, in the large room on the third floor</p>",
+			"Added “the large room on the third floor”"},
+		{"<p>We meet whil</p>", "<p>We meet while the agent writes the other sections</p>", "Added “while the agent writes the other sections”"},
+		{"<p>Intro.</p><p>It lists what the team did.</p>", "<p>Intro.</p><p>TAB-ONE words. It lists what the team did.</p>", "Added “TAB-ONE words.”"},
+		{"<p>That sentence.It lists what the team did.</p>", "<p>That sentence. TAB-ONE words. It lists what the team did.</p>", "Added “TAB-ONE words.”"},
+		{"<p>We meet while the agent writes</p>", "<p>We meet whil</p>", "Removed “while the agent writes”"},
+		{"<p>TAB-ONE words. It lists what the team did.</p>", "<p>It lists what the team did.</p>", "Removed “TAB-ONE words.”"},
+	} {
+		if got := ChangeSummary([]byte(tc.before), []byte(tc.after)); got != tc.want {
+			t.Errorf("ChangeSummary(%q, %q) = %q, want %q", tc.before, tc.after, got, tc.want)
+		}
+	}
+}
+
+func TestChangeSummaryCutsLongWords(t *testing.T) {
+	base := "<p>Try it.</p>"
+	got := summary(base, Replacement{Start: len(base), End: len(base), NewHTML: "<p>" + strings.Repeat("word ", 20) + "</p>"})
+	if want := "Added a paragraph: “" + strings.TrimSpace(strings.Repeat("word ", 11)) + "…”"; got != want {
+		t.Fatalf("got\n%s\nwant\n%s", got, want)
+	}
+}
+
+// The editor sends a new bold of part of a sentence as two replacements: its
+// start tag and its end tag. The line names the words between them.
+func TestChangeSummaryNamesAFormatFromItsStartTagToItsEndTag(t *testing.T) {
+	base := `<p>Select only these words today.</p><p>Clients retry twice before giving up.</p>`
+	tags := func(word, start, end string) []Replacement {
+		r := at(base, word, "")
+		return []Replacement{
+			{Start: r.Start, End: r.Start, NewHTML: start},
+			{Start: r.End, End: r.End, NewHTML: end},
+		}
+	}
+	for _, c := range []struct {
+		name string
+		rs   []Replacement
+		want string
+	}{
+		{"bold", tags("these words", "<strong>", "</strong>"), "Made “these words” bold"},
+		{"one word", tags("twice", "<strong>", "</strong>"), "Made “twice” bold"},
+		{"italic", tags("these words", "<em>", "</em>"), "Made “these words” italic"},
+		{"link", tags("these words", `<a href="https://example.com">`, "</a>"), "Linked “these words”"},
+	} {
+		if got := summary(base, c.rs...); got != c.want {
+			t.Errorf("%s: got %q, want %q", c.name, got, c.want)
+		}
+	}
+
+	linked := `<p>Read <a href="https://a.example">the notes</a> first.</p>`
+	for _, c := range []struct {
+		name string
+		rs   []Replacement
+		want string
+	}{
+		{"unlink", []Replacement{at(linked, `<a href="https://a.example">`, ""), at(linked, "</a>", "")},
+			"Removed the link from “the notes”"},
+		{"link target", []Replacement{at(linked, "a.example", "b.example")}, "Changed the link on “the notes”"},
+		{"markup", []Replacement{at(linked, "<p>", "<p >")}, "Changed the HTML only"},
+	} {
+		if got := summary(linked, c.rs...); got != c.want {
+			t.Errorf("%s: got %q, want %q", c.name, got, c.want)
+		}
+	}
+}
+
+func TestChangeSummaryNamesTheFirstChangeOfAWholeDocument(t *testing.T) {
+	before := `<div class="card"><h2>Card A</h2></div><div class="card"><h2>Card B</h2></div><p>End</p>`
+	if got, want := ChangeSummary([]byte(before), []byte(`<div class="card"><h2>Card A</h2></div><p>End</p>`)), "Removed the section “Card B”"; got != want {
+		t.Fatalf("ChangeSummary = %q, want %q", got, want)
+	}
+	if got, want := ChangeSummary([]byte(before), []byte(before+"<p>New</p>")), "Added a paragraph: “New”"; got != want {
+		t.Fatalf("ChangeSummary = %q, want %q", got, want)
+	}
+}
+
+// The words of an element are a part of the words of the page, so a document
+// with many elements around its text costs that text one time.
+func TestChangeSummaryOfADeepDocumentCostsItsTextOneTime(t *testing.T) {
+	const depth = 300
+	words := strings.Repeat("some words of a long paragraph ", 8<<10)
+	deep := func(last string) []byte {
+		return []byte(strings.Repeat("<div>", depth) + "<p>" + words + last + "</p>" + strings.Repeat("</div>", depth))
+	}
+	before, after := deep("end."), deep("end. More words.")
+	var m0, m1 runtime.MemStats
+	runtime.ReadMemStats(&m0)
+	got := ChangeSummary(before, after)
+	runtime.ReadMemStats(&m1)
+	if want := "Added “More words.”"; got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+	if used := m1.TotalAlloc - m0.TotalAlloc; used > 40*uint64(len(before)) {
+		t.Fatalf("the summary allocated %d bytes for a document of %d bytes", used, len(before))
+	}
+}

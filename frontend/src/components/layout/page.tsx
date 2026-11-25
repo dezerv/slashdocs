@@ -1,5 +1,7 @@
 import type { ReactNode } from "react";
+import { useLocation } from "react-router-dom";
 import { beat } from "@/lib/enter";
+import { SegmentedNav } from "@/components/ui/segmented";
 import { RazorSenseBackdrop } from "@/components/razorsense-backdrop";
 import { cn } from "@/lib/cn";
 
@@ -74,5 +76,25 @@ export function PageHeader({
         </div>
       )}
     </header>
+  );
+}
+
+const SETTINGS = [
+  { value: "/app/settings/profile", label: "Profile" },
+  { value: "/app/settings/developers", label: "Developers" },
+  { value: "/app/settings/service-accounts", label: "Bots" },
+];
+
+// The settings pages, above their titles, so each is one click from the
+// others. They are pages, so they are links and not tabs.
+export function SettingsNav() {
+  const { pathname } = useLocation();
+  return (
+    <SegmentedNav
+      label="Settings"
+      value={pathname}
+      options={SETTINGS}
+      className="enter mb-6 w-fit"
+    />
   );
 }

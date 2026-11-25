@@ -4,17 +4,38 @@ import { snapshotForPrint } from "./document-export.ts";
 import { dispatchPublicEvent, PUBLIC_NAMES } from "./public-names.ts";
 import type { RenderedTextWithBrPositions } from "./anchoring/rendered-text.ts";
 import { renderedTextOf } from "./anchoring/rendered-text.ts";
-import { describeAnchor, resolveAnchor } from "./anchoring/index.ts";
+import { describeAnchor, resolveAnchor, snapToWords } from "./anchoring/index.ts";
 import { TextRange } from "./anchoring/text-range.ts";
 import type { CommentAnchor } from "./anchoring/types.ts";
 import {
-  clearHighlights,
   clearHighlightsFor,
   highlightRange,
   refreshSVGRects,
+  reveal,
 } from "./highlight.ts";
-import { createCursorLayer, trackPointer } from "./cursors.ts";
-import { CHORD_KEYS } from "../src/lib/esc-chord.ts";
+import { createCursorChat, createCursorLayer, trackPointer } from "./cursors.ts";
+import { createPinLayer, parsePins, type PinRect } from "./pins.ts";
+import {
+  blockOf,
+  caretRange,
+  cover,
+  isEditableTarget,
+  markSurface,
+  placeClear,
+  reducedMotion,
+  scrollBehavior,
+  settled,
+  slide,
+} from "./dom.ts";
+import type { Patch } from "./source-pieces.ts";
+import { caretOf, isCaret, placeCaret } from "./caret.ts";
+import { changedRects, QUIET_SHARE, watchView } from "./view.ts";
+import { changesOf, placeAfter } from "./patch.ts";
+import { startTextEditing, type TextEditor } from "./text-editing.ts";
+import { BRIDGE_UI, elementOf, REFUSED } from "./structure.ts";
+import { probe, startScriptText, type ScriptText } from "./script-text.ts";
+import { blockTexts, changedBlocks, type Block } from "./changed-blocks.ts";
+import { CHORD_KEYS, CHORD_WINDOW_MS } from "../src/lib/esc-chord.ts";
 import {
   reduceVimScroll,
   VIM_GLIDE_PX_PER_MS,
@@ -82,6 +103,9 @@ interface SlashdocsPublicAPI {
 declare global {
   interface Window {
     __SLASHDOCS_APP_ORIGIN__?: string;
+    // Set by the wrapper before the document loads and kept current by the
+    // bridge, so a document that reloads itself reads the live theme.
+    __slashdocsTheme?: string;
     __slashdocsKVHandlers?: KVHandlers;
     __slashdocsKVQueue?: QueuedKVOperation[];
     __slashdocsGitHubQueue?: Array<{
@@ -96,11 +120,25 @@ declare global {
   }
 }
 
+// A selection as character offsets into the body text. trailing marks a
+// caret at the end of its text node, which the same offset at the start of
+// the next node must not take.
+interface SavedSelection {
+  start: number;
+  end: number;
+  backward: boolean;
+  trailing: boolean;
+}
+
 interface PaintItem {
-  id?: string;
+  id: string;
   anchor?: CommentAnchor;
   quote?: string;
   selected_text?: string;
+  // The reader did not read the thread.
+  unread?: boolean;
+  // The reader resolved the thread, whose highlight fades.
+  leaving?: boolean;
 }
 
 type Theme = "dark" | "light";
@@ -108,7 +146,47 @@ type Theme = "dark" | "light";
 (function bridge(): void {
   const appOrigin = window.__SLASHDOCS_APP_ORIGIN__ || "*";
   const frame = document.getElementById("slashdocs-doc") as HTMLIFrameElement;
-  const cursors = createCursorLayer(doc);
+  const cursors = createCursorLayer(doc, () =>
+    parent.postMessage({ type: "slashdocs:unfollowed" }, targetOrigin()),
+  );
+  const pins = createPinLayer({
+    doc,
+    post: (message) => parent.postMessage(message, targetOrigin()),
+    laidOut: () => scheduleCommentPositions(),
+  });
+  // This reader's cursor color, which the app gives only to a reader who can
+  // chat at their cursor.
+  let chatColor: string | undefined;
+  // The cursor chat of the current document, which the app opens when "/" is
+  // pressed outside the document.
+  let chat: { open: () => boolean } | null = null;
+  // A focused pin sits in this window, over the document, so its keys reach
+  // this window, not the document. Give them the document's shortcuts (Esc,
+  // C, the Esc chords) but leave the button its own keys. The same goes for
+  // the keys of this window's body, which has the focus when the app gives
+  // it back to the frame.
+  let documentKeys: ((ev: KeyboardEvent) => void) | null = null;
+  // The app shows the Esc chord, and says while it waits for a letter. An Esc
+  // here arms it at once, as the app does, so that a letter right after it
+  // goes to the chord before the app's word comes. The app's word, or the
+  // chord's time, ends it.
+  let chordArmed = false;
+  // The document has open threads, so the app takes the keys that go from
+  // one to the next.
+  let threadKeys = false;
+  const THREAD_KEYS = ["n", "N"];
+  let chordTimer: ReturnType<typeof setTimeout> | undefined;
+  function armChord(armed: boolean): void {
+    chordArmed = armed;
+    clearTimeout(chordTimer);
+    if (armed) chordTimer = setTimeout(() => (chordArmed = false), CHORD_WINDOW_MS);
+  }
+  document.addEventListener("keydown", (ev) => {
+    const target = ev.target as Element | null;
+    if (target !== document.body && !target?.closest?.(".sd-pins")) return;
+    if (ev.key === "Enter" || ev.key === " " || ev.key === "Tab") return;
+    documentKeys?.(ev);
+  });
   let kvRequestID = 0;
   const kvPending: Record<string, KVPendingRequest> = {};
   let githubRequestID = 0;
@@ -471,6 +549,262 @@ type Theme = "dark" | "light";
   }
 
   let printPreparing = false;
+  let textEditor: TextEditor | null = null;
+  // The app's Edit mode: the reader types in the document.
+  let textEditing = false;
+  let scriptText: ScriptText | null = null;
+  // Highlights split the text nodes that the editor changes, so they come
+  // off each block that the editor changes, and go back when the app takes
+  // the changes. The others stay. Paints and repairs wait meanwhile, and the
+  // comment rail keeps its positions.
+  let highlightsHeld = false;
+  // Whether the highlights must be painted when they go back: one came off,
+  // or a paint waited.
+  let paintWaits = false;
+
+  // textChanges gives the edits on screen, the count of user operations that
+  // made them, and the scroll of the document. A take also gives the
+  // selection, which a load keeps, and the highlights of the changed blocks
+  // come back after it.
+  function textChanges(take: boolean) {
+    const { regions } = (take ? textEditor?.take() : textEditor?.peek()) ?? {
+      regions: [],
+    };
+    if (take) releaseHighlights();
+    const d = doc();
+    return {
+      regions,
+      edits: textEditor?.edits() ?? 0,
+      scripts: scriptText?.take() ?? [],
+      top: Math.round(d?.defaultView?.scrollY ?? 0),
+      ...(take && { caret: d && caretOf(d) }),
+    };
+  }
+
+  // Text editing makes the document editable in place. The frame's srcdoc
+  // is the source as the server tagged it, before any script ran. Leaving
+  // Edit mode only pauses the editor, so that the regions still hold every
+  // change since the frame loaded. Text that is selected as Edit mode
+  // starts gets the caret.
+  function setTextEditing(on: boolean): void {
+    const d = doc();
+    textEditing = on;
+    // The selection actions change with editing.
+    selectionAction?.remove();
+    // Script text gives back the contenteditable values that the source map
+    // gave it, so it pauses first.
+    scriptText?.setEditable(on);
+    textEditor?.setEditable(on);
+    if (!on) return releaseHighlights();
+    if (!d?.body) return;
+    if (!textEditor) startEditor(d);
+    const selection = d.getSelection();
+    const range = selectedRange(selection);
+    if (!range) return;
+    d.body.focus({ preventScroll: true });
+    selection?.removeAllRanges();
+    selection?.addRange(range);
+  }
+
+  function startEditor(d: Document): void {
+    markSurface(d);
+    const post = (message: object) => parent.postMessage(message, targetOrigin());
+    // Each user operation also sends a draft, which the app sends when the
+    // page goes: a page that goes cannot wait for an answer of the frame. The
+    // draft goes in the same task, after the operation is complete.
+    const onDirty = () => {
+      if (held.size) followHeld(d.body);
+      queueMicrotask(() =>
+        post({ type: "slashdocs:text-draft", ...textChanges(false) }),
+      );
+    };
+    textEditor = startTextEditing(
+      d,
+      frame.srcdoc,
+      {
+        beforeTouch: holdHighlights,
+        onDirty,
+        // A hint at the text already says why it does not change.
+        onRefused: (reason) =>
+          ((reason === REFUSED.script || reason === REFUSED.fixed) &&
+            scriptText?.pulse()) ||
+          post({ type: "slashdocs:text-refused", reason }),
+      },
+      textEditing,
+    );
+    if (!textEditor) return;
+    scriptText = startScriptText(d, {
+      source: textEditor.map,
+      post,
+      onChange: onDirty,
+    });
+    scriptText.setEditable(textEditing);
+  }
+
+  // patchText shows the text of other people in place, without a load. The
+  // app made the patches for the count of user operations that its last take
+  // gave: after one more operation they are stale, and change nothing. A
+  // reader who does not edit gets the editor too, not editable, because the
+  // regions hold every change since the load. The text that the reader
+  // reads stays in its place. With ask, a patch that still changes much of
+  // the view of the reader is withdrawn: it changes nothing. A patch of a
+  // script string goes to script text after the others fit, as the script
+  // text of the reader does, and it must change the count of places that
+  // the app found. The reply is a take.
+  function patchText(data: {
+    requestId: string;
+    edits: number;
+    patches: Patch[];
+    flash?: boolean;
+    ask?: boolean;
+  }): void {
+    const d = doc();
+    if (!textEditor && d?.body) startEditor(d);
+    const isString = (p: Patch): p is Extract<Patch, { script: number }> =>
+      "script" in p;
+    const strings = data.patches.filter(isString);
+    // The view is measured only for a patch that fits.
+    let view = null as ReturnType<typeof watchView> | null;
+    const others = data.patches.filter((p) => !isString(p));
+    const { ranges = [], ...result } = textEditor?.patch(others, data.edits, () => {
+      view = d && watchView(d);
+      return (ranges) => (view?.settle(ranges) ?? 0) < QUIET_SHARE || data.ask !== true;
+    }) ?? { ok: false };
+    const texts = result.ok
+      ? strings.map(({ from, to }) => scriptText?.replace(from, to) ?? [])
+      : [];
+    if (texts.some((changed, i) => changed.length !== strings[i].places))
+      result.ok = false;
+    // The scroll goes back after the document is as it was.
+    if (result.withdrawn) view?.restore();
+    if (d && data.flash === true)
+      flashRects(
+        d,
+        [...changedRects(ranges), ...texts.flat().flatMap(rectsOf)],
+        CHANGED_FLASH,
+      );
+    // The text moved under the carets of the other editors.
+    cursors.refresh();
+    parent.postMessage(
+      {
+        type: "slashdocs:text-patched",
+        requestId: data.requestId,
+        ...result,
+        ...textChanges(true),
+      },
+      targetOrigin(),
+    );
+  }
+
+  // The highlights that live changes hold: the text of each comment, as
+  // offsets in heldText, the text of the body when they were last moved.
+  // A comment keeps its characters through the changes, as the caret does,
+  // so its highlight grows with typing in it and shrinks with deletion in
+  // it. It goes back on that text, and not where its quote is. The server
+  // moves the stored anchors in the same way.
+  const held = new Map<string, [start: number, end: number]>();
+  let heldText = "";
+
+  // followHeld moves the held highlights to the same characters of the text
+  // of body now.
+  function followHeld(body: HTMLElement): void {
+    const now = body.textContent ?? "";
+    const changes = held.size ? changesOf(heldText, now, []) : null;
+    if (changes)
+      for (const [id, [start, end]] of held)
+        held.set(id, [placeAfter(changes, start)[0], placeAfter(changes, end)[0]]);
+    heldText = now;
+  }
+
+  // anchorOf describes the text that the highlight of a comment holds, as
+  // for a new comment. A comment with no highlight has none.
+  function anchorOf(id: string): CommentAnchor | null {
+    const body = doc()?.body;
+    const range = body && marksRange(body, id);
+    return (range && describeAnchor(body, range)) || null;
+  }
+
+  function holdHighlights(block: Element): void {
+    const d = doc();
+    const body = d?.body;
+    if (!d || !body) return;
+    highlightsHeld = true;
+    const ids = new Set(
+      Array.from(
+        block.querySelectorAll<HTMLElement>(
+          "mark.slashdocs-mark,.slashdocs-svg-mark-text",
+        ),
+        (mark) => mark.dataset.cid!,
+      ),
+    );
+    if (held.size || ids.size) followHeld(body);
+    if (!ids.size) return;
+    paintWaits = true;
+    suspendMutationObserver();
+    const caret = saveSelection(d, body, true);
+    // The marks of a comment can be in other blocks too, and all of them
+    // come off. The text keeps its offsets when marks go.
+    for (const id of ids) {
+      const range = marksRange(body, id);
+      const text = range && TextRange.fromRange(range).relativeTo(body);
+      if (text) held.set(id, [text.start.offset, text.end.offset]);
+      clearHighlightsFor(d, id);
+    }
+    if (caret) restoreSelection(d, body, caret);
+    resumeMutationObserver();
+  }
+
+  // marksRange gives the range from the first mark of a comment to its last
+  // one.
+  function marksRange(body: HTMLElement, id: string): Range | null {
+    const cid = CSS.escape(id);
+    const marks = body.querySelectorAll(
+      `mark.slashdocs-mark[data-cid="${cid}"],.slashdocs-svg-mark-text[data-cid="${cid}"]`,
+    );
+    const last = marks[marks.length - 1];
+    if (!last) return null;
+    try {
+      const range = body.ownerDocument.createRange();
+      range.setStart(marks[0], 0);
+      range.setEnd(last, last.childNodes.length);
+      return range;
+    } catch {
+      return null;
+    }
+  }
+
+  // releaseHighlights paints each held highlight on its text. A comment
+  // whose text went is detached until a load: it does not go to other text
+  // that its quote finds.
+  function releaseHighlights(): void {
+    const d = doc();
+    const body = d?.body;
+    if (!highlightsHeld || !d || !body) return;
+    highlightsHeld = false;
+    if (!paintWaits) return;
+    paintWaits = false;
+    // Wrapping text in marks moves the caret, so it goes back after.
+    const caret = saveSelection(d, body, true);
+    suspendMutationObserver();
+    followHeld(body);
+    for (const [id, [start, end]] of held) {
+      const key = placed.get(id)?.key;
+      if (key === undefined) continue;
+      const range = TextRange.fromOffsets(body, start, end).toRange();
+      const quote = strippedText(range.toString());
+      const painted =
+        !!quote && highlightRange(range, id === lastPaint?.active, id, false) > 0;
+      placed.set(
+        id,
+        painted ? { key, text: quote } : { key, text: null, detached: true },
+      );
+    }
+    held.clear();
+    resumeMutationObserver();
+    if (lastPaint) paint(lastPaint.items, lastPaint.active);
+    if (caret) restoreSelection(d, body, caret);
+  }
+
   const exportPending = new Map<string, { resolve: () => void; reject: () => void }>();
   let exportID = 0;
   function requestPrint(): void {
@@ -610,8 +944,13 @@ type Theme = "dark" | "light";
     if (!d || d.getElementById("slashdocs-highlight-style")) return;
     const s = d.createElement("style");
     s.id = "slashdocs-highlight-style";
+    // The bridge's controls are not text of the document, so a selection,
+    // as of Cmd+A, does not mark them. A field keeps its own selection. The
+    // app names an unsent comment "draft:…". Its highlight has a dashed
+    // underline, apart from the comments that are sent.
     s.textContent =
-      ".slashdocs-mark{background:#fef3c7!important;color:#111827!important;-webkit-text-fill-color:#111827!important;box-decoration-break:clone;-webkit-box-decoration-break:clone;border-radius:2px 2px 0 0;box-shadow:inset 0 -2px 0 #fbbf24;cursor:pointer;transition:background-color .15s,box-shadow .15s}.slashdocs-mark-active{background:#fde68a!important;box-shadow:inset 0 -2px 0 #f59e0b}.slashdocs-svg-mark-text{fill:#111827!important;-webkit-text-fill-color:#111827!important;cursor:pointer}.slashdocs-svg-mark-rect{fill:#fef3c7;stroke:#fbbf24;stroke-width:1;rx:3;ry:3;pointer-events:auto;opacity:.8}.slashdocs-svg-mark-rect.slashdocs-mark-active{fill:#fde68a;stroke:#f59e0b;stroke-width:2;opacity:.9}@media print{.slashdocs-mark{background:transparent!important;box-shadow:none!important;-webkit-text-fill-color:inherit!important;color:inherit!important}.slashdocs-svg-mark-rect{display:none!important}.slashdocs-svg-mark-text{fill:inherit!important;-webkit-text-fill-color:inherit!important}}";
+      `:root :is(${BRIDGE_UI}),:root :is(${BRIDGE_UI}) :not(input){-webkit-user-select:none!important;user-select:none!important}` +
+      ".slashdocs-mark{background:#fef3c7!important;color:#111827!important;-webkit-text-fill-color:#111827!important;box-decoration-break:clone;-webkit-box-decoration-break:clone;border-radius:2px 2px 0 0;box-shadow:inset 0 -2px 0 #fbbf24;cursor:pointer;transition:background-color .15s,box-shadow .15s}.slashdocs-mark-active{background:#fde68a!important;box-shadow:inset 0 -2px 0 #f59e0b}.slashdocs-mark[data-unread]{box-shadow:inset 2px 0 0 #2563eb,inset 0 -2px 0 #fbbf24}.slashdocs-mark-active[data-unread]{box-shadow:inset 2px 0 0 #2563eb,inset 0 -2px 0 #f59e0b}.slashdocs-svg-mark-text{fill:#111827!important;-webkit-text-fill-color:#111827!important;cursor:pointer}.slashdocs-svg-mark-rect{fill:#fef3c7;stroke:#fbbf24;stroke-width:1;rx:3;ry:3;pointer-events:auto;opacity:.8}.slashdocs-svg-mark-rect.slashdocs-mark-active{fill:#fde68a;stroke:#f59e0b;stroke-width:2;opacity:.9}.slashdocs-svg-mark-rect[data-unread]{stroke:#2563eb}.slashdocs-mark[data-leaving]{background:transparent!important;box-shadow:none;transition-duration:.2s}.slashdocs-svg-mark-rect[data-leaving]{opacity:0;transition:opacity .2s}@media screen{.slashdocs-mark[data-cid^='draft:']{background:#fffbeb!important;box-shadow:none;text-decoration:underline dashed #f59e0b 1.5px!important;text-underline-offset:3px!important}.slashdocs-mark-active[data-cid^='draft:']{background:#fde68a!important}.slashdocs-svg-mark-rect[data-cid^='draft:']{stroke-dasharray:3 2}}@media print{.slashdocs-mark{background:transparent!important;box-shadow:none!important;-webkit-text-fill-color:inherit!important;color:inherit!important}.slashdocs-svg-mark-rect{display:none!important}.slashdocs-svg-mark-text{fill:inherit!important;-webkit-text-fill-color:inherit!important}}";
     (d.head || d.documentElement).appendChild(s);
   }
 
@@ -628,10 +967,15 @@ type Theme = "dark" | "light";
     characterData: true,
     subtree: true,
   };
-  // Identity of the last fully painted item list, and its results, so a
-  // repaint that only changes the active comment can skip re-anchoring.
-  let lastPaintKey: string | null = null;
-  let lastPaintResults: { id: string; anchored: boolean }[] | null = null;
+  // Each comment that the page placed: the key of its item, and the text of
+  // its highlight without white space, or null when it has no highlight. A
+  // highlight stays on its text until a load. Only a new or changed item
+  // anchors by its quote. A comment whose text a live change removed is
+  // detached: it waits for a load, not for its quote.
+  const placed = new Map<
+    string,
+    { key: string; text: string | null; detached?: true }
+  >();
   let commentPositionFrame = 0;
   // The active comment whose mark was last revealed (scrolled into view).
   // Reveal fires only when activation changes to a different comment:
@@ -648,23 +992,31 @@ type Theme = "dark" | "light";
   let restoredSelection: Range | null = null;
   let restoredSelectionExpiry = 0;
 
-  function paintKeyOf(list: PaintItem[]): string {
-    return JSON.stringify(
-      list.map((x) => [x && x.id, x && x.anchor, x && x.quote, x && x.selected_text]),
-    );
+  const itemKey = (x: PaintItem) =>
+    JSON.stringify([x.anchor, x.quote, x.selected_text]);
+  const quoteOf = (x: PaintItem) => x.anchor?.quote || x.quote || x.selected_text || "";
+
+  function paintResults(): { id: string; anchored: boolean }[] {
+    return (lastPaint?.items ?? []).flatMap(({ id }) => {
+      const p = placed.get(id);
+      return p ? [{ id, anchored: p.text !== null }] : [];
+    });
   }
 
   // Snapshot the user's live selection as character offsets into
   // body.textContent (unchanged by highlight wrapping) so a repaint can put
   // it back. Without this, unwrapping and re-wrapping the text nodes under
   // the selection makes the browser drop the native selection highlight
-  // while the user is still selecting.
+  // while the user is still selecting. With caret set, a collapsed selection
+  // is kept too. In Edit mode, it is the caret of the editor, so a paint
+  // keeps it.
   function saveSelection(
     d: Document,
     body: HTMLElement,
-  ): { start: number; end: number; backward: boolean } | null {
+    caret = textEditing,
+  ): SavedSelection | null {
     const sel = d.getSelection();
-    if (!sel || sel.isCollapsed || sel.rangeCount < 1) return null;
+    if (!sel || (sel.isCollapsed && !caret) || sel.rangeCount < 1) return null;
     try {
       const range = sel.getRangeAt(0);
       if (!body.contains(range.commonAncestorContainer)) return null;
@@ -673,7 +1025,17 @@ type Theme = "dark" | "light";
       probe.setStart(sel.anchorNode!, sel.anchorOffset);
       probe.collapse(true);
       const backward = probe.comparePoint(sel.focusNode!, sel.focusOffset) === -1;
-      return { start: textRange.start.offset, end: textRange.end.offset, backward };
+      const trailing =
+        sel.isCollapsed &&
+        sel.focusNode!.nodeType === Node.TEXT_NODE &&
+        sel.focusOffset > 0 &&
+        sel.focusOffset === (sel.focusNode as Text).data.length;
+      return {
+        start: textRange.start.offset,
+        end: textRange.end.offset,
+        backward,
+        trailing,
+      };
     } catch {
       return null;
     }
@@ -682,15 +1044,19 @@ type Theme = "dark" | "light";
   function restoreSelection(
     d: Document,
     body: HTMLElement,
-    saved: { start: number; end: number; backward: boolean },
+    saved: SavedSelection,
   ): void {
     try {
       const range = TextRange.fromOffsets(body, saved.start, saved.end).toRange();
       // Offset resolution is forward-biased: an end offset on a node
       // boundary resolves to (nextNode, 0), which visually stretches the
       // restored selection across the block boundary. Pull it back to the
-      // end of the preceding text node.
-      if (range.endOffset === 0 && range.endContainer !== range.startContainer) {
+      // end of the preceding text node, as for a caret that was at the end of
+      // its text.
+      if (
+        range.endOffset === 0 &&
+        (range.endContainer !== range.startContainer || saved.trailing)
+      ) {
         const tw = d.createTreeWalker(body, NodeFilter.SHOW_TEXT);
         tw.currentNode = range.endContainer;
         const prev = tw.previousNode() as Text | null;
@@ -698,6 +1064,7 @@ type Theme = "dark" | "light";
       }
       const sel = d.getSelection();
       if (!sel) return;
+      const focused = body.matches(":focus");
       if (saved.backward) {
         sel.setBaseAndExtent(
           range.endContainer,
@@ -713,6 +1080,9 @@ type Theme = "dark" | "light";
           range.endOffset,
         );
       }
+      // A selection in editable text focuses it, but text that Esc left
+      // stays left, so the keys after Esc stay shortcuts.
+      if (!focused) body.blur();
       restoredSelection = range;
       restoredSelectionExpiry = Date.now() + 1000;
     } catch {
@@ -732,31 +1102,31 @@ type Theme = "dark" | "light";
       el.classList.toggle("slashdocs-mark-active", isActive);
       if (isActive && !scrollTarget) scrollTarget = el;
     });
-    if (scroll && scrollTarget) {
-      (scrollTarget as Element).scrollIntoView({ block: "center", behavior: "smooth" });
-    }
+    if (scroll && scrollTarget) reveal(scrollTarget as Element);
+  }
+
+  // markThreads puts a bar at the start of the highlight of each thread that
+  // the reader did not read, on its first mark only, and fades the
+  // highlight of each thread that the reader resolved.
+  function markThreads(d: Document): void {
+    const ids = (key: "unread" | "leaving") =>
+      new Set(lastPaint?.items.flatMap((x) => (x?.[key] && x.id ? [x.id] : [])));
+    const [unread, leaving] = [ids("unread"), ids("leaving")];
+    const seen = new Set<string>();
+    d.querySelectorAll<HTMLElement | SVGElement>(
+      "mark.slashdocs-mark,.slashdocs-svg-mark-rect",
+    ).forEach((el) => {
+      const id = el.dataset.cid ?? "";
+      el.toggleAttribute("data-unread", unread.has(id) && !seen.has(id));
+      el.toggleAttribute("data-leaving", leaving.has(id));
+      seen.add(id);
+    });
   }
 
   // Whitespace-insensitive text key: mark text omits synthesized <br> spaces
   // and reformatting must not read as a content change.
   function strippedText(s: string): string {
     return s.replace(/\s+/g, "");
-  }
-
-  // Painted quote (whitespace-stripped) per comment id, used to detect
-  // whether a highlight survived a document mutation intact.
-  const paintedQuotes = new Map<string, string>();
-
-  function postCommentScroll(): void {
-    const d = doc();
-    if (!d) return;
-    parent.postMessage(
-      {
-        type: "slashdocs:comment-scroll",
-        scrollTop: d.defaultView?.scrollY || d.documentElement.scrollTop || 0,
-      },
-      targetOrigin(),
-    );
   }
 
   // Report a short passage in the middle of the viewport, so other viewers
@@ -798,15 +1168,6 @@ type Theme = "dark" | "light";
     return null;
   }
 
-  function caretRange(d: Document, x: number, y: number): Range | null {
-    if (!d.caretPositionFromPoint) return d.caretRangeFromPoint(x, y);
-    const position = d.caretPositionFromPoint(x, y);
-    if (!position) return null;
-    const range = d.createRange();
-    range.setStart(position.offsetNode, position.offset);
-    return range;
-  }
-
   function postCommentPositions(): void {
     const d = doc();
     if (!d || !lastPaint) return;
@@ -840,11 +1201,11 @@ type Theme = "dark" | "light";
         positions.push({ id, top: top + scrollTop, bottom: bottom + scrollTop });
       }
     }
+    for (const { id, top } of pins.tops()) positions.push({ id, top, bottom: top });
     parent.postMessage(
       {
         type: "slashdocs:comment-positions",
         positions,
-        scrollTop,
         scrollHeight,
       },
       targetOrigin(),
@@ -857,14 +1218,14 @@ type Theme = "dark" | "light";
     commentPositionFrame = view.requestAnimationFrame(() => {
       commentPositionFrame = 0;
       const current = doc();
-      if (!current) return;
+      if (!current || highlightsHeld) return;
       refreshSVGRects(current);
       postCommentPositions();
     });
   }
 
   function highlightIntact(d: Document, id: string): boolean {
-    const expected = paintedQuotes.get(id);
+    const expected = placed.get(id)?.text;
     if (!expected) return false;
     const cid = CSS.escape(id);
     let text = "";
@@ -915,25 +1276,21 @@ type Theme = "dark" | "light";
   // and move with the document, so an anchored comment whose marks are still
   // present with their text intact needs no work at all — an unrelated DOM
   // change (opening a dropdown, an animation tick) touches nothing. Only
-  // comments whose highlighted text was removed or edited, and comments
+  // comments whose highlighted text a script removed or changed, and comments
   // still waiting for their text to appear, are re-anchored.
   function repairAfterMutations(): void {
     const d = doc();
     const body = d && d.body;
-    if (!d || !body || !lastPaint || !lastPaint.items.length || !lastPaintResults) {
+    if (!d || !body || highlightsHeld || !lastPaint || !lastPaint.items.length) {
       return;
     }
     refreshSVGRects(d);
-    const resultByID = new Map(lastPaintResults.map((r) => [r.id, r]));
-    const dirty: PaintItem[] = [];
-    for (const x of lastPaint.items) {
-      if (!x || !x.id) continue;
-      const res = resultByID.get(x.id);
-      if (!res) continue;
-      // Unanchored comments retry (their text may just have been rendered);
-      // anchored comments only repaint when their highlight was damaged.
-      if (!res.anchored || !highlightIntact(d, x.id)) dirty.push(x);
-    }
+    // A comment with no highlight tries again, as its text can show later.
+    // A detached one waits for a load.
+    const dirty = lastPaint.items.filter((x) => {
+      const p = placed.get(x.id);
+      return p && !p.detached && (!p.text || !highlightIntact(d, x.id));
+    });
     if (!dirty.length) return;
 
     suspendMutationObserver();
@@ -944,35 +1301,45 @@ type Theme = "dark" | "light";
       let rendered: RenderedTextWithBrPositions | undefined;
       const getRenderedText = () => (rendered ??= renderedTextOf(body));
       for (const x of dirty) {
-        let painted: boolean;
-        try {
-          if (clearHighlightsFor(d, x.id!) > 0) mutatedDOM = true;
-          const anchor: CommentAnchor = Object.assign({}, x.anchor);
-          if (!anchor.quote) anchor.quote = x.quote || x.selected_text || "";
-          paintedQuotes.set(x.id!, strippedText(anchor.quote));
-          const r = resolveAnchor(body, anchor, getRenderedText);
-          painted =
-            !!r && highlightRange(r, x.id === lastPaint.active, x.id, false) > 0;
-          if (painted) mutatedDOM = true;
-        } catch {
-          painted = false;
-        }
-        const res = resultByID.get(x.id!);
-        if (res) res.anchored = painted;
+        if (clearHighlightsFor(d, x.id) > 0) mutatedDOM = true;
+        if (anchorByQuote(body, x, getRenderedText)) mutatedDOM = true;
       }
       // Only put the selection back when this repair actually touched the
       // DOM; a fruitless retry must not churn the user's selection.
       if (savedSelection && mutatedDOM) restoreSelection(d, body, savedSelection);
+      markThreads(d);
     } catch {
       // Never let one exotic document abort the repair loop.
     } finally {
       resumeMutationObserver();
     }
     parent.postMessage(
-      { type: "slashdocs:paint-result", results: lastPaintResults },
+      { type: "slashdocs:paint-result", results: paintResults() },
       targetOrigin(),
     );
     scheduleCommentPositions();
+  }
+
+  // anchorByQuote paints a comment where its stored anchor finds its text, as
+  // on a load, and tells whether it did.
+  function anchorByQuote(
+    body: HTMLElement,
+    x: PaintItem,
+    getRenderedText: () => RenderedTextWithBrPositions,
+  ): boolean {
+    const anchor: CommentAnchor = { ...x.anchor, quote: quoteOf(x) };
+    let text: string | null = null;
+    try {
+      const r = resolveAnchor(body, anchor, getRenderedText);
+      const found = r && strippedText(r.toString());
+      if (found && highlightRange(r, x.id === lastPaint?.active, x.id, false) > 0)
+        text = found;
+    } catch {
+      // A single off-contract item must not abort the whole paint: it is
+      // unanchored instead.
+    }
+    placed.set(x.id, { key: itemKey(x), text });
+    return text !== null;
   }
 
   // Our own painting mutates the document (splitText, mark wrapping, svg
@@ -1010,76 +1377,185 @@ type Theme = "dark" | "light";
     active: string | null | undefined,
   ): void {
     const d = doc();
-    const list = items || [];
+    const list = (items || []).filter((x) => x && typeof x.id === "string");
     const activeID = typeof active === "string" ? active : null;
     lastPaint = { items: list, active: activeID };
-    const key = paintKeyOf(list);
+    // Held highlights take this paint when they go back.
+    paintWaits = highlightsHeld;
+    if (highlightsHeld) return;
     const body = d && d.body;
-
-    // Repaint with the same comments (sidebar clicks changing the active
-    // id): move the active class without touching DOM structure. Any damage
-    // from document mutations is healed by repairAfterMutations.
-    const reveal = activeID !== null && activeID !== revealedActive;
-    if (d && body && lastPaintResults && key === lastPaintKey) {
+    if (d && body) {
+      placeComments(d, body, list);
+      // A repaint that only changes the active comment, as a click in the
+      // sidebar does, moves the active class and leaves the DOM as it is.
+      const reveal = activeID !== null && activeID !== revealedActive;
       revealedActive = activeID;
       applyActiveOnly(d, activeID, reveal);
-      parent.postMessage(
-        { type: "slashdocs:paint-result", results: lastPaintResults },
-        targetOrigin(),
-      );
-      scheduleCommentPositions();
-      return;
-    }
-
-    const results: { id: string; anchored: boolean }[] = [];
-    if (d && body) {
-      revealedActive = activeID;
-      suspendMutationObserver();
-      const savedSelection = saveSelection(d, body);
-      try {
-        clearHighlights(d);
-        paintedQuotes.clear();
-        injectStyles();
-        // One rendered-text snapshot serves every comment in this paint: marks
-        // add no text, so wrapping earlier comments never invalidates it.
-        let rendered: RenderedTextWithBrPositions | undefined;
-        const getRenderedText = () => (rendered ??= renderedTextOf(body));
-        list.forEach((x) => {
-          let painted: boolean;
-          // A single off-contract item must not abort the whole paint: catch
-          // per comment and report it unanchored instead.
-          try {
-            const anchor: CommentAnchor = Object.assign({}, x && x.anchor);
-            if (!anchor.quote) anchor.quote = (x && (x.quote || x.selected_text)) || "";
-            if (x && x.id) paintedQuotes.set(x.id, strippedText(anchor.quote || ""));
-            // Resolve immediately before painting each comment: wrapping a
-            // previous comment's marks moves text nodes, which corrupts other
-            // already-resolved live Ranges (overlapping comments would paint
-            // wrong extents), while character offsets into textContent stay
-            // valid across wraps and splits.
-            const r = resolveAnchor(body, anchor, getRenderedText);
-            painted = !!r && highlightRange(r, x.id === activeID, x.id, reveal) > 0;
-          } catch {
-            painted = false;
-          }
-          if (x && x.id) results.push({ id: x.id, anchored: painted });
-        });
-        if (savedSelection) restoreSelection(d, body, savedSelection);
-      } catch {
-        // Even a document with exotic DOM state (throwing accessors, broken
-        // replaceWith) must not prevent the paint-result post below.
-      } finally {
-        resumeMutationObserver();
-      }
-      lastPaintKey = key;
-      lastPaintResults = results;
+      markThreads(d);
     }
     // Post even when the inner document is unavailable so the parent never
     // keeps stale "highlight not found" state.
-    parent.postMessage({ type: "slashdocs:paint-result", results }, targetOrigin());
+    parent.postMessage(
+      { type: "slashdocs:paint-result", results: paintResults() },
+      targetOrigin(),
+    );
     scheduleCommentPositions();
   }
 
+  // placeComments keeps the highlight of each comment that the page placed
+  // for the same item, or that shows the quote of its changed item already,
+  // as after an editor typed in its text. It takes off those of the others,
+  // and anchors each new or changed item by its quote.
+  function placeComments(d: Document, body: HTMLElement, list: PaintItem[]): void {
+    const keys = new Map(list.map((x) => [x.id, itemKey(x)]));
+    for (const x of list) {
+      const p = placed.get(x.id);
+      if (p?.text && p.text === strippedText(quoteOf(x)))
+        placed.set(x.id, { key: itemKey(x), text: p.text });
+    }
+    const gone = [...placed].filter(([id, { key }]) => keys.get(id) !== key);
+    gone.forEach(([id]) => placed.delete(id));
+    const fresh = list.filter((x) => !placed.has(x.id));
+    if (!gone.length && !fresh.length) return;
+    suspendMutationObserver();
+    const savedSelection = saveSelection(d, body);
+    try {
+      injectStyles();
+      gone.forEach(([id]) => clearHighlightsFor(d, id));
+      // One rendered-text snapshot serves every comment in this paint: marks
+      // add no text, so wrapping earlier comments never invalidates it.
+      // Each comment resolves just before it paints: wrapping a previous
+      // comment's marks moves text nodes, which corrupts other resolved live
+      // ranges, while character offsets into textContent stay valid.
+      let rendered: RenderedTextWithBrPositions | undefined;
+      const getRenderedText = () => (rendered ??= renderedTextOf(body));
+      fresh.forEach((x) => anchorByQuote(body, x, getRenderedText));
+      if (savedSelection) restoreSelection(d, body, savedSelection);
+    } catch {
+      // Even a document with exotic DOM state (throwing accessors, broken
+      // replaceWith) must not prevent the paint-result post.
+    } finally {
+      resumeMutationObserver();
+    }
+  }
+
+  // The thread whose popover the app shows, and the last rect sent for it.
+  let watched: string | null = null;
+  let watchFrame = 0;
+  let watchedRect = "";
+
+  // watchAnchor reports where a thread's pin or highlight is, each frame
+  // that it moves, so the app keeps its popover beside it. A rect of null
+  // means that this version has neither.
+  function watchAnchor(id: string | null): void {
+    watched = id;
+    watchedRect = "";
+    cancelAnimationFrame(watchFrame);
+    if (id) watchFrame = requestAnimationFrame(postWatched);
+  }
+
+  function postWatched(): void {
+    const id = watched;
+    if (!id) return;
+    const rect = pins.rect(id) ?? marksRect(id);
+    // The blocks that hold a highlight, and the text of its lines. The rest
+    // of those lines is part of what the comment is on, so the app keeps the
+    // popover off them: in the margin of the blocks, or else beside the text.
+    const block = marksRect(id, (mark) => blockOf(mark)?.getBoundingClientRect());
+    const lines = marksRect(id, linesOf);
+    const key = JSON.stringify([rect, block, lines]);
+    if (key !== watchedRect) {
+      watchedRect = key;
+      parent.postMessage(
+        { type: "slashdocs:anchor-rect", id, rect, block, lines },
+        targetOrigin(),
+      );
+    }
+    watchFrame = requestAnimationFrame(postWatched);
+  }
+
+  // linesOf gives the box of the text on the lines of a mark, in its block.
+  function linesOf(mark: Element): DOMRect {
+    const own = mark.getBoundingClientRect();
+    const block = blockOf(mark);
+    if (!block) return own;
+    const range = mark.ownerDocument.createRange();
+    range.selectNodeContents(block);
+    let [left, right] = [own.left, own.right];
+    for (const line of range.getClientRects()) {
+      if (!line.width || line.bottom <= own.top || line.top >= own.bottom) continue;
+      left = Math.min(left, line.left);
+      right = Math.max(right, line.right);
+    }
+    return new DOMRect(left, own.top, right - left, own.height);
+  }
+
+  // marksRect gives the box around a text comment's highlight, or around the
+  // box that `boxOf` gives for each of its marks. It is null when the
+  // comment has no highlight.
+  function marksRect(
+    id: string,
+    boxOf: (mark: Element) => DOMRect | undefined = (mark) =>
+      mark.getBoundingClientRect(),
+  ): PinRect | null {
+    const d = doc();
+    if (!d) return null;
+    const cid = CSS.escape(id);
+    let box: DOMRect | null = null;
+    for (const mark of d.querySelectorAll(
+      `mark.slashdocs-mark[data-cid="${cid}"],.slashdocs-svg-mark-rect[data-cid="${cid}"]`,
+    )) {
+      const r = boxOf(mark);
+      if (!r || (!r.width && !r.height)) continue;
+      box = box
+        ? new DOMRect(
+            Math.min(box.left, r.left),
+            Math.min(box.top, r.top),
+            Math.max(box.right, r.right) - Math.min(box.left, r.left),
+            Math.max(box.bottom, r.bottom) - Math.min(box.top, r.top),
+          )
+        : r;
+    }
+    if (!box) return null;
+    return { left: box.left, top: box.top, width: box.width, height: box.height };
+  }
+
+  // pulse shows where a thread is that the reader went to, once its pin or
+  // highlight stops moving, as when the scroll to it ends: its pin sends out
+  // a ring, or its highlight's tint doubles. It gives up after two seconds.
+  let pulseFrame = 0;
+  function pulse(id: string): void {
+    cancelAnimationFrame(pulseFrame);
+    let last = "";
+    let still = 0;
+    let frames = 0;
+    const step = () => {
+      const rect = pins.rect(id) ?? marksRect(id);
+      const key = JSON.stringify(rect);
+      still = rect && key === last ? still + 1 : 0;
+      last = key;
+      if (still < 4) {
+        if (++frames < 120) pulseFrame = requestAnimationFrame(step);
+        return;
+      }
+      const d = doc();
+      if (!d || pins.pulse(id)) return;
+      const cid = CSS.escape(id);
+      const marks = d.querySelectorAll(
+        `mark.slashdocs-mark[data-cid="${cid}"],.slashdocs-svg-mark-rect[data-cid="${cid}"]`,
+      );
+      flashRects(
+        d,
+        Array.from(marks).flatMap((m) => Array.from(m.getClientRects())),
+        PULSE,
+      );
+    };
+    pulseFrame = requestAnimationFrame(step);
+  }
+
+  // A click on a highlight opens its thread. For an editor, the click also
+  // puts the caret in the text, as in Google Docs: the thread opens beside
+  // the words and leaves the focus in them.
   function activate(e: MouseEvent): void {
     const m = (e.target &&
       (e.target as Element).closest &&
@@ -1131,6 +1607,12 @@ type Theme = "dark" | "light";
     if (!d || !e.target || !(e.target as Element).closest) return;
     const a = (e.target as Element).closest("a[href]") as HTMLAnchorElement | null;
     if (!a) return;
+    // A click on a link while editing places the caret. Cmd or Ctrl and
+    // click follows the link, as in other editors.
+    if (textEditing && !e.metaKey && !e.ctrlKey) {
+      e.preventDefault();
+      return;
+    }
     const href = a.getAttribute("href") || "";
     if (!href || /^javascript:/i.test(href)) {
       e.preventDefault();
@@ -1140,7 +1622,7 @@ type Theme = "dark" | "light";
       const t = fragmentTarget(d, href);
       if (t) {
         e.preventDefault();
-        t.scrollIntoView({ block: "start", behavior: "smooth" });
+        t.scrollIntoView({ block: "start", behavior: scrollBehavior(d) });
         try {
           d.defaultView!.history.replaceState(null, "", href);
         } catch (err) {}
@@ -1179,6 +1661,16 @@ type Theme = "dark" | "light";
   }
 
   let curTheme: Theme | null = null;
+  // The app's pointer, "coarse" for a finger. A frame does not always match
+  // the app's (pointer: coarse), as in touch emulation.
+  let hostPointer = "";
+  // The theme last announced to the current document. A document that reloads
+  // itself on a theme change (a common way to re-render a diagram) would
+  // reload forever if every load were announced. So the load right after an
+  // announcement counts as that reload and is skipped. Every other load is
+  // announced, because documents that only listen for the event need it.
+  let announcedTheme: Theme | null = null;
+  let reloadExpected = false;
   function initialTheme(): Theme | null {
     try {
       const t = new URLSearchParams(location.search).get("slashdocs_theme");
@@ -1191,11 +1683,19 @@ type Theme = "dark" | "light";
   function applyTheme(t: unknown): void {
     if (t !== "dark" && t !== "light") return;
     curTheme = t;
+    // The prelude in the document reads this before its own scripts run, and
+    // a document that reloads itself reads it again on the way back.
+    window.__slashdocsTheme = t;
     const d = doc();
     if (!d || !d.documentElement) return;
     for (const name of PUBLIC_NAMES) {
       d.documentElement.setAttribute(`data-${name}-theme`, t);
     }
+    markSurface(d);
+    d.documentElement.setAttribute("data-slashdocs-pointer", hostPointer);
+    if (d !== setupDoc || announcedTheme === t) return;
+    announcedTheme = t;
+    reloadExpected = true;
     try {
       dispatchPublicEvent(d.defaultView!, "theme", { detail: { theme: t } });
     } catch (e) {}
@@ -1218,6 +1718,31 @@ type Theme = "dark" | "light";
       range = merged;
     }
     return range.collapsed ? null : range;
+  }
+
+  // snapSelection widens a drag to whole words when the pointer lets go, so
+  // the selection shows the quote that a comment on it takes. A selection
+  // made with keys stays as the keys put it.
+  function snapSelection(d: Document): void {
+    const s = d.getSelection();
+    const range = selectedRange(s);
+    if (!s || !range) return;
+    const words = snapToWords(range);
+    if (s.anchorNode === range.endContainer && s.anchorOffset === range.endOffset) {
+      s.setBaseAndExtent(
+        words.endContainer,
+        words.endOffset,
+        words.startContainer,
+        words.startOffset,
+      );
+    } else {
+      s.setBaseAndExtent(
+        words.startContainer,
+        words.startOffset,
+        words.endContainer,
+        words.endOffset,
+      );
+    }
   }
 
   function labelIcon(button: HTMLButtonElement, label: string): void {
@@ -1252,16 +1777,62 @@ type Theme = "dark" | "light";
     if (!d.getElementById("slashdocs-icon-tooltip-style")) {
       const style = d.createElement("style");
       style.id = "slashdocs-icon-tooltip-style";
+      // A hidden tip has no box, so that it never widens the page, as near
+      // its right edge on a phone. It fades in from its starting style.
       style.textContent = `
-        [data-slashdocs-tooltip]::after{all:initial!important;content:attr(data-slashdocs-tooltip)!important;position:absolute!important;z-index:2147483647!important;top:var(--slashdocs-tip-top,auto)!important;bottom:var(--slashdocs-tip-bottom,calc(100% + 6px))!important;left:var(--slashdocs-tip-left,50%)!important;transform:translate(var(--slashdocs-tip-shift,-50%),var(--slashdocs-tip-enter-y,3px))!important;width:max-content!important;max-width:min(220px,calc(100vw - 16px))!important;box-sizing:border-box!important;padding:6px 10px!important;border-radius:6px!important;background:#18181b!important;color:#fff!important;font:500 12px/1.4 system-ui,sans-serif!important;white-space:normal!important;text-align:center!important;box-shadow:0 2px 8px #0003!important;pointer-events:none!important;visibility:hidden!important;opacity:0!important;transition:opacity .1s ease-out,transform .14s ease-out,visibility 0s linear .1s!important}
-        [data-slashdocs-tooltip]:hover::after,[data-slashdocs-tooltip]:focus-visible::after{visibility:visible!important;opacity:1!important;transform:translate(var(--slashdocs-tip-shift,-50%),0)!important;transition:opacity .14s ease-out .5s,transform .14s ease-out .5s,visibility 0s linear .5s!important}
+        [data-slashdocs-tooltip]::after{all:initial!important;content:attr(data-slashdocs-tooltip)!important;position:absolute!important;z-index:2147483647!important;top:var(--slashdocs-tip-top,auto)!important;bottom:var(--slashdocs-tip-bottom,calc(100% + 6px))!important;left:var(--slashdocs-tip-left,50%)!important;transform:translate(var(--slashdocs-tip-shift,-50%),var(--slashdocs-tip-enter-y,3px))!important;width:max-content!important;max-width:min(220px,calc(100vw - 16px))!important;box-sizing:border-box!important;padding:6px 10px!important;border-radius:6px!important;background:#18181b!important;color:#fff!important;font:500 12px/1.4 system-ui,sans-serif!important;white-space:normal!important;text-wrap:balance!important;text-align:center!important;box-shadow:0 2px 8px #0003!important;pointer-events:none!important;display:none!important;opacity:0!important;transition:opacity .1s ease-out,transform .14s ease-out,display .1s allow-discrete!important}
+        [data-slashdocs-tooltip]:hover::after,[data-slashdocs-tooltip]:focus-visible::after{display:block!important;opacity:1!important;transform:translate(var(--slashdocs-tip-shift,-50%),0)!important;transition:opacity .14s ease-out .5s,transform .14s ease-out .5s,display .14s allow-discrete .5s!important}
+        @starting-style{[data-slashdocs-tooltip]:hover::after,[data-slashdocs-tooltip]:focus-visible::after{opacity:0!important;transform:translate(var(--slashdocs-tip-shift,-50%),var(--slashdocs-tip-enter-y,3px))!important}}
         [data-slashdocs-tooltip]:focus-visible::after{transition-delay:0s!important}
+        [data-slashdocs-tooltip][data-slashdocs-copied]::after{content:"Copied"!important;display:block!important;opacity:1!important;transform:translate(var(--slashdocs-tip-shift,-50%),0)!important;transition-delay:0s!important}
         @media(prefers-reduced-motion:reduce){[data-slashdocs-tooltip]::after{transition-duration:0s!important;transform:translateX(var(--slashdocs-tip-shift,-50%))!important}}
         @media print{[data-slashdocs-tooltip]::after{display:none!important}}`;
       d.head.appendChild(style);
     }
   }
 
+  const SELECTION_ACTION_GAP = 6;
+  const MAC = /Mac|iPhone|iPad/.test(navigator.userAgent);
+  const COMMENT_CHORD = MAC ? "⌘⌥M" : "Ctrl+Alt+M";
+  // The formatting actions for an editor: the input that each one runs, its
+  // name and keys, the elements around a selection that has it, and its icon.
+  const FORMATS = [
+    {
+      type: "formatBold",
+      name: "Bold",
+      keys: MAC ? "⌘B" : "Ctrl+B",
+      on: "strong,b",
+      icon: "M6 12h9a4 4 0 0 1 0 8H7a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1h7a4 4 0 0 1 0 8",
+    },
+    {
+      type: "formatItalic",
+      name: "Italic",
+      keys: MAC ? "⌘I" : "Ctrl+I",
+      on: "em,i",
+      icon: "M19 4h-9M14 20H5M15 4 9 20",
+    },
+    {
+      type: "insertLink",
+      name: "Link",
+      keys: MAC ? "⌘K" : "Ctrl+K",
+      on: "a[href]",
+      icon: "M9 17H7A5 5 0 0 1 7 7h2M15 7h2a5 5 0 1 1 0 10h-2M8 12h8",
+    },
+    {
+      type: "insertUnorderedList",
+      name: "Bulleted list",
+      keys: MAC ? "⌘⇧8" : "Ctrl+Shift+8",
+      on: "ul>li",
+      icon: "M3 12h.01M3 18h.01M3 6h.01M8 12h13M8 18h13M8 6h13",
+    },
+    {
+      type: "insertOrderedList",
+      name: "Numbered list",
+      keys: MAC ? "⌘⇧7" : "Ctrl+Shift+7",
+      on: "ol>li",
+      icon: "M10 12h11M10 18h11M10 6h11M4 10h2M4 6h1v4M6 18H4c0-1 2-2 2-3s-1-1.5-2-1",
+    },
+  ];
   let selectionAction: HTMLDivElement | null = null;
   let actionRange: Range | null = null;
   let selectionDismissed = false;
@@ -1275,22 +1846,23 @@ type Theme = "dark" | "light";
   function commitSelection(range: Range): void {
     const d = doc();
     if (!d?.body) return;
-    const anchor = describeAnchor(d.body, range);
+    const anchor = describeAnchor(d.body, snapToWords(range));
     if (!anchor) return;
-    const rect = range.getBoundingClientRect();
-    const scrollTop = d.defaultView?.scrollY || d.documentElement.scrollTop || 0;
     dismissSelectionAction();
-    parent.postMessage(
-      { type: "slashdocs:selection", anchor, top: rect.top + scrollTop },
-      targetOrigin(),
-    );
+    // The highlight of the new draft takes the place of the selection, so
+    // the draft stays in view after its popover closes, and a click opens it.
+    d.getSelection()?.removeAllRanges();
+    parent.postMessage({ type: "slashdocs:selection", anchor }, targetOrigin());
   }
 
   function selection(): void {
     const d = doc();
     if (!d || !d.body) return;
     const range = selectedRange(d.getSelection());
-    if (!range || isTextEditingTarget(d.activeElement)) {
+    // Text selected in the document editor is still document text to
+    // comment on; text in the document's own inputs is not.
+    const inEditor = textEditing && d.activeElement === d.body;
+    if (!range || (isEditableTarget(d, d.activeElement) && !inEditor)) {
       dismissSelectionAction();
       actionRange = null;
       return;
@@ -1330,16 +1902,10 @@ type Theme = "dark" | "light";
       selectionAction.setAttribute("aria-label", "Selected text actions");
       selectionAction.addEventListener("mousedown", (e) => e.preventDefault());
       selectionAction.addEventListener("click", (e) => e.stopPropagation());
-      const addAction = (
-        label: string,
-        title: string,
-        path: string,
-        click: () => void,
-      ) => {
+      const addAction = (label: string, path: string, click: () => void) => {
         const button = d.createElement("button");
         button.type = "button";
         button.setAttribute("aria-label", label);
-        labelIcon(button, title);
         const svg = d.createElementNS("http://www.w3.org/2000/svg", "svg");
         svg.setAttribute("viewBox", "0 0 24 24");
         svg.setAttribute("aria-hidden", "true");
@@ -1351,88 +1917,142 @@ type Theme = "dark" | "light";
         selectionAction!.appendChild(button);
         return button;
       };
-      addAction(
+      if (textEditing)
+        for (const format of FORMATS) {
+          const button = addAction(format.name, format.icon, () => {
+            textEditor?.run(format.type);
+            selection();
+          });
+          button.dataset.slashdocsFormat = format.on;
+          labelIcon(button, `${format.name} ${format.keys}`);
+        }
+      const comment = addAction(
         "Comment on selected text",
-        "Comment (C)",
         "M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9H13a8.48 8.48 0 0 1 8 8v.5Z",
         () => {
           if (actionRange) commitSelection(actionRange);
         },
       );
-      addAction(
+      // The main action says its name and its key, as a menu item does. When
+      // they do not fit in one row, it is an icon with a tooltip.
+      const name = d.createElement("span");
+      name.textContent = "Comment";
+      comment.append(name, d.createElement("kbd"));
+      comment.classList.add("slashdocs-comment");
+      labelIcon(comment, "Comment");
+      // A hash, as at headings, so that it differs from the Link action.
+      const copy = addAction(
         "Copy link to selected text",
-        "Copy link to text",
-        "M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71",
+        "M4 9h16M4 15h16M10 3 8 21M16 3l-2 18",
         () => {
           if (!actionRange) return;
-          const anchor = describeAnchor(d.body, actionRange);
+          const anchor = describeAnchor(d.body, snapToWords(actionRange));
           parent.postMessage({ type: "slashdocs:copy-text", anchor }, targetOrigin());
         },
       );
+      labelIcon(copy, "Copy link to text");
       if (!d.getElementById("slashdocs-selection-style")) {
         const style = d.createElement("style");
         style.id = "slashdocs-selection-style";
         style.textContent = `
-          .slashdocs-selection-action{all:initial!important;position:fixed!important;z-index:2147483647!important;display:flex!important;padding:2px!important;border-radius:10px!important;background:#fff!important;color:#52525b!important;box-shadow:0 0 0 1px #0001,0 4px 16px #0002!important}
-          .slashdocs-selection-action button{all:initial!important;position:relative!important;box-sizing:border-box!important;display:flex!important;align-items:center!important;justify-content:center!important;width:40px!important;height:40px!important;border-radius:8px!important;color:inherit!important;cursor:pointer!important;transition:background-color .15s,transform .15s!important}
+          .slashdocs-selection-action{all:initial!important;position:fixed!important;z-index:2147483647!important;display:flex!important;width:max-content!important;max-width:calc(100vw - 16px)!important;padding:2px!important;border-radius:10px!important;background:#fff!important;color:#52525b!important;box-shadow:0 0 0 1px #0001,0 4px 16px #0002!important;animation:slashdocs-selection-in .15s ease-out!important}
+          @keyframes slashdocs-selection-in{from{opacity:0;transform:scale(.97)}}
+          .slashdocs-selection-action button{all:initial!important;position:relative!important;box-sizing:border-box!important;display:flex!important;align-items:center!important;justify-content:center!important;gap:6px!important;min-width:40px!important;height:40px!important;padding:0 11px!important;border-radius:8px!important;color:inherit!important;cursor:pointer!important;transition:background-color .15s,transform .15s!important}
+          .slashdocs-selection-action span{all:initial!important;color:inherit!important;font:500 13px/1 system-ui,sans-serif!important}
+          .slashdocs-selection-action kbd{all:initial!important;padding:2px 5px!important;border-radius:4px!important;background:#f4f4f5!important;color:#71717a!important;font:500 11px/1.2 system-ui,sans-serif!important}
           .slashdocs-selection-action button:hover{background:#f4f4f5!important;color:#18181b!important}
           .slashdocs-selection-action button:active{transform:scale(.96)!important}
+          .slashdocs-selection-action button[hidden],.slashdocs-selection-action[data-compact] .slashdocs-comment>:not(svg),.slashdocs-selection-action:not([data-compact]) .slashdocs-comment::after{display:none!important}
+          .slashdocs-selection-action button[aria-pressed=true]{background:#eef2ff!important;color:#4338ca!important}
+          .slashdocs-selection-action [data-slashdocs-format]:not([hidden])+button:not([data-slashdocs-format])::before{all:initial!important;content:""!important;position:absolute!important;left:-1px!important;top:10px!important;bottom:10px!important;width:1px!important;background:currentColor!important;opacity:.2!important}
           .slashdocs-selection-action button:focus-visible{outline:2px solid #6366f1!important;outline-offset:-2px!important}
           .slashdocs-selection-action svg{all:initial!important;color:inherit!important;width:17px!important;height:17px!important;fill:none!important;stroke:currentColor!important;stroke-width:1.8!important;stroke-linecap:round!important;stroke-linejoin:round!important;pointer-events:none!important}
           .slashdocs-selection-action path{fill:none!important;stroke:inherit!important;stroke-width:inherit!important}
-          [data-slashdocs-theme=dark] .slashdocs-selection-action{background:#27272a!important;color:#d4d4d8!important;box-shadow:0 0 0 1px #fff2,0 4px 16px #0004!important}
-          [data-slashdocs-theme=dark] .slashdocs-selection-action button:hover{background:#3f3f46!important;color:#fff!important}
-          @media(prefers-reduced-motion:reduce){.slashdocs-selection-action button{transition:none!important}}
+          .slashdocs-selection-action[data-docked]{left:0!important;right:0!important;width:auto!important;max-width:none!important;justify-content:center!important;padding:2px 2px max(2px,env(safe-area-inset-bottom))!important;border-radius:0!important}
+          .slashdocs-selection-action[data-docked=bottom]{bottom:0!important}
+          .slashdocs-selection-action[data-docked=top]{top:0!important}
+          html:has(>.slashdocs-selection-action[data-docked=bottom]){padding-bottom:48px!important}
+          [data-slashdocs-surface=dark] .slashdocs-selection-action{background:#27272a!important;color:#d4d4d8!important;box-shadow:0 0 0 1px #fff2,0 4px 16px #0004!important}
+          [data-slashdocs-surface=dark] .slashdocs-selection-action button:hover{background:#3f3f46!important;color:#fff!important}
+          [data-slashdocs-surface=dark] .slashdocs-selection-action kbd{background:#3f3f46!important;color:#a1a1aa!important}
+          [data-slashdocs-surface=dark] .slashdocs-selection-action button[aria-pressed=true]{background:#312e81!important;color:#e0e7ff!important}
+          [data-slashdocs-pointer=coarse] .slashdocs-selection-action kbd{display:none!important}
+          @media(pointer:coarse){.slashdocs-selection-action kbd{display:none!important}}
+          @media(prefers-reduced-motion:reduce){.slashdocs-selection-action,.slashdocs-selection-action button{animation:none!important;transition:none!important}}
           @media print{.slashdocs-selection-action,.slashdocs-text-flash{display:none!important}}`;
         d.head.appendChild(style);
       }
-      d.body.appendChild(selectionAction);
+      // Outside the body, as the link field is, so that a selection of all
+      // the text, as of Cmd+A in the editor, does not hold the actions.
+      d.documentElement.appendChild(selectionAction);
     }
+    // In text that the reader edits, C types, so the chip shows the chord.
+    const typing = isEditableTarget(d, d.activeElement);
+    const key = typing ? COMMENT_CHORD : "C";
+    const comment = selectionAction.querySelector<HTMLElement>(".slashdocs-comment")!;
+    comment.querySelector("kbd")!.textContent = key;
+    comment.dataset.slashdocsTooltip = `Comment ${key}`;
+    // The formatting actions show for editable text, and are pressed when
+    // the whole selection has their format.
+    const ends = [range.startContainer, range.endContainer];
+    const formattable = inEditor && ends.every((n) => isEditableTarget(d, n));
+    selectionAction
+      .querySelectorAll<HTMLButtonElement>("[data-slashdocs-format]")
+      .forEach((button) => {
+        button.hidden = !formattable;
+        const on = ends.every((n) =>
+          elementOf(n)?.closest(button.dataset.slashdocsFormat!),
+        );
+        button.setAttribute("aria-pressed", String(on));
+      });
+    // The buttons shrink to fit in one row. Comment keeps its name and key
+    // while they fit in it. Its tooltip shows only when they do not.
+    selectionAction.removeAttribute("data-compact");
+    selectionAction.removeAttribute("data-docked");
+    selectionAction.toggleAttribute(
+      "data-compact",
+      comment.scrollWidth > comment.clientWidth,
+    );
+    // The actions sit next to the selection, as in other editors: centered
+    // above it, else below it. They cover the text around the selection
+    // while they show, but never the selection. With a finger, the system's
+    // own menu takes that place, so the actions sit where they cover no text:
+    // also after its last line, or beside its block. When no place is clear,
+    // as in a narrow column of text, they dock at an edge of the viewport as
+    // a bar, and the document gets room to scroll out from under a bar at
+    // the bottom.
     const rect = range.getBoundingClientRect();
-    const view = d.defaultView!;
-    selectionAction.style.setProperty(
-      "left",
-      `${Math.max(8, Math.min(rect.right - 84, view.innerWidth - 92))}px`,
-      "important",
-    );
-    selectionAction.style.setProperty(
-      "top",
-      `${Math.max(8, rect.bottom + 8 + 44 < view.innerHeight ? rect.bottom + 8 : rect.top - 52)}px`,
-      "important",
-    );
+    const lines = Array.from(range.getClientRects()).filter((r) => r.width);
+    const [first, last] = [lines[0] ?? rect, lines.at(-1) ?? rect];
+    const block = blockOf(range.startContainer)?.getBoundingClientRect() ?? rect;
+    const { offsetWidth: width, offsetHeight: height } = selectionAction;
+    const gap = SELECTION_ACTION_GAP;
+    const center = rect.left + (rect.width - width) / 2;
+    const beside = (line: DOMRect) => line.top + (line.height - height) / 2;
+    const touch = hostPointer === "coarse";
+    const places = [
+      [center, first.top - gap - height],
+      [center, last.bottom + gap],
+      ...(touch
+        ? [
+            [last.right + gap, beside(last)],
+            [block.right + gap, beside(first)],
+            [block.left - gap - width, beside(first)],
+          ]
+        : []),
+    ];
+    const edge = placeClear(d, selectionAction, lines, places, {
+      dock: touch,
+      overText: !touch,
+    });
+    if (!edge) return;
+    selectionAction.style.removeProperty("left");
+    selectionAction.style.removeProperty("top");
+    selectionAction.setAttribute("data-docked", edge);
   }
 
-  function isTextEditingTarget(target: EventTarget | null): boolean {
-    const d = doc();
-    if (d && String(d.designMode || "").toLowerCase() === "on") return true;
-    const keyTarget = target || (d && d.activeElement);
-    const el =
-      keyTarget && (keyTarget as Node).nodeType === 1
-        ? (keyTarget as Element)
-        : keyTarget && (keyTarget as Node).parentElement
-          ? (keyTarget as Node).parentElement
-          : null;
-    if (!el || !el.closest) return false;
-    const editable = el.closest("input,textarea,[contenteditable],[role='textbox']");
-    if (!editable) return false;
-    if (editable.matches && editable.matches("[contenteditable]")) {
-      return (
-        String(editable.getAttribute("contenteditable") || "").toLowerCase() !== "false"
-      );
-    }
-    const role = String(editable.getAttribute("role") || "").toLowerCase();
-    if (role === "textbox") return true;
-    const tag = String(editable.tagName || "").toLowerCase();
-    if (tag === "textarea") return true;
-    if (tag !== "input") return false;
-    const type = String(editable.getAttribute("type") || "text").toLowerCase();
-    return !/^(button|checkbox|radio|submit|reset|file|image|color|range|hidden)$/.test(
-      type,
-    );
-  }
-
-  function handleKVUndoRedoShortcut(ev: KeyboardEvent): void {
-    if (ev.defaultPrevented || isTextEditingTarget(ev.target)) return;
+  function handleKVUndoRedoShortcut(d: Document, ev: KeyboardEvent): void {
+    if (ev.defaultPrevented || isEditableTarget(d, ev.target)) return;
     if (!(ev.ctrlKey || ev.metaKey) || ev.altKey) return;
     const key = String(ev.key || "").toLowerCase();
     const wantsRedo = key === "y" || (key === "z" && ev.shiftKey);
@@ -1460,7 +2080,11 @@ type Theme = "dark" | "light";
     if (!d.getElementById("slashdocs-heading-link-style")) {
       const style = d.createElement("style");
       style.id = "slashdocs-heading-link-style";
-      style.textContent = `.slashdocs-heading-link{position:relative!important;display:inline-flex!important;vertical-align:middle;width:40px;height:40px;margin:0 0 0 4px;padding:0;align-items:center;justify-content:center;border:0;border-radius:6px;background:transparent;color:inherit;font:20px sans-serif;opacity:0;cursor:pointer;transition:opacity .15s}.slashdocs-heading-link::before{content:"#"}h1:hover>.slashdocs-heading-link,h2:hover>.slashdocs-heading-link,h3:hover>.slashdocs-heading-link,h4:hover>.slashdocs-heading-link,h5:hover>.slashdocs-heading-link,h6:hover>.slashdocs-heading-link,.slashdocs-heading-link:focus-visible{opacity:.65}.slashdocs-heading-link:focus-visible{outline:2px solid currentColor}@media(pointer:coarse){.slashdocs-heading-link{opacity:.5}}@media print{.slashdocs-heading-link{display:none!important}}`;
+      // The link button is out of flow, in the gutter before the heading's
+      // first line. Headings keep the height that the author gave them, so
+      // readers, editors and previews lay out the document in the same way.
+      // With no gutter, it follows the heading's last word.
+      style.textContent = `.slashdocs-heading-link{position:absolute!important;box-sizing:border-box!important;width:1.2em!important;margin:0!important;margin-inline-start:-1.2em!important;padding:0!important;border:0!important;border-radius:4px;background:transparent!important;color:inherit;font:inherit;text-align:center;cursor:pointer}.slashdocs-heading-link.slashdocs-heading-link-end{margin-inline-start:.25em!important}.slashdocs-heading-link::before{content:"#";opacity:0;transition:opacity .15s ease-out}:is(h1,h2,h3,h4,h5,h6):hover>.slashdocs-heading-link::before,.slashdocs-heading-link:focus-visible::before{opacity:.5}.slashdocs-heading-link:hover::before{opacity:.85}.slashdocs-heading-link:focus-visible{outline:2px solid currentColor}:is(h1,h2,h3,h4,h5,h6)>.slashdocs-heading-link[data-slashdocs-copied]::before{content:"✓";opacity:1}@media print{.slashdocs-heading-link{display:none!important}}`;
       d.head.appendChild(style);
     }
     Array.from(d.querySelectorAll("h1,h2,h3,h4,h5,h6")).forEach((heading) => {
@@ -1476,10 +2100,16 @@ type Theme = "dark" | "light";
         heading.id = id;
         used.add(id);
       }
-      if (!heading.querySelector(":scope > .slashdocs-heading-link")) {
-        const button = d.createElement("button");
+      let button = heading.querySelector<HTMLButtonElement>(
+        ":scope > .slashdocs-heading-link",
+      );
+      if (!button) {
+        button = d.createElement("button");
         button.type = "button";
         button.className = "slashdocs-heading-link";
+        // The editor's caret and typing stay in the heading's text.
+        button.contentEditable = "false";
+        button.addEventListener("mousedown", (event) => event.preventDefault());
         button.setAttribute(
           "aria-label",
           `Copy link to ${heading.textContent?.trim() || "heading"}`,
@@ -1493,10 +2123,43 @@ type Theme = "dark" | "light";
             targetOrigin(),
           );
         });
-        heading.appendChild(button);
       }
+      // The button sits in the gutter when the heading has room on its left.
+      // Else it follows the heading's text, so that it stays in the frame.
+      const fits =
+        heading.getBoundingClientRect().left >=
+        parseFloat(d.defaultView!.getComputedStyle(heading).fontSize) * 1.2;
+      if (button !== (fits ? heading.firstChild : heading.lastChild)) {
+        if (fits) heading.prepend(button);
+        else heading.append(button);
+      }
+      button.classList.toggle("slashdocs-heading-link-end", !fits);
+      // A button after a last word at the page's edge would make the page
+      // wider. It moves back over that word, where only hover and focus show it.
+      button.style.translate = "";
+      const over = button.getBoundingClientRect().right - d.documentElement.clientWidth;
+      if (!fits && over > 0) button.style.translate = `${-Math.ceil(over)}px`;
     });
     if (pendingHeading) navigateHeading(pendingHeading);
+  }
+
+  // The time that the link control of a heading says Copied.
+  const COPIED_MS = 1500;
+
+  // showCopied tells, on the link control of heading id, that its link is
+  // copied, in place of a toast that would cover the heading.
+  let copied: HTMLElement | undefined;
+  let copiedTimer: number | undefined;
+  function showCopied(id: string): void {
+    clearTimeout(copiedTimer);
+    if (copied) delete copied.dataset.slashdocsCopied;
+    copied =
+      doc()
+        ?.getElementById(id)
+        ?.querySelector<HTMLElement>(":scope > .slashdocs-heading-link") ?? undefined;
+    if (!copied) return;
+    copied.dataset.slashdocsCopied = "";
+    copiedTimer = window.setTimeout(() => showCopied(""), COPIED_MS);
   }
 
   function navigateHeading(id: string): void {
@@ -1519,13 +2182,11 @@ type Theme = "dark" | "light";
     const resting = {
       backgroundColor: d.defaultView!.getComputedStyle(target).backgroundColor,
     };
-    const reducedMotion = d.defaultView!.matchMedia(
-      "(prefers-reduced-motion: reduce)",
-    ).matches;
+    const reduced = reducedMotion(d);
     // A single arrival cue, with no layout changes or persistent author styles.
     headingFlash = target.animate(
       [highlight, { ...highlight, offset: 0.25 }, resting],
-      { duration: 1400, easing: reducedMotion ? "steps(1, end)" : "ease-out" },
+      { duration: 1400, easing: reduced ? "steps(1, end)" : "ease-out" },
     );
   }
   let textVisibilityObserver: MutationObserver | undefined;
@@ -1538,7 +2199,6 @@ type Theme = "dark" | "light";
     }
   }
 
-  let textFlashStarted = 0;
   let pendingText: CommentAnchor | null = null;
   let textRetryTimer: ReturnType<typeof setTimeout> | undefined;
   let textNoticeTimer: ReturnType<typeof setTimeout> | undefined;
@@ -1597,36 +2257,150 @@ type Theme = "dark" | "light";
       top: line.top + line.height / 2 - d.defaultView!.innerHeight / 2,
       behavior: "instant",
     });
-    textFlashStarted = Date.now();
-    const reducedMotion = d.defaultView!.matchMedia(
-      "(prefers-reduced-motion: reduce)",
-    ).matches;
-    // Non-interactive overlays avoid splitting text nodes or disturbing comments.
-    Array.from(range.getClientRects())
-      .slice(0, 200)
-      .forEach((r) => {
-        if (!r.width || !r.height) return;
-        const flash = d.createElement("span");
-        flash.className = "slashdocs-text-flash";
-        flash.setAttribute("aria-hidden", "true");
-        // Keep opacity animatable: an important `all` reset overrides animation values.
-        flash.style.cssText = `all:initial;position:fixed!important;pointer-events:none!important;z-index:2147483646!important;left:${r.left}px!important;top:${r.top}px!important;width:${r.width}px!important;height:${r.height}px!important;background:rgba(56,189,248,.32)!important;box-shadow:0 0 0 1px rgba(14,165,233,.65)!important;border-radius:3px!important`;
-        d.body.appendChild(flash);
-        const animation = flash.animate(
-          reducedMotion
-            ? [{ opacity: 1 }, { opacity: 1, offset: 0.85 }, { opacity: 0 }]
-            : [
-                { opacity: 0.2 },
-                { opacity: 1, offset: 0.12 },
-                { opacity: 0.25, offset: 0.25 },
-                { opacity: 1, offset: 0.38 },
-                { opacity: 1, offset: 0.72 },
-                { opacity: 0 },
-              ],
-          { duration: 2200, easing: reducedMotion ? "steps(1, end)" : "ease-in-out" },
-        );
-        animation.onfinish = () => flash.remove();
-      });
+    flashRects(d, Array.from(range.getClientRects()), TEXT_FLASH);
+  }
+
+  // A flash blinks twice on text that a link goes to, and fades once on text
+  // that changed. Reduced motion holds it, then takes it away.
+  // A flash paints a sky tint unless it gives its own paint. With reduced
+  // motion, it holds its keyframes, or else shows its still paint as long.
+  type Flash = {
+    keyframes: Keyframe[];
+    duration: number;
+    paint?: string;
+    still?: { paint: string; duration: number };
+  };
+  const TEXT_FLASH: Flash = {
+    keyframes: [
+      { opacity: 0.2 },
+      { opacity: 1, offset: 0.12 },
+      { opacity: 0.25, offset: 0.25 },
+      { opacity: 1, offset: 0.38 },
+      { opacity: 1, offset: 0.72 },
+      { opacity: 0 },
+    ],
+    duration: 2200,
+  };
+  const CHANGED_FLASH: Flash = {
+    keyframes: [{ opacity: 0 }, { opacity: 1, offset: 0.15 }, { opacity: 0 }],
+    duration: 1200,
+  };
+
+  // The paint of a flash that gives none.
+  const SKY =
+    "background:rgba(56,189,248,.32)!important;box-shadow:0 0 0 1px rgba(14,165,233,.65)!important";
+  // A thread that the reader went to: the tint of its highlight doubles and
+  // comes back, once. Reduced motion outlines it for 1.5 s.
+  const PULSE: Flash = {
+    keyframes: [{ opacity: 0 }, { opacity: 1, offset: 0.4 }, { opacity: 0 }],
+    duration: 600,
+    paint:
+      "background:rgba(251,191,36,.55)!important;mix-blend-mode:multiply!important",
+    still: { paint: "box-shadow:0 0 0 2px #f59e0b!important", duration: 1500 },
+  };
+
+  // flashRects puts a flash over each rectangle. Overlays that take no
+  // pointer events do not split text nodes or disturb comments. They sit on
+  // the page, not the window, so that they stay on their text through any
+  // scroll: the load, a scroll restore, an open pin, or the reader's own.
+  function flashRects(d: Document, rects: DOMRect[], flash: Flash): void {
+    const reduced = reducedMotion(d);
+    const { paint = SKY, duration } = (reduced && flash.still) || flash;
+    const { scrollX, scrollY } = d.defaultView!;
+    rects.slice(0, 200).forEach((r) => {
+      if (!r.width || !r.height) return;
+      const overlay = d.createElement("span");
+      overlay.className = "slashdocs-text-flash";
+      overlay.setAttribute("aria-hidden", "true");
+      // Keep opacity animatable: an important `all` reset overrides animation values.
+      overlay.style.cssText = `all:initial;position:absolute!important;pointer-events:none!important;z-index:2147483646!important;left:${r.left + scrollX}px!important;top:${r.top + scrollY}px!important;width:${r.width}px!important;height:${r.height}px!important;${paint};border-radius:3px!important`;
+      d.documentElement.appendChild(overlay);
+      const animation = overlay.animate(
+        reduced
+          ? [{ opacity: 1 }, { opacity: 1, offset: 0.85 }, { opacity: 0 }]
+          : flash.keyframes,
+        { duration, easing: reduced ? "steps(1, end)" : "ease-in-out" },
+      );
+      animation.onfinish = () => overlay.remove();
+    });
+  }
+
+  // The text of the blocks that a reader saw last in this tab, per document,
+  // which the next load of the document compares with its own. It is kept
+  // after each load, and again when the document's window goes, while its
+  // blocks are still there: this frame goes after the document does.
+  const SEEN_BLOCKS = `slashdocs:blocks:${location.pathname.split("/")[2]}`;
+  function keepSeen(blocks: Block[]): void {
+    // A window that goes before its blocks show keeps the list of the last.
+    if (!blocks.length) return;
+    try {
+      sessionStorage.setItem(SEEN_BLOCKS, JSON.stringify(blocks.map((b) => b.text)));
+    } catch {}
+  }
+
+  // showChanges flashes the blocks whose text the reader did not see last.
+  function showChanges(): void {
+    const d = doc();
+    if (!d?.body) return;
+    let seen: unknown;
+    try {
+      seen = JSON.parse(sessionStorage.getItem(SEEN_BLOCKS) ?? "null");
+    } catch {}
+    const blocks = blockTexts(d);
+    keepSeen(blocks);
+    if (!Array.isArray(seen)) return;
+    const changed = changedBlocks(
+      seen.map(String),
+      blocks.map((b) => b.text),
+    );
+    flashRects(
+      d,
+      changed.flatMap((i) => blocks[i].nodes.flatMap(rectsOf)),
+      CHANGED_FLASH,
+    );
+  }
+
+  // The margin that a document keeps at its left when it moves for a panel.
+  const ROOM_MARGIN = 16;
+  // The pixels at the right of the window that a panel of the app covers.
+  let panel = 0;
+
+  // makeRoomForPanel moves the document left, so that the panel covers none
+  // of its content, when its left margin has room. Else it tells the app,
+  // which makes room beside the panel.
+  function makeRoomForPanel(): void {
+    const d = doc();
+    if (!d?.body) return;
+    const shift = roomFor(d, panel);
+    slide(d, shift ?? 0);
+    if (shift === null)
+      parent.postMessage({ type: "slashdocs:room", crowded: true }, targetOrigin());
+  }
+
+  // roomFor tells how far left document d moves so that a panel over the
+  // right `covered` pixels of the window covers none of its content: 0 when the
+  // panel covers margin only, or null when the left margin is too narrow.
+  // The content is the boxes of the body's blocks, as a centered column, in
+  // the page.
+  function roomFor(d: Document, covered: number): number | null {
+    const view = d.defaultView!;
+    let left = Infinity;
+    let right = -Infinity;
+    for (const el of d.body.children) {
+      if (/^(absolute|fixed)$/.test(view.getComputedStyle(el).position)) continue;
+      const r = el.getBoundingClientRect();
+      if (!r.width || !r.height) continue;
+      left = Math.min(left, r.left + view.scrollX);
+      right = Math.max(right, r.right + view.scrollX);
+    }
+    const shift = Math.max(0, Math.ceil(right - (view.innerWidth - covered)));
+    return !shift || (left <= right && shift <= left - ROOM_MARGIN) ? shift : null;
+  }
+
+  function rectsOf(node: Node): DOMRect[] {
+    const range = node.ownerDocument!.createRange();
+    range.selectNodeContents(node);
+    return Array.from(range.getClientRects());
   }
 
   function setupFrame(): void {
@@ -1643,35 +2417,41 @@ type Theme = "dark" | "light";
     // any repaint already scheduled for it — keeps its comments from being
     // anchored into the new document mid-load.
     lastPaint = null;
-    lastPaintKey = null;
-    lastPaintResults = null;
+    placed.clear();
+    held.clear();
+    highlightsHeld = false;
+    paintWaits = false;
     commentPositionFrame = 0;
     revealedActive = null;
     restoredSelection = null;
-    paintedQuotes.clear();
     clearTimeout(mutationRepaintTimer ?? undefined);
     mutationRepaintTimer = null;
     mutationRepaintDeadline = 0;
     observeMutations(d);
+    // Before the click listeners below: a click that places a pin goes no
+    // further.
+    pins.start(d);
     resetKVHistory();
     injectStyles();
     installSlashdocsAPI();
     dismissSelectionAction();
     actionRange = null;
     selectionDismissed = false;
+    // The actions at the selection go on scroll. Docked ones stay, so that
+    // the reader can scroll text out from under them.
     d.defaultView?.addEventListener(
       "scroll",
       () => {
-        if (Date.now() - textFlashStarted > 100)
-          d.querySelectorAll(".slashdocs-text-flash").forEach((el) => el.remove());
+        if (!selectionAction?.hasAttribute("data-docked")) dismissSelectionAction();
       },
       { passive: true },
     );
-    d.defaultView?.addEventListener("scroll", dismissSelectionAction, {
-      passive: true,
-    });
     prepareHeadings(d);
     prepareLinks();
+    // The prelude already stamped the current theme on a reload, so only
+    // other loads get it announced.
+    announcedTheme = reloadExpected ? curTheme : null;
+    reloadExpected = false;
     applyTheme(curTheme);
     // Track the selection gesture so mutation repairs never run mid-drag
     // (they would make the browser stop rendering the native selection).
@@ -1681,7 +2461,12 @@ type Theme = "dark" | "light";
     d.addEventListener("mouseup", () => {
       selectionGestureActive = false;
     });
-    d.addEventListener("mouseup", () => setTimeout(selection, 0));
+    d.addEventListener("mouseup", () =>
+      setTimeout(() => {
+        snapSelection(d);
+        selection();
+      }, 0),
+    );
     d.addEventListener("keyup", () => setTimeout(selection, 0));
     // Touch devices: while a finger is down the user is still adjusting the
     // selection (long-press then drag the handles), so we must NOT emit yet
@@ -1728,7 +2513,6 @@ type Theme = "dark" | "light";
       selTimer = setTimeout(selection, 350);
     });
     const chordKeys: string[] = CHORD_KEYS.map((item) => item.key);
-    let chordArmedAt = 0;
     let vimGArmed = false;
     let vimGTimer = 0;
     let glide = 0;
@@ -1741,11 +2525,10 @@ type Theme = "dark" | "light";
     const runVimScroll = (action: VimScrollAction, repeat = false) => {
       const view = d.defaultView;
       if (!view) return;
-      const reducedMotion = view.matchMedia("(prefers-reduced-motion: reduce)").matches;
-      const behavior = reducedMotion ? "instant" : "smooth";
+      const behavior = scrollBehavior(d);
       if (action === "line-down" || action === "line-up") {
         const direction = action === "line-down" ? 1 : -1;
-        if (!repeat || reducedMotion) {
+        if (!repeat || behavior === "instant") {
           stopGlide();
           view.scrollBy({ top: direction * VIM_LINE_PX, behavior });
           return;
@@ -1774,17 +2557,22 @@ type Theme = "dark" | "light";
           behavior,
         });
     };
-    d.addEventListener("keydown", (ev) => {
-      if (ev.key === "Escape") dismissSelectionAction();
+    const onKey = (ev: KeyboardEvent) => {
+      // An Esc that closes the actions at the selection is theirs alone.
+      if (ev.key === "Escape") {
+        const shown = !!selectionAction?.isConnected;
+        dismissSelectionAction();
+        if (shown) return;
+      }
       const modified = ev.metaKey || ev.ctrlKey || ev.altKey;
-      // C comments on the selected text, as in Figma. Esc then C still
-      // toggles the comments panel.
-      if (
-        ev.key === "c" &&
-        !modified &&
-        !chordArmedAt &&
-        !isTextEditingTarget(ev.target)
-      ) {
+      if (ev.key === "Escape" && pins.isPlacing()) {
+        ev.preventDefault();
+        pins.setPlacing(false);
+        return;
+      }
+      // Where C types, as in the document editor, Ctrl or Cmd with Alt and
+      // M comments on the selection, as in Google Docs.
+      if ((ev.metaKey || ev.ctrlKey) && ev.altKey && ev.code === "KeyM") {
         const range = selectedRange(d.getSelection());
         if (range) {
           ev.preventDefault();
@@ -1792,34 +2580,53 @@ type Theme = "dark" | "light";
           return;
         }
       }
-      const target = ev.target as Element | null;
-      const textEditing = !!target?.closest?.(
-        'input,textarea,select,[contenteditable="true"]',
-      );
-      if (ev.defaultPrevented || textEditing) {
-        chordArmedAt = 0;
-        vimGArmed = false;
-        clearTimeout(vimGTimer);
-        handleKVUndoRedoShortcut(ev);
-        return;
-      }
-
-      if (ev.key === "Escape") {
-        chordArmedAt = modified ? 0 : Date.now();
+      // In Edit mode every key types while the text has the caret, as in
+      // Google Docs. Esc leaves the text, and in the app it closes the open
+      // thread, or else leaves Edit mode. It arms no chord.
+      if (ev.key === "Escape" && textEditing && isEditableTarget(d, ev.target)) {
+        (d.activeElement as HTMLElement | null)?.blur();
         parent.postMessage(
           { type: "slashdocs:keydown", key: "Escape" },
           targetOrigin(),
         );
-      } else if (chordArmedAt) {
-        const withinWindow = Date.now() - chordArmedAt <= 800;
-        chordArmedAt = 0;
-        const key = ev.key.toLowerCase();
-        if (withinWindow && !modified && chordKeys.includes(key)) {
-          parent.postMessage({ type: "slashdocs:keydown", key }, targetOrigin());
-        }
+        return;
+      }
+      if (ev.defaultPrevented || isEditableTarget(d, ev.target)) {
+        vimGArmed = false;
+        clearTimeout(vimGTimer);
+        handleKVUndoRedoShortcut(d, ev);
+        return;
+      }
+
+      const key = ev.key.toLowerCase();
+      if (ev.key === "Escape") {
+        // An Esc closes the open thread in the app, or leaves Edit mode, and
+        // arms no chord.
+        armChord(!chordArmed && !watched && !textEditing);
+        parent.postMessage(
+          { type: "slashdocs:keydown", key: "Escape" },
+          targetOrigin(),
+        );
+      } else if (chordArmed && !modified && chordKeys.includes(key)) {
+        // While the app shows the Esc chord, the chord takes the key: it
+        // types nothing, and C opens the comments instead of placing a pin.
+        armChord(false);
+        ev.preventDefault();
+        parent.postMessage({ type: "slashdocs:keydown", key }, targetOrigin());
       }
       if (ev.key === "?" && !modified) {
         parent.postMessage({ type: "slashdocs:keydown", key: "?" }, targetOrigin());
+      }
+      // While the document has open threads, N and Shift+N go from thread to
+      // thread in the app.
+      if (threadKeys && !modified && THREAD_KEYS.includes(ev.key)) {
+        ev.preventDefault();
+        if (!ev.repeat)
+          parent.postMessage(
+            { type: "slashdocs:keydown", key: ev.key },
+            targetOrigin(),
+          );
+        return;
       }
 
       const vim = reduceVimScroll(
@@ -1842,14 +2649,37 @@ type Theme = "dark" | "light";
         ev.preventDefault();
         runVimScroll(vim.action, ev.repeat);
       }
-      handleKVUndoRedoShortcut(ev);
-    });
+      handleKVUndoRedoShortcut(d, ev);
+    };
+    // C comments on the selected text, as in Figma, and with nothing
+    // selected it places a comment pin. In Edit mode it goes back to Comment
+    // mode, with a comment on the selected text, and E, which the app takes,
+    // starts Edit mode. They run after the document's own handlers, on its
+    // window, so a document that takes them keeps them.
+    const onModeKey = (ev: KeyboardEvent) => {
+      if (ev.metaKey || ev.ctrlKey || ev.altKey) return;
+      if (ev.defaultPrevented || isEditableTarget(d, ev.target)) return;
+      if (ev.key === (textEditing ? "c" : "e"))
+        parent.postMessage({ type: "slashdocs:keydown", key: ev.key }, targetOrigin());
+      if (ev.key !== "c") return;
+      ev.preventDefault();
+      const range = selectedRange(d.getSelection());
+      if (range) commitSelection(range);
+      else if (!textEditing) pins.setPlacing(!pins.isPlacing());
+    };
+    d.addEventListener("keydown", onKey);
+    d.defaultView?.addEventListener("keydown", onModeKey);
+    documentKeys = (ev) => {
+      onKey(ev);
+      onModeKey(ev);
+    };
     // Forward trackpad pinch-to-zoom (wheel + ctrlKey) to parent so the
-    // app can scale only the document iframe instead of browser-zooming.
-    d.addEventListener(
+    // app can scale only the document iframe instead of browser-zooming. A
+    // document that zooms itself takes the wheel first, and keeps it.
+    d.defaultView?.addEventListener(
       "wheel",
       function (ev) {
-        if (!ev.ctrlKey) return;
+        if (!ev.ctrlKey || ev.defaultPrevented) return;
         ev.preventDefault();
         parent.postMessage(
           {
@@ -1863,6 +2693,21 @@ type Theme = "dark" | "light";
       },
       { passive: false },
     );
+    // The app tells an editor what a change does to approvals when the text
+    // takes the caret. The focus settles first, as it moves from the body
+    // into script text.
+    const reportFocus = () =>
+      setTimeout(() =>
+        parent.postMessage(
+          {
+            type: "slashdocs:text-focus",
+            on: textEditing && isEditableTarget(d, d.activeElement),
+          },
+          targetOrigin(),
+        ),
+      );
+    d.addEventListener("focusin", reportFocus);
+    d.addEventListener("focusout", reportFocus);
     d.addEventListener("click", activate);
     d.addEventListener("click", handleLinkClick);
     d.addEventListener(
@@ -1870,20 +2715,34 @@ type Theme = "dark" | "light";
       () => parent.postMessage({ type: "slashdocs:document-click" }, targetOrigin()),
       true,
     );
-    d.defaultView?.addEventListener("scroll", postCommentScroll, {
-      passive: true,
-    });
     d.defaultView?.addEventListener("resize", scheduleCommentPositions);
+    d.defaultView?.addEventListener("pagehide", () => keepSeen(blockTexts(d)));
     // Capture scrolls of nested containers too, not only the window.
     d.addEventListener("scroll", scheduleViewport, { capture: true, passive: true });
     d.addEventListener("scroll", cursors.refresh, { capture: true, passive: true });
+    // Typing here moves the blocks that others edit.
+    d.addEventListener("input", cursors.refresh);
     d.defaultView?.addEventListener("resize", cursors.refresh);
-    trackPointer(d, (spot) =>
+    d.defaultView?.addEventListener("resize", cursors.refollow);
+    cursors.watchInput(d);
+    const pointer = trackPointer(d, (spot) =>
       parent.postMessage({ type: "slashdocs:pointer", spot }, targetOrigin()),
     );
-    parent.postMessage({ type: "slashdocs:ready" }, targetOrigin());
+    chat = pointer ? createCursorChat(d, pointer, () => chatColor) : null;
+    // A document that reloads by itself while being edited stays editable.
+    textEditor = null;
+    scriptText = null;
+    if (textEditing) setTextEditing(true);
+    // The address says which document is ready, so that the app does not
+    // take a late ready of the document before it as this one's.
+    parent.postMessage(
+      { type: "slashdocs:ready", href: location.href },
+      targetOrigin(),
+    );
     scheduleViewport();
     hydrateKV();
+    // A document that reloads by itself keeps clear of the panel.
+    if (panel) makeRoomForPanel();
   }
 
   frame.addEventListener("load", setupFrame);
@@ -1938,9 +2797,101 @@ type Theme = "dark" | "light";
       else pending?.reject();
       return;
     }
+    if (e.data.type === "slashdocs:text-editing") {
+      setTextEditing(e.data.on === true);
+      return;
+    }
+    if (
+      e.data.type === "slashdocs:text-collect" &&
+      typeof e.data.requestId === "string"
+    ) {
+      parent.postMessage(
+        {
+          type: "slashdocs:text-changes",
+          requestId: e.data.requestId,
+          ...textChanges(true),
+        },
+        targetOrigin(),
+      );
+      return;
+    }
+    // A draft comment is sent on the text that its highlight holds now: the
+    // highlight moves with the text that other people type.
+    if (
+      e.data.type === "slashdocs:anchor" &&
+      typeof e.data.requestId === "string" &&
+      typeof e.data.id === "string"
+    ) {
+      parent.postMessage(
+        {
+          type: "slashdocs:anchor-result",
+          requestId: e.data.requestId,
+          anchor: anchorOf(e.data.id),
+        },
+        targetOrigin(),
+      );
+      return;
+    }
+    if (
+      e.data.type === "slashdocs:text-patch" &&
+      typeof e.data.requestId === "string" &&
+      Array.isArray(e.data.patches)
+    ) {
+      patchText(e.data);
+      return;
+    }
+    // A saved script string shows its new text in every place, and the
+    // places that changed flash.
+    if (
+      e.data.type === "slashdocs:script-replace" &&
+      typeof e.data.from === "string" &&
+      typeof e.data.to === "string"
+    ) {
+      const d = doc();
+      const texts = scriptText?.replace(e.data.from, e.data.to) ?? [];
+      if (d) flashRects(d, texts.flatMap(rectsOf), CHANGED_FLASH);
+      return;
+    }
+    if (
+      e.data.type === "slashdocs:script-text-result" &&
+      typeof e.data.requestId === "string"
+    ) {
+      scriptText?.answer(
+        e.data.requestId,
+        e.data.editable === true,
+        e.data.failed === true,
+      );
+      return;
+    }
+    // The app renders a changed source in a hidden frame here, beside the
+    // document, to make sure that a script change shows before it saves.
+    if (
+      e.data.type === "slashdocs:probe" &&
+      typeof e.data.requestId === "string" &&
+      typeof e.data.html === "string" &&
+      Array.isArray(e.data.strings)
+    ) {
+      const { requestId, html, locator, strings } = e.data;
+      void probe(frame, html, locator, strings.map(String))
+        .catch(() => ({
+          text: null,
+          counts: strings.map(() => 0),
+          texts: 0,
+          errors: 0,
+        }))
+        .then((result) =>
+          parent.postMessage(
+            { type: "slashdocs:probe-result", requestId, ...result },
+            targetOrigin(),
+          ),
+        );
+      return;
+    }
     if (e.data.type === "slashdocs:paint") paint(e.data.comments, e.data.active);
-    else if (e.data.type === "slashdocs:theme") applyTheme(e.data.theme);
-    else if (e.data.type === "slashdocs:kv-response") {
+    else if (e.data.type === "slashdocs:theme") {
+      hostPointer = String(e.data.pointer ?? "");
+      applyTheme(e.data.theme);
+    } else if (e.data.type === "slashdocs:kv-response") {
       const requestId = String(e.data.requestId || "");
       const pending = kvPending[requestId];
       if (!pending) return;
@@ -1960,6 +2911,15 @@ type Theme = "dark" | "light";
         pending.reject(
           new Error((e.data.error && e.data.error.message) || "GitHub request failed"),
         );
+    } else if (
+      e.data.type === "slashdocs:room" &&
+      typeof e.data.cover === "number" &&
+      Number.isFinite(e.data.cover)
+    ) {
+      panel = e.data.cover;
+      makeRoomForPanel();
+    } else if (e.data.type === "slashdocs:show-changes") {
+      showChanges();
     } else if (e.data.type === "slashdocs:navigate-text") {
       navigateText(e.data.anchor);
     } else if (e.data.type === "slashdocs:navigate-heading") {
@@ -1971,10 +2931,18 @@ type Theme = "dark" | "light";
       typeof e.data.top === "number" &&
       Number.isFinite(e.data.top)
     ) {
-      doc()?.defaultView?.scrollTo({
+      const d = doc();
+      d?.defaultView?.scrollTo({
         top: Math.max(0, e.data.top),
         behavior: "instant",
       });
+      // The caret of an editor goes back to its characters after a load.
+      if (d?.body && isCaret(e.data.caret)) {
+        if (textEditing) d.body.focus({ preventScroll: true });
+        placeCaret(d, e.data.caret);
+      }
+    } else if (e.data.type === "slashdocs:history") {
+      textEditor?.run(e.data.redo === true ? "historyRedo" : "historyUndo");
     } else if (e.data.type === "slashdocs:vim-key") {
       const d = doc();
       const KeyboardEventCtor = d?.defaultView?.KeyboardEvent;
@@ -1995,7 +2963,52 @@ type Theme = "dark" | "light";
     } else if (e.data.type === "slashdocs:clear-cursors") {
       cursors.clear();
     } else if (e.data.type === "slashdocs:follow-cursor") {
-      cursors.follow(String(e.data.session || ""));
+      cursors.follow(String(e.data.session || ""), e.data.continuous === true);
+    } else if (e.data.type === "slashdocs:unfollow-cursor") {
+      cursors.unfollow();
+    } else if (e.data.type === "slashdocs:open-cursor-chat") {
+      chat?.open();
+    } else if (e.data.type === "slashdocs:chord") {
+      armChord(e.data.armed === true);
+    } else if (e.data.type === "slashdocs:cursor-chat") {
+      chatColor =
+        typeof e.data.color === "string" && /^#[0-9a-f]{3,8}$/i.test(e.data.color)
+          ? e.data.color
+          : undefined;
+    } else if (e.data.type === "slashdocs:pins") {
+      pins.setPins(
+        parsePins(e.data.pins),
+        typeof e.data.active === "string" ? e.data.active : undefined,
+      );
+    } else if (e.data.type === "slashdocs:pin-placing") {
+      pins.setPlacing(
+        e.data.on === true,
+        typeof e.data.move === "string" ? e.data.move : undefined,
+      );
+    } else if (e.data.type === "slashdocs:pins-release") {
+      pins.releaseOutside();
+    } else if (e.data.type === "slashdocs:heading-copied") {
+      if (typeof e.data.id === "string") showCopied(e.data.id);
+    } else if (e.data.type === "slashdocs:pulse" && typeof e.data.id === "string") {
+      pulse(e.data.id);
+    } else if (e.data.type === "slashdocs:thread-keys") {
+      threadKeys = e.data.on === true;
+    } else if (e.data.type === "slashdocs:watch") {
+      watchAnchor(typeof e.data.id === "string" ? e.data.id : null);
+    } else if (e.data.type === "slashdocs:cover") {
+      // A comment sheet covers the bottom of the document. Once the document
+      // stops scrolling to the open thread, its pin or highlight comes up
+      // above the sheet.
+      const d = doc();
+      const bottom = typeof e.data.bottom === "number" ? e.data.bottom : 0;
+      if (!d?.defaultView) return;
+      cover(d, bottom);
+      if (bottom)
+        settled(d.defaultView, () => {
+          const cid = watched && CSS.escape(watched);
+          const mark = cid && d.querySelector(`mark.slashdocs-mark[data-cid="${cid}"]`);
+          if (!pins.reveal(watched ?? undefined) && mark) reveal(mark);
+        });
     }
   });
 })();

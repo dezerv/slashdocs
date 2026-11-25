@@ -6,10 +6,13 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strconv"
 
 	"github.com/gin-gonic/gin"
 	"github.com/mark3labs/mcp-go/mcp"
 	mcpserver "github.com/mark3labs/mcp-go/server"
+
+	"github.com/razorpay/slashdocs/internal/textedit"
 )
 
 func mcpDocumentID() mcp.ToolOption {
@@ -31,20 +34,30 @@ func mcpCommentID() mcp.ToolOption {
 func registerMCPDocumentTools(server *mcpserver.MCPServer, api mcpAPIAdapter) {
 	registerMCPDocumentCRUDTools(server, api)
 	registerMCPDocumentMoveTool(server, api)
+	registerMCPDocumentLabelTools(server, api)
 	registerMCPVersionTools(server, api)
+	registerMCPEditTool(server, api)
 	registerMCPCommentTools(server, api)
+	registerMCPPointCommentTool(server, api)
 	registerMCPCommentMutationTools(server, api)
 	registerMCPDocumentAccessTools(server, api)
 }
 
 func registerMCPDocumentCRUDTools(server *mcpserver.MCPServer, api mcpAPIAdapter) {
 	server.AddTool(mcp.NewTool("list_documents", readOnlyOptions(
-		mcp.WithDescription("List documents visible to the caller, optionally filtering by title."),
-		mcp.WithString("query", mcp.Description("Optional title search text.")),
+		mcp.WithDescription("List documents visible to the caller, or search their titles and text. Documents with the words in the title come first, then the latest. The result is one page: has_more is true when more documents follow, and offset gets the next page."),
+		mcp.WithString("query", mcp.Description("Optional Slack-style search of titles and text: words, \"phrases\", -word, title:, from:, in:, label:, before:, after:, on:, and during:. title:word or title:\"a phrase\" matches the title only.")),
+		mcp.WithNumber("limit", mcp.Description("Optional page size: 25 by default, 100 at most.")),
+		mcp.WithNumber("offset", mcp.Description("Optional number of documents to skip.")),
 	)...), func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		values := url.Values{}
 		if query := request.GetString("query", ""); query != "" {
 			values.Set("q", query)
+		}
+		for _, key := range []string{"limit", "offset"} {
+			if n := request.GetInt(key, 0); n > 0 {
+				values.Set(key, strconv.Itoa(n))
+			}
 		}
 		target := "/v1/documents"
 		if len(values) > 0 {
@@ -65,9 +78,10 @@ func registerMCPDocumentCRUDTools(server *mcpserver.MCPServer, api mcpAPIAdapter
 	})
 
 	server.AddTool(mcp.NewTool("create_document", mutationOptions(false, false,
-		mcp.WithDescription("Create a slashdocs document from complete self-contained HTML. Returns its document and initial version IDs. The server applies its configured default sharing at create; when a default grant was applied, the result carries default_grant (grant_id, principal, role) plus a warning describing who can access the document and how to revoke the grant."),
+		mcp.WithDescription("Create a slashdocs document from complete self-contained HTML. Returns its document and initial version IDs. The server applies its configured default sharing at create; when a default grant was applied, the result carries default_grant (grant_id, principal, role) plus a warning describing who can access the document and how to revoke the grant. With folder_id, the document is in that folder from the start, and permission_warning tells when the folder is shared."),
 		mcp.WithString("title", mcp.Required(), mcp.Description("Human-readable document title.")),
 		mcp.WithString("html", mcp.Required(), mcp.Description("Complete self-contained HTML, up to 50 MiB.")),
+		mcp.WithString("folder_id", mcp.Description("Optional folder ID (fld_…) for the document. Requires editor on the folder. The default is the workspace root.")),
 	)...), func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		title, invalid := mcpRequired(request, "title")
 		if invalid != nil {
@@ -77,7 +91,8 @@ func registerMCPDocumentCRUDTools(server *mcpserver.MCPServer, api mcpAPIAdapter
 		if invalid != nil {
 			return invalid, nil
 		}
-		response, err := api.multipartResponse(ctx, "/v1/documents", map[string]string{"title": title}, html, nil, api.handlers.createDocument)
+		fields := map[string]string{"title": title, "folder_id": request.GetString("folder_id", "")}
+		response, err := api.multipartResponse(ctx, "/v1/documents", fields, html, nil, api.handlers.createDocument)
 		if err != nil || response.status != http.StatusCreated {
 			return api.result(response, err, false)
 		}
@@ -159,6 +174,24 @@ func defaultGrantVerb(role string) string {
 	}
 }
 
+func registerMCPDocumentLabelTools(server *mcpserver.MCPServer, api mcpAPIAdapter) {
+	server.AddTool(mcp.NewTool("set_document_labels", mutationOptions(true, true,
+		mcp.WithDescription("Replace all labels of a document. An empty list removes them. Requires editor on the document. Returns the labels."),
+		mcpDocumentID(),
+		mcp.WithArray("labels", mcp.Required(), mcp.WithStringItems(), mcp.Description("Up to 20 labels: lowercase letters, numbers, dots, underscores, or hyphens.")),
+	)...), func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		id, invalid := mcpRequired(request, "document_id")
+		if invalid != nil {
+			return invalid, nil
+		}
+		labels, err := request.RequireStringSlice("labels")
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		return api.json(ctx, http.MethodPut, "/v1/documents/"+id+"/labels", map[string]any{"labels": labels}, mcpParams("id", id), api.handlers.replaceDocumentLabels)
+	})
+}
+
 func registerMCPDocumentMoveTool(server *mcpserver.MCPServer, api mcpAPIAdapter) {
 	server.AddTool(mcp.NewTool("move_document", mutationOptions(true, true,
 		mcp.WithDescription("Move a document into a folder, or move it to the workspace root. Pass exactly one of folder_id or to_root=true."),
@@ -223,7 +256,7 @@ func registerMCPVersionTools(server *mcpserver.MCPServer, api mcpAPIAdapter) {
 	})
 
 	server.AddTool(mcp.NewTool("get_document_html", readOnlyOptions(
-		mcp.WithDescription("Fetch raw document HTML. Omit version_id to fetch the current version."),
+		mcp.WithDescription("Fetch raw document HTML. Omit version_id to fetch the current version. A second text gives the version_id and the seq of the HTML, which update_document needs."),
 		mcpDocumentID(), mcpVersionID(false),
 	)...), func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		doc, invalid := mcpRequired(request, "document_id")
@@ -248,9 +281,10 @@ func registerMCPVersionTools(server *mcpserver.MCPServer, api mcpAPIAdapter) {
 	})
 
 	server.AddTool(mcp.NewTool("update_document", mutationOptions(false, false,
-		mcp.WithDescription("Publish complete HTML as a new document version using optimistic concurrency."),
+		mcp.WithDescription("Publish complete HTML as a new document version. A result with rebased set means that other people edited the document after your base, and the saved version has their edits and yours: fetch its HTML before you change the document again. A version_conflict error means that other people changed the same text, and their text stays: fetch the HTML again and make your change again. To change existing text, prefer edit_document: it sends only the changed strings."),
 		mcpDocumentID(),
 		mcp.WithString("base_version_id", mcp.Required(), mcp.Description("Version on which these edits are based.")),
+		mcp.WithNumber("base_seq", mcp.Required(), mcp.Description("The seq that get_document_html gave with the HTML on which these edits are based. With it, the server keeps the text that people typed after it.")),
 		mcp.WithString("html", mcp.Required(), mcp.Description("Complete replacement HTML, up to 50 MiB.")),
 		mcp.WithString("change_summary", mcp.Description("Short summary of the changes, one change per line.")),
 	)...), func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -266,16 +300,73 @@ func registerMCPVersionTools(server *mcpserver.MCPServer, api mcpAPIAdapter) {
 		if invalid != nil {
 			return invalid, nil
 		}
-		fields := map[string]string{"base_version_id": base, "change_summary": request.GetString("change_summary", "")}
+		seq, err := request.RequireInt("base_seq")
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		fields := map[string]string{"base_version_id": base, "base_seq": strconv.Itoa(seq), "change_summary": request.GetString("change_summary", "")}
 		return api.multipart(ctx, "/v1/documents/"+doc+"/versions", fields, html, mcpParams("id", doc), api.handlers.createVersion)
 	})
+}
+
+func registerMCPEditTool(server *mcpserver.MCPServer, api mcpAPIAdapter) {
+	server.AddTool(mcp.NewTool("edit_document", mutationOptions(false, false,
+		mcp.WithDescription(fmt.Sprintf("Change a document by exact find-and-replace on its HTML and save the result as a new version, without resending the document. Each old_string must occur exactly once in the current HTML: copy it from get_document_html and include enough surrounding text to make it unique, or set replace_all to replace every occurrence. Edits apply in order, each to the result of the one before. If any edit does not match, nothing is saved and the error names that edit. Up to %d edits per call. Everything outside the replaced strings stays byte-for-byte the same, so comments elsewhere stay anchored.", textedit.MaxEdits)),
+		mcpDocumentID(),
+		mcp.WithArray("edits", mcp.Required(), mcp.Description("Replacements to make, in order."), mcp.Items(map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"old_string":  map[string]any{"type": "string", "description": "Exact HTML to replace. Must occur exactly once unless replace_all is set."},
+				"new_string":  map[string]any{"type": "string", "description": "HTML to put in its place."},
+				"replace_all": map[string]any{"type": "boolean", "description": "Replace every occurrence of old_string instead of requiring exactly one. Defaults to false."},
+			},
+			"required":             []string{"old_string", "new_string"},
+			"additionalProperties": false,
+		})),
+		mcp.WithString("change_summary", mcp.Description("Short summary of the changes, one change per line. Defaults to one line per edit.")),
+	)...), func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		doc, invalid := mcpRequired(request, "document_id")
+		if invalid != nil {
+			return invalid, nil
+		}
+		edits, invalid := mcpEdits(request)
+		if invalid != nil {
+			return invalid, nil
+		}
+		payload := map[string]any{"edits": edits}
+		if summary := request.GetString("change_summary", ""); summary != "" {
+			payload["change_summary"] = summary
+		}
+		return api.json(ctx, http.MethodPost, "/v1/documents/"+doc+"/edits", payload, mcpParams("id", doc), api.handlers.editDocument)
+	})
+}
+
+// mcpEdits reads the edits argument as a list of replacements.
+func mcpEdits(request mcp.CallToolRequest) ([]textedit.Edit, *mcp.CallToolResult) {
+	const shape = "edits must be a list of {old_string, new_string, replace_all} objects"
+	raw, ok := request.GetArguments()["edits"]
+	if !ok {
+		return nil, mcp.NewToolResultError("edits is required")
+	}
+	b, err := json.Marshal(raw)
+	if err != nil {
+		return nil, mcp.NewToolResultError(shape)
+	}
+	var edits []textedit.Edit
+	if err := json.Unmarshal(b, &edits); err != nil {
+		return nil, mcp.NewToolResultError(shape)
+	}
+	if len(edits) == 0 {
+		return nil, mcp.NewToolResultError("edits must contain at least one edit")
+	}
+	return edits, nil
 }
 
 func registerMCPCommentTools(server *mcpserver.MCPServer, api mcpAPIAdapter) {
 	server.AddTool(mcp.NewTool("list_comments", readOnlyOptions(
 		mcp.WithDescription("List document comment threads, optionally filtered by status or version."),
 		mcpDocumentID(),
-		mcp.WithString("status", mcp.Description("Optional status filter."), mcp.Enum("open", "resolved", "stale", "orphaned", "all")),
+		mcp.WithString("status", mcp.Description("Optional thread status filter. Omit it or use all to list every thread."), mcp.Enum("open", "resolved", "all")),
 		mcp.WithString("version_id", mcp.Description("Optional version filter.")),
 	)...), func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		doc, invalid := mcpRequired(request, "document_id")
@@ -338,6 +429,51 @@ func registerMCPCommentTools(server *mcpserver.MCPServer, api mcpAPIAdapter) {
 		return api.json(ctx, http.MethodPost, "/v1/documents/"+doc+"/comments/"+comment+"/replies", map[string]any{"body": body}, mcpParams("id", doc, "comment_id", comment), api.handlers.createCommentReply)
 	})
 
+}
+
+// registerMCPPointCommentTool adds create_point_comment as a tool of its own,
+// so the schema of create_comment, which clients cache, stays the same.
+func registerMCPPointCommentTool(server *mcpserver.MCPServer, api mcpAPIAdapter) {
+	server.AddTool(mcp.NewTool("create_point_comment", mutationOptions(false, false,
+		mcp.WithDescription("Create a review comment pinned to a spot on an element, such as a chart, diagram or image, in a document version."),
+		mcpDocumentID(), mcpVersionID(true),
+		mcp.WithString("body", mcp.Required(), mcp.Description("Comment text.")),
+		mcp.WithString("target", mcp.Required(), mcp.Description("The element's data-slashdocs-target value, or else its id.")),
+		mcp.WithNumber("x", mcp.Required(), mcp.Min(-maxViewFraction), mcp.Max(maxViewFraction), mcp.Description("Horizontal position as a fraction of the element's box, 0 (left) to 1 (right). A value below 0 or above 1 is a spot beside the box.")),
+		mcp.WithNumber("y", mcp.Required(), mcp.Min(-maxViewFraction), mcp.Max(maxViewFraction), mcp.Description("Vertical position as a fraction of the element's box, 0 (top) to 1 (bottom). A value below 0 or above 1 is a spot above or below the box.")),
+		mcp.WithString("quote", mcp.Description("The start of the element's text, which finds the element again when its target changes.")),
+		mcp.WithString("label", mcp.Description("A short name for the element in comment lists, such as \"Revenue chart\".")),
+	)...), func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		doc, invalid := mcpRequired(request, "document_id")
+		if invalid != nil {
+			return invalid, nil
+		}
+		version, invalid := mcpRequired(request, "version_id")
+		if invalid != nil {
+			return invalid, nil
+		}
+		body, invalid := mcpRequired(request, "body")
+		if invalid != nil {
+			return invalid, nil
+		}
+		target, invalid := mcpRequired(request, "target")
+		if invalid != nil {
+			return invalid, nil
+		}
+		x, err := request.RequireFloat("x")
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		y, err := request.RequireFloat("y")
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		payload := map[string]any{"version_id": version, "body": body, "anchor": map[string]any{
+			"quote": request.GetString("quote", ""),
+			"point": map[string]any{"target": target, "label": request.GetString("label", ""), "x": x, "y": y},
+		}}
+		return api.json(ctx, http.MethodPost, "/v1/documents/"+doc+"/comments", payload, mcpParams("id", doc), api.handlers.createComment)
+	})
 }
 
 func registerMCPCommentMutationTools(server *mcpserver.MCPServer, api mcpAPIAdapter) {
@@ -453,6 +589,16 @@ func registerMCPDocumentAccessTools(server *mcpserver.MCPServer, api mcpAPIAdapt
 			return invalid, nil
 		}
 		return api.json(ctx, http.MethodPost, "/v1/documents/"+doc+"/access-requests", map[string]any{}, mcpParams("id", doc), api.handlers.requestDocumentAccess)
+	})
+
+	server.AddTool(mcp.NewTool("list_document_access_requests", readOnlyOptions(
+		mcp.WithDescription("List requests for access to a document, the newest first. Without the editor role, it lists only your own request. Share the document with a requester to grant access and remove the request."), mcpDocumentID(),
+	)...), func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		doc, invalid := mcpRequired(request, "document_id")
+		if invalid != nil {
+			return invalid, nil
+		}
+		return api.get(ctx, "/v1/documents/"+doc+"/access-requests", mcpParams("id", doc), api.handlers.listDocumentAccessRequests)
 	})
 
 	server.AddTool(mcp.NewTool("list_document_access", readOnlyOptions(

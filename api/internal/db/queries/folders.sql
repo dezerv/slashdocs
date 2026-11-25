@@ -237,7 +237,8 @@ LIMIT 51;
 -- name: ListChildFolders :many
 SELECT f.id, f.title, f.owner_type, f.owner_id,
        COALESCE(f.parent_folder_id,'') AS parent_folder_id,
-       COALESCE(u.name,sa.name,'') AS owner_name, COALESCE(u.email,'') AS owner_email
+       COALESCE(u.name,sa.name,'') AS owner_name, COALESCE(u.email,'') AS owner_email,
+       f.updated_at
 FROM folders f
 LEFT JOIN users u ON f.owner_type='user' AND f.owner_id=u.id
 -- nosemgrep: detected-google-gcm-service-account - slashdocs-native principal type/table, not a Google credential.
@@ -249,44 +250,58 @@ ORDER BY f.title
 LIMIT 51;
 
 -- name: SearchFoldersByTitle :many
-WITH RECURSIVE accessible(id, depth) AS (
-  SELECT f.id, 1 FROM folders f WHERE f.owner_type= @principal_type AND f.owner_id= @principal_id
+-- The folders whose title matches, where the principal has at least min_role
+-- ('' is any role). The role is the one of ListFolderAccessChain: a role on a
+-- folder cascades to its subfolders, ownership cascades as editor, and a grant
+-- to anyone counts. But a folder that only anyone can open is listed in an org
+-- deployment only, as it is not shared with the principal.
+WITH RECURSIVE ranks(role, rank) AS (
+  VALUES ('viewer', 1), ('commenter', 2), ('editor', 3), ('owner', 4)
+), accessible(id, rank, listed, depth) AS (
+  SELECT f.id, 4, true, 1 FROM folders f WHERE f.owner_type= @principal_type AND f.owner_id= @principal_id
   UNION
-  SELECT g.resource_id, 1 FROM resource_grants g
+  SELECT g.resource_id, r.rank, g.principal_type <> 'anyone' OR @include_org_wide::boolean, 1
+  FROM resource_grants g JOIN ranks r ON r.role=g.role
   WHERE g.resource_type='folder' AND g.revoked_at IS NULL
     AND ((g.principal_type= @principal_type AND g.principal_id= @principal_id)
       OR (g.principal_type='google_group' AND g.principal_id=ANY(@google_group_ids::text[]))
-      OR (@include_org_wide::boolean AND g.principal_type='anyone'))
+      OR g.principal_type='anyone')
   UNION ALL
-  SELECT c.id, a.depth+1 FROM folders c JOIN accessible a ON c.parent_folder_id = a.id WHERE a.depth < 20
+  SELECT c.id, LEAST(a.rank, 3), a.listed, a.depth+1 FROM folders c JOIN accessible a ON c.parent_folder_id = a.id WHERE a.depth < 20
 )
-SELECT DISTINCT f.id, f.title, f.owner_type, f.owner_id,
+SELECT f.id, f.title, f.owner_type, f.owner_id,
        COALESCE(f.parent_folder_id,'') AS parent_folder_id,
        COALESCE(u.name,sa.name,'') AS owner_name, COALESCE(u.email,'') AS owner_email
 FROM folders f
-JOIN accessible a ON f.id = a.id
+JOIN (SELECT id, max(rank) AS rank FROM accessible GROUP BY id HAVING bool_or(listed)) a ON f.id = a.id
 LEFT JOIN users u ON f.owner_type='user' AND f.owner_id=u.id
 -- nosemgrep: detected-google-gcm-service-account - slashdocs-native principal type/table, not a Google credential.
 LEFT JOIN service_accounts sa -- nosemgrep: detected-google-gcm-service-account - slashdocs-native principal type/table, not a Google credential.
   -- nosemgrep: detected-google-gcm-service-account - slashdocs-native principal type, not a Google credential.
   ON f.owner_type='service_account' AND f.owner_id=sa.id -- nosemgrep: detected-google-gcm-service-account - slashdocs-native principal type/table, not a Google credential.
 WHERE f.title ILIKE '%' || @query::text || '%'
-ORDER BY f.title
+  AND a.rank >= COALESCE((SELECT rank FROM ranks WHERE role= @min_role::text), 0)
+ORDER BY f.title, f.id
 LIMIT @row_limit;
 
--- name: FolderOrAncestorsHaveGrants :one
--- Whether the folder or any of its ancestors carries an active grant, i.e.
--- placing content inside it may broaden who can see that content.
+-- name: FolderMayBroadenAccess :one
+-- Whether placing content of the given owner inside the folder may broaden
+-- who can see that content: the folder or one of its ancestors carries an
+-- active grant or has another owner, whose ownership cascades as editor.
 WITH RECURSIVE anc(fid, depth) AS (
   SELECT @folder_id::text, 1
   UNION ALL
   SELECT f.parent_folder_id, a.depth+1 FROM folders f JOIN anc a ON f.id=a.fid WHERE f.parent_folder_id IS NOT NULL AND a.depth < 20
 )
-SELECT EXISTS(
+SELECT (EXISTS(
   SELECT 1 FROM resource_grants g
   JOIN anc ON g.resource_id=anc.fid
   WHERE g.resource_type='folder' AND g.revoked_at IS NULL
-)::bool AS has_grants;
+) OR EXISTS(
+  SELECT 1 FROM folders f
+  JOIN anc ON f.id=anc.fid
+  WHERE (f.owner_type, f.owner_id) <> (@owner_type::text, @owner_id::text)
+))::bool AS may_broaden;
 
 -- name: RecordFolderWorkspaceEntry :exec
 INSERT INTO folder_workspace_entries(folder_id,principal_type,principal_id,last_opened_at)
@@ -298,8 +313,10 @@ ON CONFLICT (folder_id,principal_type,principal_id) DO UPDATE SET last_opened_at
 -- with the principal's access at each level, resolved in one round trip. A
 -- grant on a folder applies to it and everything below it, so the strongest
 -- grant for chain element X is taken over X and all of X's ancestors
--- (chain elements with depth >= X's). Rank order mirrors repo.MaxRole:
--- owner=4, editor=3, commenter=2, viewer=1.
+-- (chain elements with depth >= X's). The owner of a folder above X counts as
+-- an editor grant: a resource has one owner, and editor is the most that a
+-- grant can give. Rank order mirrors repo.MaxRole: owner=4, editor=3,
+-- commenter=2, viewer=1.
 WITH RECURSIVE chain(id, title, parent_folder_id, owner_type, owner_id, depth) AS (
   SELECT f.id, f.title, f.parent_folder_id, f.owner_type, f.owner_id, 0
   FROM folders f WHERE f.id= @folder_id
@@ -310,15 +327,22 @@ WITH RECURSIVE chain(id, title, parent_folder_id, owner_type, owner_id, depth) A
 )
 SELECT c.id, c.title,
        (c.owner_type= @principal_type::text AND c.owner_id= @principal_id::text)::bool AS is_owner,
-       COALESCE((
-         SELECT max(CASE g.role WHEN 'owner' THEN 4 WHEN 'editor' THEN 3 WHEN 'commenter' THEN 2 WHEN 'viewer' THEN 1 ELSE 0 END)
-         FROM resource_grants g
-         JOIN chain gc ON g.resource_id=gc.id
-         WHERE gc.depth >= c.depth
-           AND g.resource_type='folder' AND g.revoked_at IS NULL
-           AND ((g.principal_type= @principal_type::text AND g.principal_id= @principal_id::text)
-             OR (g.principal_type='google_group' AND g.principal_id=ANY(@google_group_ids::text[]))
-             OR g.principal_type='anyone')
-       ), 0)::int AS grant_rank
+       GREATEST(
+         COALESCE((
+           SELECT max(CASE g.role WHEN 'owner' THEN 4 WHEN 'editor' THEN 3 WHEN 'commenter' THEN 2 WHEN 'viewer' THEN 1 ELSE 0 END)
+           FROM resource_grants g
+           JOIN chain gc ON g.resource_id=gc.id
+           WHERE gc.depth >= c.depth
+             AND g.resource_type='folder' AND g.revoked_at IS NULL
+             AND ((g.principal_type= @principal_type::text AND g.principal_id= @principal_id::text)
+               OR (g.principal_type='google_group' AND g.principal_id=ANY(@google_group_ids::text[]))
+               OR g.principal_type='anyone')
+         ), 0),
+         CASE WHEN EXISTS (
+           SELECT 1 FROM chain oc
+           WHERE oc.depth > c.depth
+             AND oc.owner_type= @principal_type::text AND oc.owner_id= @principal_id::text
+         ) THEN 3 ELSE 0 END
+       )::int AS grant_rank
 FROM chain c
 ORDER BY c.depth DESC;

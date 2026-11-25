@@ -30,3 +30,13 @@ export function useIsMobile(): boolean {
 export function usePrefersReducedMotion(): boolean {
   return useMediaQuery("(prefers-reduced-motion: reduce)");
 }
+
+/** True when the main pointer is a finger, which needs larger targets. */
+export function useCoarsePointer(): boolean {
+  return useMediaQuery("(pointer: coarse)");
+}
+
+/** True from Tailwind's `xl` breakpoint (1280px), wider than a laptop. */
+export function useWideScreen(): boolean {
+  return useMediaQuery("(min-width: 80rem)");
+}

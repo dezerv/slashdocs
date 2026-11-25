@@ -274,6 +274,8 @@ async function installFakeWorkspace(page: Page, state: WorkspaceState) {
       return json(route, { items: [{ id: "ver_1", number: 1 }] });
     }
     if (path === "/v1/documents/doc_1/comments") return json(route, { items: [] });
+    if (path === "/v1/documents/doc_1/access-requests")
+      return json(route, { items: [] });
     if (path === "/v1/documents/doc_1/versions/ver_1/render-token") {
       return json(route, { token: "fake", url: `${url.origin}/fake-render` });
     }
@@ -325,12 +327,13 @@ async function shareWithPlatformGroup(page: Page) {
   await shareSheet.getByRole("tab", { name: "Google Groups" }).click();
   await shareSheet.getByPlaceholder("Search group name or email").fill("platform");
   await shareSheet
-    .locator("button")
-    .filter({ hasText: "Platform" })
-    .filter({ hasText: "platform@example.com" })
+    .getByRole("option", { name: /Platform.*platform@example\.com/ })
     .click();
   await shareSheet.getByRole("button", { name: "Share", exact: true }).click();
-  await expect(page.getByText("Access granted.")).toBeVisible();
+  // The field clears when the group gets access.
+  await expect(shareSheet.getByPlaceholder("Search group name or email")).toHaveValue(
+    "",
+  );
 }
 
 test("owner shares a document and folder with a verified group", async ({ page }) => {
@@ -444,7 +447,7 @@ test("nested group access inherited from a parent folder opens the document", as
   await page.goto("/app/folders/fld_1");
   await expect(page.getByText("Group Plan", { exact: true }).first()).toBeVisible();
   await page.goto("/app/d/doc_1");
-  await expect(page.getByText("Shared Folder", { exact: true })).toBeVisible();
+  await expect(page.getByRole("link", { name: "Back to Shared Folder" })).toBeVisible();
   await expect(page.getByText("Group Plan", { exact: true })).toBeVisible();
 });
 
@@ -476,9 +479,9 @@ test("existing user and service-account sharing remains available", async ({
   await page.getByRole("button", { name: "Share" }).click();
 
   const shareSheet = page.getByRole("dialog", { name: "Share document" });
-  const input = shareSheet.getByPlaceholder(/user@org\.example/);
+  const input = shareSheet.getByRole("combobox", { name: "Person or bot" });
   await input.fill("alice");
-  await shareSheet.getByRole("button", { name: /Alice/ }).click();
+  await shareSheet.getByRole("option", { name: /Alice/ }).click();
   await shareSheet.getByRole("button", { name: "Share", exact: true }).click();
   await expect.poll(() => state.directShares).toContain("alice@example.com");
   await expect(input).toHaveValue("");

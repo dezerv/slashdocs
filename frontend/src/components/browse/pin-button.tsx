@@ -14,17 +14,26 @@ export function PinButton({
   pinned?: boolean;
   className: string;
 }) {
-  const { isPinned, togglePin } = useTogglePin(resourceType, resourceId, pinned);
+  const { unknown, isPinned, togglePin } = useTogglePin(
+    resourceType,
+    resourceId,
+    pinned,
+  );
   return (
     <Button
       variant="ghost"
       size="icon"
-      className={className}
+      // A busy button still takes the press, so that it does not reach the
+      // link of the item under it and open the item.
+      className={cn(className, "disabled:pointer-events-auto")}
       aria-label={isPinned ? "Unpin" : "Pin"}
+      tooltip={unknown ? "Your pins did not load. Retry them above." : undefined}
+      disabled={unknown}
+      busy={togglePin.isPending}
       onClick={(e) => {
         e.preventDefault();
         e.stopPropagation();
-        togglePin.mutate();
+        togglePin.mutate(!isPinned);
       }}
     >
       {isPinned ? <PinOff className="h-3.5 w-3.5" /> : <Pin className="h-3.5 w-3.5" />}

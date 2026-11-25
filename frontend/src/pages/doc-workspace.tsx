@@ -6,66 +6,57 @@ import {
   useState,
   type ReactNode,
 } from "react";
-import { useNavigate, useSearchParams } from "react-router-dom";
+import { useLocation, useNavigate, useSearchParams } from "react-router-dom";
 import { AnimatePresence, motion } from "framer-motion";
+import { Minimize2 } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
-import { api, type CommentMention, type Principal } from "@/api";
+import { api, type Principal } from "@/api";
 import { queryKeys } from "@/lib/queryKeys";
-import { useCommentDrafts } from "@/lib/comment-drafts";
+import { signInPath } from "@/lib/auth-state";
+import {
+  keepPendingComment,
+  takePendingComment,
+  useCommentDrafts,
+  type DraftText,
+} from "@/lib/comment-drafts";
+import { Button } from "@/components/ui/button";
+import type { ThreadCount } from "@/components/layout/doc-bar-frame";
 import { Center } from "@/components/ui/misc";
-import { Sheet, SheetContent, SheetHeader, SheetTitle } from "@/components/ui/sheet";
+import { SheetHandle } from "@/components/ui/sheet";
+import { keepToastsAbove } from "@/components/ui/toaster";
+import { useMounted } from "@/lib/hooks";
 import { useIsMobile } from "@/lib/use-media-query";
 import { useTheme } from "@/lib/theme";
 import { useEscChord } from "@/lib/use-esc-chord";
-import { createPersistentStore } from "@/lib/persistent-store";
 import { cursorsShownStore } from "@/lib/live-cursors";
 import { isChordBlocked, type ChordKey } from "@/lib/esc-chord";
-import {
-  COMMENT_STATUS,
-  DEFAULT_COMMENT_FILTER,
-  type CommentFilter,
-} from "@/lib/constants";
+import { randomId } from "@/lib/uuid";
+import { cn } from "@/lib/cn";
+import { fade, sheetUp, slideIn } from "@/lib/motion";
+import { COMMENT_STATUS } from "@/lib/constants";
 import {
   DocProvider,
   type CommentPosition,
-  type CommentViewport,
   type DocContextValue,
+  type DocumentScroller,
+  type LiveText,
   type PendingSelection,
+  type SaveState,
+  type UnanchoredKind,
 } from "./doc-context";
 import { RenderFrame } from "./doc-render-frame";
-import { Comments } from "./doc-comments";
+import { newLoads } from "./live-load";
+import { CommentsList } from "./doc-comments";
+import { CommentMap } from "./comment-map";
 import { Keycast } from "./doc-keycast";
 import { ShortcutsDialog } from "./doc-shortcuts";
+import { useCommentLink } from "./use-comment-link";
+import { useEarlierDraft } from "./use-earlier-draft";
+import { useCommentReads } from "./use-comment-reads";
+import { useResolveThread } from "./use-resolve-thread";
+import { plainKey } from "./use-comment-pins";
 
 const THEME_LABELS = { light: "Light", dark: "Dark", system: "System" } as const;
-
-// The desktop comments panel stays as the reader left it, across documents
-// and visits. The mobile sheet always starts closed.
-const commentsOpenStore = createPersistentStore<boolean>(
-  "slashdocs:comments-open",
-  true,
-  (parsed) => parsed !== false,
-);
-
-const pageStagger = {
-  hidden: {},
-  visible: { transition: { staggerChildren: 0.1, delayChildren: 0.05 } },
-};
-const barSlide = {
-  hidden: { opacity: 0, y: -8 },
-  visible: {
-    opacity: 1,
-    y: 0,
-    transition: { duration: 0.35, ease: [0.25, 0.4, 0.25, 1] as const },
-  },
-};
-const contentFade = {
-  hidden: { opacity: 0 },
-  visible: {
-    opacity: 1,
-    transition: { duration: 0.4, ease: [0.25, 0.4, 0.25, 1] as const },
-  },
-};
 
 // A document without a live event stream, such as a `slashdocs local` file,
 // has no KV events and no other viewers to tell.
@@ -73,19 +64,39 @@ const NO_STREAM = {
   subscribeKV: () => () => {},
   reportViewport: () => {},
   moveCursor: () => {},
+  holdCursor: () => {},
   subscribeCursors: () => () => {},
 };
 
+const noop = () => {};
+const NO_TYPISTS: Principal[] = [];
+const NO_AUTHORS = () => undefined;
+
+// The document's area. A narrow screen keeps a gutter for the tick strip,
+// off the text, in the paper white of the document, and the same gutter on
+// the left, so that a document with no margin of its own does not touch the
+// edge.
+const FRAME_AREA = "relative h-full max-sm:bg-white max-sm:px-3";
+// The comments list and its gap at the right of the document.
+const PANEL_ROOM = 392;
+
+// The intents in the sign-in path of a reader who asked to comment on a spot,
+// or on the text that they selected.
+const PIN_INTENT = "pin";
+const COMMENT_INTENT = "comment";
+
 export type DocBarControls = {
+  // The comments list is open.
   commentsOpen: boolean;
+  threads: ThreadCount;
   onToggleComments: () => void;
   onShowShortcuts: () => void;
 };
 
-// DocWorkspace is a rendered document with its comments: the comment rail,
-// drafts, shortcuts, and full screen. The page around it supplies the
-// document bar and the parts that only the server has, such as versions and
-// sharing.
+// DocWorkspace is a rendered document with its comments: their popovers, the
+// comments list, drafts, shortcuts, and full screen. The page around it
+// supplies the document bar, an optional banner, and the parts that only the
+// server has, such as versions and sharing.
 export function DocWorkspace({
   docId,
   version,
@@ -95,8 +106,23 @@ export function DocWorkspace({
   notifications = true,
   stream = NO_STREAM,
   followedCursor,
+  onUnfollowCursor,
   onDocumentClick,
+  canEdit = false,
+  editing = false,
+  onEditingChange = noop,
+  frameShows = noop,
+  onLeavePreview = noop,
+  showsLatest = true,
+  latest,
+  live = true,
+  event,
+  typists = NO_TYPISTS,
+  madeBy = NO_AUTHORS,
+  shownSeq,
+  holdUpdate = noop,
   bar,
+  banner,
 }: {
   docId: string;
   version: string;
@@ -109,35 +135,69 @@ export function DocWorkspace({
     subscribeKV: DocContextValue["subscribeDocumentKV"];
     reportViewport: DocContextValue["reportViewport"];
     moveCursor: DocContextValue["moveCursor"];
+    holdCursor: DocContextValue["holdCursor"];
     subscribeCursors: DocContextValue["subscribeCursors"];
   };
   followedCursor?: DocContextValue["followedCursor"];
+  onUnfollowCursor?: DocContextValue["onUnfollowCursor"];
   onDocumentClick?: () => void;
+  // The reader may edit the version on screen.
+  canEdit?: boolean;
+  // Edit mode, which the page keeps. Each document opens in Comment mode.
+  editing?: boolean;
+  onEditingChange?: (editing: boolean) => void;
+  frameShows?: DocContextValue["frameShows"];
+  // Leaves a preview of an earlier version.
+  onLeavePreview?: () => void;
+  // The page shows the document, not a preview of an earlier version.
+  showsLatest?: boolean;
+  // What the frame needs to follow the live document. A document without
+  // an event stream has no newer state to follow.
+  latest?: DocContextValue["latest"];
+  live?: boolean;
+  event?: DocContextValue["event"];
+  typists?: DocContextValue["typists"];
+  madeBy?: DocContextValue["madeBy"];
+  shownSeq?: DocContextValue["shownSeq"];
+  holdUpdate?: DocContextValue["holdUpdate"];
   bar: (controls: DocBarControls) => ReactNode;
+  // Shown above the document, under the bar when there is one.
+  banner?: ReactNode;
 }) {
   const [searchParams, setSearchParams] = useSearchParams();
   const fullscreen = searchParams.get("fullscreen") === "1";
-  // One comments query feeds both the paint overlay and the comment rail so they
-  // stay in sync.
+  // One comments query feeds the highlights, the pins and the popovers, so
+  // they stay in sync.
   const comments = useQuery({
     queryKey: queryKeys.comments(docId),
     queryFn: () => api.listComments(docId),
     enabled: !!docId,
     meta: { suppressGlobalError: true },
   });
-  const [commentFilter, setCommentFilter] =
-    useState<CommentFilter>(DEFAULT_COMMENT_FILTER);
   const [activeComment, setActiveComment] = useState<string>();
-  const [unanchoredComments, setUnanchoredComments] = useState<ReadonlySet<string>>(
-    new Set(),
+  const { comments: readComments, readThread } = useCommentReads(
+    docId,
+    comments,
+    activeComment,
   );
+  const [placingPin, setPlacingPin] = useState<boolean | string>(false);
+  const [unanchored, setUnanchored] = useState<
+    Record<UnanchoredKind, ReadonlySet<string>>
+  >({ text: new Set(), pins: new Set() });
+  const setUnanchoredComments = useCallback(
+    (kind: UnanchoredKind, ids: ReadonlySet<string>) =>
+      setUnanchored((current) => ({ ...current, [kind]: ids })),
+    [],
+  );
+  const unanchoredComments = useMemo(
+    () => new Set([...unanchored.text, ...unanchored.pins]),
+    [unanchored],
+  );
+  const [movedPins, setMovedPins] = useState<ReadonlySet<string>>(new Set());
   const [commentPositions, setCommentPositions] = useState<
     ReadonlyMap<string, CommentPosition>
   >(new Map());
-  const [commentViewport, setCommentViewport] = useState<CommentViewport>({
-    scrollTop: 0,
-    scrollHeight: 1,
-  });
+  const [documentHeight, setDocumentHeight] = useState(1);
   const documentPrinterRef = useRef<(() => void) | null>(null);
   const registerDocumentPrinter = useCallback((print: (() => void) | null) => {
     documentPrinterRef.current = print;
@@ -145,155 +205,153 @@ export function DocWorkspace({
   const printDocument = useCallback(() => {
     documentPrinterRef.current?.();
   }, []);
-  const documentScrollerRef = useRef<((top: number) => void) | null>(null);
-  const registerDocumentScroller = useCallback(
-    (scroller: ((top: number) => void) | null) => {
-      documentScrollerRef.current = scroller;
-    },
-    [],
-  );
-  const scrollDocumentTo = useCallback((top: number) => {
-    documentScrollerRef.current?.(top);
+  const [saveState, setSaveState] = useState<SaveState>("idle");
+  const [frameReady, setFrameReady] = useState(false);
+  const liveText = useRef<LiveText | null>(null);
+  const registerLiveText = useCallback((text: LiveText | null) => {
+    liveText.current = text;
   }, []);
-  const commentRailSyncRef = useRef<((top: number) => void) | null>(null);
-  const registerCommentRailSync = useCallback(
-    (sync: ((top: number) => void) | null) => {
-      commentRailSyncRef.current = sync;
+  const setEditing = useCallback(
+    async (on: boolean) => {
+      const can = on ? canEdit : (await liveText.current?.settle()) !== false;
+      if (can) onEditingChange(on);
+      return can;
     },
+    [canEdit, onEditingChange],
+  );
+  const retrySave = useCallback(() => void liveText.current?.settle(), []);
+  const showUpdate = useCallback(() => void liveText.current?.showUpdate(), []);
+  const anchorOf = useCallback(
+    async (id: string) => liveText.current?.anchorOf(id),
     [],
   );
-  const syncCommentRail = useCallback((top: number) => {
-    commentRailSyncRef.current?.(top);
+  const [frameLoad, setFrameLoad] = useState(0);
+  const reloadFrame = useCallback(() => setFrameLoad((n) => n + 1), []);
+  const showCurrent = useCallback(() => {
+    onLeavePreview();
+    reloadFrame();
+  }, [onLeavePreview, reloadFrame]);
+  const onPage = useMounted();
+  const [liveLoads] = useState(newLoads);
+  // A load lives while its page does: another page can then send its draft.
+  useEffect(() => () => liveLoads.all.forEach((s) => s.release()), [liveLoads]);
+  // The page offers the text of an earlier visit one time: not again when
+  // the frame mounts again, while a load that ended still sends its text.
+  useEarlierDraft(docId, principal?.id);
+  const documentScroller = useRef<DocumentScroller | null>(null);
+  const registerDocumentScroller = useCallback((scroller: DocumentScroller | null) => {
+    documentScroller.current = scroller;
+  }, []);
+  const scrollDocumentTo = useCallback((top: number) => {
+    documentScroller.current?.to(top);
   }, []);
   const isMobile = useIsMobile();
-  // A comment started while the comments are hidden shows them only until it
-  // is posted or discarded.
-  const [peekDraft, setPeekDraft] = useState<string>();
-  const commentsOpen = commentsOpenStore.useStore() || peekDraft !== undefined;
-  const [mobilePanelOpen, setMobilePanelOpen] = useState(false);
+  const [listOpen, setListOpen] = useState(false);
+  // The comments list covers the document's right margin, and the document
+  // glides left from under it when it can. When its margins are too narrow
+  // for that, it is crowded: the list takes room beside it.
+  const [crowded, setCrowded] = useState(false);
+  useEffect(() => {
+    if (!listOpen) setCrowded(false);
+  }, [listOpen]);
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
   const [showFullscreenHint, setShowFullscreenHint] = useState(false);
   const [chordLabel, setChordLabel] = useState<string>();
   const nav = useNavigate();
   const { theme, setTheme } = useTheme();
 
-  const handleDocCommentClick = useCallback(
-    (commentId: string) => {
-      setActiveComment(commentId);
-      if (fullscreen) return;
-      if (isMobile) setMobilePanelOpen(true);
-      else commentsOpenStore.write(true);
-    },
-    [fullscreen, isMobile],
-  );
-  useEffect(() => {
-    setCommentFilter(DEFAULT_COMMENT_FILTER);
-    setPeekDraft(undefined);
-  }, [docId]);
-
-  const linkedComment = searchParams.get("comment");
-  const handledCommentLink = useRef("");
-  useEffect(() => {
-    if (!linkedComment) {
-      handledCommentLink.current = "";
-      return;
-    }
-    if (!comments.data?.items) return;
-    const key = `${docId}:${linkedComment}`;
-    if (handledCommentLink.current === key) return;
-    const root = comments.data.items.find(
-      (c) => c.id === linkedComment || c.replies?.some((r) => r.id === linkedComment),
-    );
-    if (!root) return;
-    handledCommentLink.current = key;
-    setCommentFilter(
-      root.status === COMMENT_STATUS.resolved
-        ? COMMENT_STATUS.resolved
-        : DEFAULT_COMMENT_FILTER,
-    );
-    handleDocCommentClick(root.id);
-  }, [docId, linkedComment, comments.data, handleDocCommentClick]);
+  const { leaving, resolveThread } = useResolveThread(docId, setActiveComment);
+  const [jump, setJump] = useState<{ id: string }>();
+  const jumpToComment = useCallback((id: string) => {
+    setActiveComment(id);
+    setJump({ id });
+  }, []);
+  useCommentLink(docId, comments, jumpToComment);
 
   const handleRenderedDocumentClick = useCallback(() => {
     onDocumentClick?.();
     setActiveComment(undefined);
+    setListOpen(false);
   }, [onDocumentClick]);
 
-  const toggleComments = useCallback(() => {
-    if (isMobile) setMobilePanelOpen((o) => !o);
-    else commentsOpenStore.write(!commentsOpen);
-    setPeekDraft(undefined);
-  }, [isMobile, commentsOpen]);
-
-  // On mobile the comments sheet should be dismissable with the browser/OS
-  // Back gesture, without leaving the document. We push a dedicated history
-  // entry when it opens; Back pops that entry (closing the sheet) instead of
-  // navigating away. Closing via the UI removes the entry we added.
-  const sheetHistoryRef = useRef(false);
+  const toggleComments = useCallback(() => setListOpen((open) => !open), []);
+  // The list takes the focus when it opens, and gives it back when it
+  // closes, unless the reader moved it on, as into the document.
+  const listRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
-    if (!mobilePanelOpen) return;
-    window.history.pushState({ slashdocsCommentsSheet: true }, "");
-    sheetHistoryRef.current = true;
-    const onPop = () => {
-      sheetHistoryRef.current = false;
-      setMobilePanelOpen(false);
-    };
-    window.addEventListener("popstate", onPop);
+    const list = listRef.current;
+    if (!listOpen || !list) return;
+    const opener = document.activeElement;
+    list.focus({ preventScroll: true });
     return () => {
-      window.removeEventListener("popstate", onPop);
-      // If the sheet closed via the UI (not via Back), remove the entry we
-      // pushed so the next Back returns to the documents list as expected.
-      if (sheetHistoryRef.current) {
-        sheetHistoryRef.current = false;
-        window.history.back();
-      }
+      const focus = document.activeElement;
+      const lost = focus === document.body || list.contains(focus);
+      if (lost && opener instanceof HTMLElement) opener.focus({ preventScroll: true });
     };
-  }, [mobilePanelOpen]);
-
-  // Radix Dialog's scroll-lock (react-remove-scroll) can leave the body
-  // with `overflow: hidden` / `pointer-events: none` after the mobile
-  // comments sheet closes, which freezes document scrolling. Restore the
-  // body once the sheet is fully closed. (`modal={false}` on the Sheet
-  // would avoid the lock, but Radix then skips the overlay and outside
-  // dismissal entirely, so we keep modal behavior and clean up after it.)
-  useEffect(() => {
-    if (mobilePanelOpen) return;
-    const restore = () => {
-      for (const el of [document.body, document.documentElement]) {
-        el.style.removeProperty("overflow");
-        el.style.removeProperty("padding-right");
-        el.style.removeProperty("pointer-events");
-        el.removeAttribute("data-scroll-locked");
-      }
-    };
-    // Run after Radix's own close cleanup on the next frame.
-    const id = window.requestAnimationFrame(restore);
-    return () => window.cancelAnimationFrame(id);
-  }, [mobilePanelOpen]);
-
-  useEffect(() => {
-    setCommentPositions(new Map());
-    setCommentViewport({ scrollTop: 0, scrollHeight: 1 });
-  }, [version]);
+  }, [listOpen]);
+  useEffect(
+    () => (listOpen ? keepToastsAbove(listRef.current) : undefined),
+    [listOpen],
+  );
+  const pickComment = useCallback(
+    (id: string) => {
+      setListOpen(false);
+      jumpToComment(id);
+    },
+    [jumpToComment],
+  );
+  // A reader who is signed out signs in first, and comes back to place it.
+  const location = useLocation();
+  const placePin = useCallback(() => {
+    setListOpen(false);
+    if (signIn) nav(signInPath(location, PIN_INTENT));
+    else setPlacingPin(true);
+  }, [signIn, nav, location]);
 
   const [drafts, updateDrafts] = useCommentDrafts(docId);
   // Drafts left empty on an earlier visit hold nothing worth keeping.
   useEffect(() => {
     updateDrafts((list) => list.filter((draft) => draft.body.trim()));
   }, [updateDrafts]);
+  // A draft left empty goes when its popover closes, as in Figma.
+  const latestDrafts = useRef(drafts);
+  latestDrafts.current = drafts;
+  const previousActive = useRef(activeComment);
+  useEffect(() => {
+    const previous = previousActive.current;
+    previousActive.current = activeComment;
+    if (!previous || previous === activeComment) return;
+    // Later than the composer's save, which holds what was typed last.
+    window.setTimeout(() => {
+      const empty = latestDrafts.current.some(
+        (d) => d.id === previous && !d.body.trim(),
+      );
+      if (empty && previousActive.current !== previous)
+        updateDrafts((list) => list.filter((d) => d.id !== previous));
+    }, 500);
+  }, [activeComment, updateDrafts]);
 
-  // A selection starts a new draft next to the drafts that have text. Picking
-  // the same text again returns to its draft.
+  // A selection or a placed pin starts a new draft next to the drafts that
+  // have text. Picking the same text or spot again returns to its draft when
+  // the draft has text. An empty draft is not used again: the timer of its
+  // closed popover can remove it before it opens again. A reader who is
+  // signed out signs in first, and comes back to the draft.
   const startDraft = useCallback(
-    (selection: PendingSelection) => {
-      if (signIn) return signIn();
-      let draftId = `draft:${crypto.randomUUID()}`;
+    (selection: PendingSelection, draftVersion = version) => {
+      if (signIn) {
+        keepPendingComment({ docId, version: draftVersion, selection });
+        return nav(signInPath(location, COMMENT_INTENT));
+      }
+      let draftId = `draft:${randomId()}`;
       updateDrafts((list) => {
+        const key = (anchor?: PendingSelection["anchor"]) =>
+          JSON.stringify([anchor?.point, anchor?.start_offset]);
         const same = list.find(
           (draft) =>
-            draft.version === version &&
+            draft.body.trim() &&
+            draft.version === draftVersion &&
             draft.quote === selection.quote &&
-            draft.anchor?.start_offset === selection.anchor?.start_offset,
+            key(draft.anchor) === key(selection.anchor),
         );
         if (same) {
           draftId = same.id;
@@ -301,36 +359,36 @@ export function DocWorkspace({
         }
         const draft = {
           id: draftId,
-          version,
+          version: draftVersion,
           ...selection,
-          body: "",
+          body: selection.body ?? "",
           mentions: [],
           updatedAt: Date.now(),
         };
         return [...list.filter((d) => d.body.trim()), draft];
       });
-      setCommentFilter(COMMENT_STATUS.open);
       setActiveComment(draftId);
-      if (fullscreen) return;
-      // The newest draft keeps a peek, so the panel stays while it is written.
-      if (peekDraft !== undefined || !(isMobile ? mobilePanelOpen : commentsOpen)) {
-        setPeekDraft(draftId);
-      }
-      if (isMobile) setMobilePanelOpen(true);
     },
-    [
-      version,
-      updateDrafts,
-      signIn,
-      fullscreen,
-      isMobile,
-      mobilePanelOpen,
-      commentsOpen,
-      peekDraft,
-    ],
+    [docId, version, updateDrafts, signIn, nav, location],
   );
+  // Back from sign-in, the reader goes on with what they asked for.
+  const intent = searchParams.get("intent");
+  useEffect(() => {
+    if (!intent || !principal) return;
+    if (intent === PIN_INTENT) setPlacingPin(true);
+    const pending = intent === COMMENT_INTENT && takePendingComment(docId);
+    if (pending) startDraft(pending.selection, pending.version);
+    setSearchParams(
+      (params) => {
+        const next = new URLSearchParams(params);
+        next.delete("intent");
+        return next;
+      },
+      { replace: true },
+    );
+  }, [intent, principal, docId, startDraft, setSearchParams]);
   const saveDraft = useCallback(
-    (draftId: string, text: { body: string; mentions: CommentMention[] }) =>
+    (draftId: string, text: DraftText) =>
       updateDrafts((list) =>
         list.map((d) =>
           d.id === draftId ? { ...d, ...text, updatedAt: Date.now() } : d,
@@ -338,14 +396,23 @@ export function DocWorkspace({
       ),
     [updateDrafts],
   );
+  const moveDraft = useCallback<DocContextValue["moveDraft"]>(
+    (draftId, anchor) =>
+      updateDrafts((list) =>
+        list.map((d) =>
+          d.id === draftId
+            ? { ...d, quote: anchor.quote ?? "", anchor, updatedAt: Date.now() }
+            : d,
+        ),
+      ),
+    [updateDrafts],
+  );
   const discardDraft = useCallback(
     (draftId: string) => {
       updateDrafts((list) => list.filter((d) => d.id !== draftId));
-      if (draftId !== peekDraft) return;
-      setPeekDraft(undefined);
-      setMobilePanelOpen(false);
+      setActiveComment((active) => (active === draftId ? undefined : active));
     },
-    [updateDrafts, peekDraft],
+    [updateDrafts],
   );
 
   const exitFullscreen = useCallback(() => {
@@ -400,11 +467,7 @@ export function DocWorkspace({
         return;
       }
       if (key === "c") {
-        setChordLabel(
-          (isMobile ? mobilePanelOpen : commentsOpen)
-            ? "Comments hidden"
-            : "Comments shown",
-        );
+        setChordLabel(listOpen ? "Comments hidden" : "Comments");
         toggleComments();
         return;
       }
@@ -421,41 +484,52 @@ export function DocWorkspace({
       setTheme,
       fullscreen,
       toggleFullscreen,
-      isMobile,
-      mobilePanelOpen,
-      commentsOpen,
+      listOpen,
       toggleComments,
       cursorsShown,
       nav,
       home,
     ],
   );
-  // ? shows every shortcut, as in GitHub and Gmail. The bridge forwards it
-  // from the document.
+  // ? shows every shortcut, as in GitHub and Gmail, and E starts Edit mode.
+  // The bridge forwards them from the document.
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === "?" && !isChordBlocked(event.target)) setShortcutsOpen(true);
+      if (canEdit && !editing && plainKey(event, "e")) {
+        event.preventDefault();
+        void setEditing(true);
+      }
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, []);
+  }, [canEdit, editing, setEditing]);
   const onBareEscape = useCallback(() => {
     if (fullscreen) exitFullscreen();
+    else if (listOpen) setListOpen(false);
     else setActiveComment(undefined);
-  }, [fullscreen, exitFullscreen]);
+  }, [fullscreen, exitFullscreen, listOpen]);
+  // An Esc from anywhere stops placing a pin, or closes the open thread, or
+  // leaves Edit mode, also with the caret in the text.
+  const takeEscape = useCallback(() => {
+    if (placingPin) setPlacingPin(false);
+    else if (activeComment) setActiveComment(undefined);
+    else if (editing) void setEditing(false);
+    else return false;
+    return true;
+  }, [placingPin, activeComment, editing, setEditing]);
   const chord = useEscChord({
     available: chordKeys,
     onRun: runChord,
     onEscape: onBareEscape,
+    takeEscape,
   });
 
   const ctx = useMemo(
     () => ({
       docId,
       version,
-      comments: comments.data?.items || [],
-      commentFilter,
-      setCommentFilter,
+      comments: readComments,
       commentsLoading: comments.isLoading,
       commentsError: !!comments.error,
       notifications,
@@ -464,34 +538,67 @@ export function DocWorkspace({
       drafts,
       startDraft,
       saveDraft,
+      moveDraft,
       discardDraft,
       activeComment,
       setActiveComment,
+      jumpToComment,
+      jump,
+      resolveThread,
+      leaving,
+      readThread,
       unanchoredComments,
       setUnanchoredComments,
+      movedPins,
+      setMovedPins,
       commentPositions,
       setCommentPositions,
-      commentViewport,
-      setCommentViewport,
+      documentHeight,
+      setDocumentHeight,
       registerDocumentPrinter,
       printDocument,
       registerDocumentScroller,
       scrollDocumentTo,
-      registerCommentRailSync,
-      syncCommentRail,
-      handleDocCommentClick,
+      handleDocCommentClick: setActiveComment,
       handleRenderedDocumentClick,
+      placingPin,
+      setPlacingPin,
       subscribeDocumentKV: stream.subscribeKV,
       reportViewport: stream.reportViewport,
       moveCursor: stream.moveCursor,
+      holdCursor: stream.holdCursor,
       subscribeCursors: stream.subscribeCursors,
       followedCursor,
+      onUnfollowCursor,
+      canEdit,
+      editing,
+      setEditing,
+      registerLiveText,
+      saveState,
+      setSaveState,
+      retrySave,
+      frameReady,
+      setFrameReady,
+      frameShows,
+      showCurrent,
+      frameLoad,
+      reloadFrame,
+      onPage,
+      liveLoads,
+      latest,
+      live,
+      event,
+      typists,
+      madeBy,
+      shownSeq,
+      holdUpdate,
+      showUpdate,
+      anchorOf,
     }),
     [
       docId,
       version,
-      comments.data,
-      commentFilter,
+      readComments,
       comments.isLoading,
       comments.error,
       notifications,
@@ -500,31 +607,81 @@ export function DocWorkspace({
       drafts,
       startDraft,
       saveDraft,
+      moveDraft,
       discardDraft,
       activeComment,
+      jumpToComment,
+      jump,
+      resolveThread,
+      leaving,
+      readThread,
       unanchoredComments,
+      setUnanchoredComments,
+      movedPins,
       commentPositions,
-      commentViewport,
-      setActiveComment,
+      documentHeight,
       registerDocumentPrinter,
       printDocument,
       registerDocumentScroller,
       scrollDocumentTo,
-      registerCommentRailSync,
-      syncCommentRail,
-      handleDocCommentClick,
       handleRenderedDocumentClick,
+      placingPin,
       stream.subscribeKV,
       stream.reportViewport,
       stream.moveCursor,
+      stream.holdCursor,
       stream.subscribeCursors,
       followedCursor,
+      onUnfollowCursor,
+      canEdit,
+      editing,
+      setEditing,
+      registerLiveText,
+      saveState,
+      retrySave,
+      frameReady,
+      frameShows,
+      showCurrent,
+      frameLoad,
+      reloadFrame,
+      onPage,
+      liveLoads,
+      latest,
+      live,
+      event,
+      typists,
+      madeBy,
+      shownSeq,
+      holdUpdate,
+      showUpdate,
+      anchorOf,
     ],
   );
 
+  const threads = useMemo(() => {
+    const open = ctx.comments.filter((c) => c.status === COMMENT_STATUS.open);
+    return { open: open.length, unread: open.some((c) => c.unread) };
+  }, [ctx.comments]);
+  // The tick strip marks the threads that the document highlights or pins.
+  const shownComments = useMemo(
+    () =>
+      ctx.comments.filter(
+        (c) => c.status !== COMMENT_STATUS.resolved || c.id === activeComment,
+      ),
+    [ctx.comments, activeComment],
+  );
   const frame = (
     <>
-      {version ? <RenderFrame /> : <Center>No version available.</Center>}
+      {version ? (
+        <RenderFrame
+          chordArmed={chord.phase === "armed"}
+          cover={listOpen && !isMobile && !crowded ? PANEL_ROOM : 0}
+          onCrowded={() => setCrowded(true)}
+        />
+      ) : (
+        <Center>Nothing to show yet.</Center>
+      )}
+      <CommentMap comments={shownComments} />
       <Keycast state={chord} available={chordKeys} label={chordLabel} />
     </>
   );
@@ -532,67 +689,94 @@ export function DocWorkspace({
     <DocProvider value={ctx}>
       <ShortcutsDialog open={shortcutsOpen} onOpenChange={setShortcutsOpen} />
       {fullscreen ? (
-        <div className="relative h-full bg-[var(--color-surface-muted)]">
-          {showFullscreenHint ? (
-            <div className="pointer-events-none absolute left-1/2 top-6 z-20 -translate-x-1/2 rounded-full bg-[var(--color-surface)] px-6 py-3 text-base font-semibold text-[var(--color-fg)] shadow-xl ring-1 ring-[var(--color-border)]">
-              <span className="hidden sm:inline">
+        <div className="flex h-full flex-col">
+          {banner}
+          <div
+            className={cn("min-h-0 flex-1 bg-[var(--color-surface-muted)]", FRAME_AREA)}
+          >
+            {showFullscreenHint ? (
+              <div className="pointer-events-none absolute left-1/2 top-6 z-20 hidden -translate-x-1/2 rounded-full bg-[var(--color-surface)] px-6 py-3 text-base font-semibold text-[var(--color-fg)] shadow-xl ring-1 ring-[var(--color-border)] sm:block">
                 Esc to exit · ? for all shortcuts
-              </span>
-              <span className="sm:hidden">Go back to exit full screen</span>
-            </div>
-          ) : null}
-          {frame}
+              </div>
+            ) : null}
+            {/* A phone has no Esc key, so its exit stays in view. */}
+            <Button
+              variant="outline"
+              size="icon"
+              onClick={exitFullscreen}
+              aria-label="Exit full screen"
+              className="absolute right-4 top-3 z-20 h-10 w-10 rounded-full sm:hidden"
+            >
+              <Minimize2 className="h-4 w-4" />
+            </Button>
+            {frame}
+          </div>
         </div>
       ) : (
-        <motion.div
-          className="flex h-full flex-col"
-          initial="hidden"
-          animate="visible"
-          variants={pageStagger}
-        >
-          <motion.div variants={barSlide}>
-            {bar({
-              commentsOpen: isMobile ? mobilePanelOpen : commentsOpen,
-              onToggleComments: toggleComments,
-              onShowShortcuts: () => setShortcutsOpen(true),
-            })}
-          </motion.div>
-          <motion.div variants={contentFade} className="flex flex-1 overflow-hidden">
-            <section className="relative min-w-0 flex-1 bg-[var(--color-surface-muted)]">
-              {frame}
-            </section>
-            <AnimatePresence initial={false}>
-              {commentsOpen && !isMobile && (
-                <motion.aside
-                  key="comment-rail"
-                  initial={{ width: 0, opacity: 0 }}
-                  animate={{ width: 360, opacity: 1 }}
-                  exit={{ width: 0, opacity: 0 }}
-                  transition={{ type: "spring", duration: 0.35, bounce: 0 }}
-                  className="relative hidden shrink-0 overflow-hidden bg-[var(--color-chrome)] md:block"
-                >
-                  <div className="h-full w-[360px]">
-                    <Comments />
-                  </div>
-                </motion.aside>
-              )}
-            </AnimatePresence>
-          </motion.div>
-
-          {/* Mobile: comments live in a slide-over sheet */}
-          <Sheet open={mobilePanelOpen} onOpenChange={setMobilePanelOpen}>
-            <SheetContent
-              side="right"
-              className="w-full max-w-md p-0 md:hidden"
-              aria-describedby={undefined}
+        <div className="flex h-full flex-col">
+          {bar({
+            commentsOpen: listOpen,
+            threads,
+            onToggleComments: toggleComments,
+            onShowShortcuts: () => setShortcutsOpen(true),
+          })}
+          {banner}
+          <section className="relative min-w-0 flex-1 overflow-hidden bg-[var(--color-surface-muted)]">
+            {/* A wide screen makes room for the list beside a crowded
+                document, as Google Docs does. The room opens at once, so the
+                text reflows one time, and only the list slides in. Under the
+                sheet of a narrow one, the document is out of reach. */}
+            <div
+              inert={listOpen && isMobile}
+              className={cn(FRAME_AREA, crowded && "lg:mr-[392px]")}
             >
-              <SheetHeader className="sr-only">
-                <SheetTitle>Comments</SheetTitle>
-              </SheetHeader>
-              <Comments mobile />
-            </SheetContent>
-          </Sheet>
-        </motion.div>
+              {frame}
+            </div>
+            <AnimatePresence>
+              {listOpen && isMobile ? (
+                <motion.div
+                  key="backdrop"
+                  {...fade}
+                  aria-hidden="true"
+                  onClick={() => setListOpen(false)}
+                  className="absolute inset-0 z-30 bg-[hsl(218_30%_12%/0.24)] dark:bg-black/60"
+                />
+              ) : null}
+              {listOpen ? (
+                // The comment history, as in Google Docs: under the bar on the
+                // right, or a sheet at the bottom of a narrow screen.
+                <motion.div
+                  key="comments"
+                  ref={listRef}
+                  tabIndex={-1}
+                  {...(isMobile ? sheetUp : slideIn)}
+                  role="dialog"
+                  aria-label="Comments"
+                  onKeyDown={(e) => {
+                    if (e.key !== "Escape") return;
+                    e.stopPropagation();
+                    setListOpen(false);
+                  }}
+                  className={cn(
+                    "absolute z-30 flex flex-col overflow-hidden bg-[var(--color-surface)] shadow-xl ring-1 ring-[var(--color-border)] outline-none",
+                    isMobile
+                      ? "inset-x-0 bottom-0 max-h-[70%] rounded-t-2xl"
+                      : "right-4 top-3 max-h-[calc(100%-1.5rem)] w-[360px] rounded-xl",
+                  )}
+                >
+                  {isMobile && <SheetHandle />}
+                  <CommentsList
+                    showsLatest={showsLatest}
+                    onPick={pickComment}
+                    onPlacePin={placePin}
+                    retry={comments}
+                    onClose={() => setListOpen(false)}
+                  />
+                </motion.div>
+              ) : null}
+            </AnimatePresence>
+          </section>
+        </div>
       )}
     </DocProvider>
   );

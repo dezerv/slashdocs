@@ -4,7 +4,9 @@ import {
   CHORD_WINDOW_MS,
   IDLE,
   isChordBlocked,
+  isInLayer,
   reduceChord,
+  type ChordEffect,
   type ChordEvent,
   type ChordKey,
   type ChordState,
@@ -14,11 +16,15 @@ export function useEscChord({
   available,
   onRun,
   onEscape,
+  takeEscape = () => false,
   enabled = true,
 }: {
   available: ReadonlyArray<ChordKey>;
   onRun: (key: ChordKey) => void;
   onEscape: () => void;
+  // Something on screen that an Esc closes, as an open thread, takes it at
+  // once and says so.
+  takeEscape?: () => boolean;
   enabled?: boolean;
 }): ChordState {
   const [state, setState] = React.useState<ChordState>(IDLE);
@@ -29,9 +35,11 @@ export function useEscChord({
   onRunRef.current = onRun;
   const onEscapeRef = React.useRef(onEscape);
   onEscapeRef.current = onEscape;
+  const takeEscapeRef = React.useRef(takeEscape);
+  takeEscapeRef.current = takeEscape;
   const timerRef = React.useRef<number>(undefined);
 
-  const dispatch = React.useCallback((event: ChordEvent) => {
+  const dispatch = React.useCallback((event: ChordEvent): ChordEffect => {
     const { state: next, effect } = reduceChord(
       stateRef.current,
       event,
@@ -56,6 +64,7 @@ export function useEscChord({
     }
     if (effect?.type === "run") onRunRef.current(effect.key);
     if (effect?.type === "escape") onEscapeRef.current();
+    return effect;
   }, []);
 
   React.useEffect(() => {
@@ -64,15 +73,28 @@ export function useEscChord({
       return;
     }
     const onKeyDown = (event: KeyboardEvent) => {
-      if (isChordBlocked(event.target)) {
+      // Only an Esc that nothing else uses arms the chord. What takes the Esc
+      // keeps it, so that the Esc does nothing more, as stop a follow.
+      const blocked = isChordBlocked(event.target);
+      const escape = event.key === "Escape";
+      const used = () => event.defaultPrevented || isInLayer(event.target);
+      if (escape && !blocked && !used() && takeEscapeRef.current())
+        event.preventDefault();
+      if (blocked || (escape && used())) {
         dispatch({ type: "cancel" });
         return;
       }
-      dispatch({
+      const effect = dispatch({
         type: "keydown",
         key: event.key,
         modified: event.metaKey || event.ctrlKey || event.altKey,
       });
+      // The letter of a chord is the chord's alone: C opens the comments,
+      // and does not also place a pin.
+      if (effect?.type === "run") {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+      }
     };
     window.addEventListener("keydown", onKeyDown, true);
     return () => {

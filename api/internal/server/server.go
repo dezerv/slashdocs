@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"io/fs"
 	"mime/multipart"
 	"net/http"
 	"net/url"
@@ -19,6 +20,7 @@ import (
 	"github.com/razorpay/slashdocs/api/internal/kvevents"
 	"github.com/razorpay/slashdocs/api/internal/notifications"
 	"github.com/razorpay/slashdocs/api/internal/repo"
+	"github.com/razorpay/slashdocs/api/internal/webhooks"
 )
 
 // Config holds static configuration for the server.
@@ -28,8 +30,11 @@ type Config struct {
 	RenderOrigin string
 	// PreviousOrigins are app origins that this deployment used before. A
 	// request to one of them is sent to AppOrigin (see movedOriginMiddleware).
-	PreviousOrigins     []string
-	OIDC                auth.OIDC
+	PreviousOrigins []string
+	OIDC            auth.OIDC
+	// PreviousOIDCIssuers are issuer URLs that OIDC used before. A user whose
+	// identity key came from one of them moves to the key of OIDC.Issuer.
+	PreviousOIDCIssuers []string
 	OIDCProviderName    string
 	SessionSecret       string
 	AllowedOAuthDomains []string
@@ -55,7 +60,9 @@ type Config struct {
 // Server wraps the gin engine.
 type Server struct {
 	engine             *gin.Engine
+	closeStreams       context.CancelFunc
 	notificationWorker *notifications.Worker
+	webhookWorker      *webhooks.Worker
 }
 
 type readinessCheck struct {
@@ -64,29 +71,43 @@ type readinessCheck struct {
 }
 
 type dependencies struct {
-	commentNotificationSender notifications.Sender
-	authenticator             auth.Authenticator
-	repository                repo.Repository
-	stateStore                auth.LoginStateStore
-	oidc                      auth.OIDC
-	oidcProviderName          string
-	sessionSecret             string
-	appOrigin                 string
-	renderOrigin              string
-	allowedOAuthDomains       []string
-	deployment                string
-	orgName                   string
-	defaultDocPermission      repo.Role
-	featured                  []FeaturedSection
-	readinessChecks           []readinessCheck
-	documentKVEvents          kvevents.Subscriber
-	githubOAuth               *oauth2.Config
-	githubHTTPClient          *http.Client
-	githubAccessChecks        *singleflight.Group
-	googleGroupsEnabled       bool
-	googleGroupDirectory      googlegroups.GoogleGroupDirectory
-	googleGroupResolver       *googlegroups.Resolver
-	labelsEnabled             bool
+	notificationSenders  map[string]notifications.Sender
+	approvalWebhook      *webhooks.Endpoint
+	authenticator        auth.Authenticator
+	repository           repo.Repository
+	stateStore           auth.LoginStateStore
+	oidc                 auth.OIDC
+	previousOIDCIssuers  []string
+	oidcProviderName     string
+	sessionSecret        string
+	appOrigin            string
+	renderOrigin         string
+	allowedOAuthDomains  []string
+	deployment           string
+	orgName              string
+	defaultDocPermission repo.Role
+	featured             []FeaturedSection
+	readinessChecks      []readinessCheck
+	documentKVEvents     kvevents.Subscriber
+	// streams ends when the server stops, and the event streams of
+	// documents with it.
+	streams              context.Context
+	githubOAuth          *oauth2.Config
+	githubHTTPClient     *http.Client
+	githubAccessChecks   *singleflight.Group
+	anchorFollows        *followers
+	placements           *placementDocs
+	googleGroupsEnabled  bool
+	googleGroupDirectory googlegroups.GoogleGroupDirectory
+	googleGroupResolver  *googlegroups.Resolver
+	labelsEnabled        bool
+	slackSigningSecret   string
+	slackUnfurler        notifications.Unfurler
+	previousOrigins      []string
+	frontend             fs.FS
+	// frontendBuild names the build of frontend. The pages of another build
+	// load again.
+	frontendBuild string
 }
 
 // Option configures the Server.
@@ -96,8 +117,16 @@ func WithAuthenticator(a auth.Authenticator) Option {
 	return func(d *dependencies) { d.authenticator = a }
 }
 
-func WithCommentNotificationSender(sender notifications.Sender) Option {
-	return func(d *dependencies) { d.commentNotificationSender = sender }
+// WithNotificationSenders starts the notification worker when at least one
+// provider is configured. The map key names the provider.
+func WithNotificationSenders(senders map[string]notifications.Sender) Option {
+	return func(d *dependencies) { d.notificationSenders = senders }
+}
+
+// WithSlackLinkPreviews serves Slack link previews at POST /v1/slack/events.
+// signingSecret verifies that Slack sent each event.
+func WithSlackLinkPreviews(signingSecret string, unfurler notifications.Unfurler) Option {
+	return func(d *dependencies) { d.slackSigningSecret, d.slackUnfurler = signingSecret, unfurler }
 }
 
 func (s *Server) RunCommentNotifications(ctx context.Context) {
@@ -106,7 +135,22 @@ func (s *Server) RunCommentNotifications(ctx context.Context) {
 	}
 }
 
+// WithApprovalWebhook posts approval events to the endpoint. The repository
+// must queue them (postgres.Store.EnableApprovalEvents).
+func WithApprovalWebhook(endpoint webhooks.Endpoint) Option {
+	return func(d *dependencies) { d.approvalWebhook = &endpoint }
+}
+
+func (s *Server) RunApprovalWebhooks(ctx context.Context) {
+	if s.webhookWorker != nil {
+		s.webhookWorker.Run(ctx)
+	}
+}
+
 func WithRepository(r repo.Repository) Option { return func(d *dependencies) { d.repository = r } }
+
+// WithFrontend serves the web app from fsys instead of the embedded build.
+func WithFrontend(fsys fs.FS) Option { return func(d *dependencies) { d.frontend = fsys } }
 
 func WithGoogleGroupDirectory(directory googlegroups.GoogleGroupDirectory) Option {
 	return func(d *dependencies) { d.googleGroupDirectory = directory }
@@ -145,9 +189,12 @@ func (denyAllAuthenticator) Authenticate(_ *http.Request) (*auth.Principal, erro
 func New(cfg Config, opts ...Option) *Server {
 	gin.SetMode(gin.ReleaseMode)
 	deps := dependencies{
+		anchorFollows:        &followers{pending: map[string]bool{}},
+		placements:           &placementDocs{docs: map[string]*placementDoc{}},
 		authenticator:        denyAllAuthenticator{},
 		stateStore:           auth.NewStateStore(),
 		oidc:                 cfg.OIDC,
+		previousOIDCIssuers:  cfg.PreviousOIDCIssuers,
 		oidcProviderName:     cfg.OIDCProviderName,
 		sessionSecret:        cfg.SessionSecret,
 		appOrigin:            cfg.AppOrigin,
@@ -161,6 +208,8 @@ func New(cfg Config, opts ...Option) *Server {
 		githubAccessChecks:   new(singleflight.Group),
 		googleGroupsEnabled:  cfg.GoogleGroupsEnabled,
 		labelsEnabled:        !cfg.DisableLabels,
+		previousOrigins:      cfg.PreviousOrigins,
+		frontend:             embeddedFrontend(),
 	}
 	if cfg.GitHubClientID != "" && cfg.GitHubClientSecret != "" && cfg.AppOrigin != "" {
 		deps.githubOAuth = &oauth2.Config{
@@ -174,6 +223,7 @@ func New(cfg Config, opts ...Option) *Server {
 	for _, opt := range opts {
 		opt(&deps)
 	}
+	deps.frontendBuild = frontendBuild(deps.frontend)
 	// Missing storage is a startup wiring bug, not a recoverable request error.
 	if deps.repository == nil {
 		panic("server.New: repository is required (use server.WithRepository)")
@@ -202,18 +252,31 @@ func New(cfg Config, opts ...Option) *Server {
 		r.Use(movedOriginMiddleware(cfg.AppOrigin, cfg.PreviousOrigins))
 	}
 	s := &Server{engine: r}
-	if deps.commentNotificationSender != nil {
+	deps.streams, s.closeStreams = context.WithCancel(context.Background())
+	s.addWorkers(deps)
+	s.routes(deps)
+	return s
+}
+
+// addWorkers builds the outbox workers that the dependencies configure.
+func (s *Server) addWorkers(deps dependencies) {
+	if len(deps.notificationSenders) > 0 {
 		store, ok := deps.repository.(notifications.Store)
 		if !ok {
 			panic("notification sender requires an outbox store")
 		}
-		s.notificationWorker = &notifications.Worker{Store: store, Sender: deps.commentNotificationSender, AppOrigin: deps.appOrigin}
+		s.notificationWorker = &notifications.Worker{Store: store, Senders: deps.notificationSenders, AppOrigin: deps.appOrigin}
 		if deps.googleGroupResolver != nil {
 			s.notificationWorker.ResolvePrincipal = deps.googleGroupResolver.Resolve
 		}
 	}
-	s.routes(deps)
-	return s
+	if deps.approvalWebhook != nil {
+		store, ok := deps.repository.(webhooks.Store)
+		if !ok {
+			panic("approval webhook requires an outbox store")
+		}
+		s.webhookWorker = webhooks.NewWorker(store, *deps.approvalWebhook)
+	}
 }
 
 type unavailableDocumentKVEvents struct{}
@@ -227,6 +290,12 @@ func (unavailableDocumentKVEvents) Relay(context.Context, repo.DocumentKVEvent) 
 }
 
 func (s *Server) Handler() http.Handler { return s.engine }
+
+// CloseStreams ends the open event streams of documents, so that a server
+// that stops does not wait for them. An HTTP server does not wait for a
+// WebSocket at all: register this with http.Server.RegisterOnShutdown. The
+// viewers connect again, to a server that runs.
+func (s *Server) CloseStreams() { s.closeStreams() }
 
 func (s *Server) routes(deps dependencies) {
 	h := handlers{deps: deps}
@@ -249,7 +318,7 @@ func (s *Server) routes(deps dependencies) {
 	registerAPIDocsRoutes(s.engine, deps)
 	s.engine.GET("/v/:id/:version_id", h.renderVersion)
 	s.engine.GET("/print/:id/:version_id", h.renderPrintVersion)
-	registerFrontendRoutes(s.engine, deps.appOrigin)
+	registerFrontendRoutes(s.engine, h)
 
 	s.engine.GET("/livez", h.livez)
 	s.engine.GET("/readyz", h.readyz)
@@ -265,28 +334,60 @@ func (s *Server) routes(deps dependencies) {
 	v1.GET("/auth/oidc/callback", h.oauthCallback)
 	v1.POST("/auth/cli/exchange", h.cliExchange)
 	v1.POST("/auth/logout", h.logout)
+	// Slack link previews. Public, because Slack cannot sign in. Every request
+	// must carry a valid Slack signature instead (see verifySlackSignature).
+	if deps.slackUnfurler != nil {
+		v1.POST("/slack/events", verifySlackSignature(deps.slackSigningSecret, time.Now), h.slackEvents)
+	}
 
 	// These routes read a document. A public deployment also serves them to
 	// anonymous readers of a document that is shared with anyone.
-	reader := v1.Group("", requireAuth(deps.readerAuthenticator(), deps.appOrigin, deps.googleGroupResolver))
+	readerAuth := requireAuth(deps.readerAuthenticator(), deps.appOrigin, deps.googleGroupResolver)
+	reader := v1.Group("", readerAuth)
 	reader.GET("/documents/:id", h.getDocument)
 	reader.GET("/documents/:id/versions", h.listVersions)
+	// A browser that follows live edits asks for the changes when the event
+	// of an operation does not carry it, or when it missed an event. A read
+	// of the source at a seq costs as much as a read of the changes does, so
+	// the two share one budget.
+	followLimit := activityRateLimit(1200)
+	reader.GET("/documents/:id/changes", followLimit, h.documentChanges)
 	reader.GET("/documents/:id/versions/:version_id", h.getVersion)
-	reader.GET("/documents/:id/versions/:version_id/html", h.getVersionHTML)
+	reader.GET("/documents/:id/versions/:version_id/html", followLimit, h.getVersionHTML)
 	reader.POST("/documents/:id/versions/:version_id/render-token", h.createRenderToken)
 	reader.POST("/documents/:id/versions/:version_id/print-token", h.createPrintToken)
 	reader.GET("/documents/:id/comments", h.listComments)
 	reader.GET("/documents/:id/kv", h.listDocumentKV)
 	reader.GET("/documents/:id/kv/events", h.streamDocumentKVEvents)
+	// Separate budgets: presence reports and cursor moves must not starve
+	// other activity. A moving cursor reports about 12 times a second. The
+	// live connection reports them too, from the same budgets.
+	presenceLimit := newActivityLimit(60)
+	cursorLimit := newActivityLimit(1200)
+	v1.GET("/documents/:id/live", refuseOverWebSocket, readerAuth, h.documentLive(presenceLimit, cursorLimit))
 
 	// Every route below requires authentication.
 	authed := v1.Group("", requireAuth(deps.authenticator, deps.appOrigin, deps.googleGroupResolver))
 	activityLimit := activityRateLimit(60)
-	// Separate budgets: presence heartbeats and cursor moves must not starve
-	// other activity. A moving cursor reports about 12 times a second.
-	presenceLimit := activityRateLimit(60)
-	cursorLimit := activityRateLimit(1200)
+	// A decision can start the seal of the open version, which writes a
+	// blob. Decisions have their own budget, so that other activity and
+	// typing never block them.
+	decisionLimit := activityRateLimit(60)
+	// An editor writes many operations a second.
+	opsLimit := activityRateLimit(1200)
+	// A comment update changes the body or the status of a comment, or moves
+	// a point comment. The server moves text anchors itself, off the request
+	// (followLater). Comment updates have their own budget, so that other
+	// activity does not block them.
+	commentLimit := activityRateLimit(300)
+	// A change of access wakes the open streams of each document that it
+	// affects, and a change of a folder wakes all open streams.
+	accessLimit := activityRateLimit(30)
+	// One read of the inbox can read many pages: it skips the items of
+	// documents that the caller can no longer read.
+	inboxLimit := activityRateLimit(60)
 	authed.GET("/me", h.me)
+	authed.GET("/me/inbox", inboxLimit, h.inbox)
 	authed.GET("/users", h.searchUsers)
 	authed.GET("/google-groups", h.searchGoogleGroups)
 	authed.GET("/auth/cli/credentials", h.listCLICredentials)
@@ -303,14 +404,26 @@ func (s *Server) routes(deps dependencies) {
 	authed.POST("/service-accounts/transfers/:id/decline", h.declineOwnershipTransfer)
 	authed.POST("/documents", h.createDocument)
 	authed.GET("/documents", h.listDocuments)
+	authed.GET("/access-requests", h.listManagedAccessRequests)
 	authed.POST("/documents/:id/access-requests", activityLimit, h.requestDocumentAccess)
+	authed.GET("/documents/:id/access-requests", h.listDocumentAccessRequests)
+	authed.DELETE("/documents/:id/access-requests/:requester_type/:requester_id", h.declineDocumentAccessRequest)
 	authed.GET("/documents/:id/access", h.documentAccess)
 	authed.PATCH("/documents/:id", h.patchDocument)
 	authed.DELETE("/documents/:id", h.deleteDocument)
 	authed.POST("/documents/:id/grants", h.createGrant)
 	authed.PATCH("/documents/:id/grants/:grant_id", h.patchGrant)
 	authed.DELETE("/documents/:id/grants/:grant_id", h.deleteGrant)
+	authed.POST("/documents/:id/approvers", h.createApprover)
+	authed.GET("/documents/:id/approvers", h.listApprovers)
+	authed.DELETE("/documents/:id/approvers/:approver_id", h.deleteApprover)
+	authed.POST("/documents/:id/approvals", decisionLimit, h.createApproval)
+	authed.GET("/documents/:id/approvals", h.listApprovals)
+	authed.DELETE("/documents/:id/approvals/:approval_id", h.deleteApproval)
 	authed.POST("/documents/:id/versions", h.createVersion)
+	authed.POST("/documents/:id/edits", h.editDocument)
+	authed.POST("/documents/:id/ops", opsLimit, h.appendOperation)
+	authed.POST("/documents/:id/versions/:version_id/restore", h.restoreVersion)
 	authed.GET("/documents/:id/labels", h.listDocumentLabels)
 	authed.PUT("/documents/:id/labels", h.replaceDocumentLabels)
 	authed.POST("/documents/:id/github/raw", h.githubRawContent)
@@ -321,26 +434,27 @@ func (s *Server) routes(deps dependencies) {
 	authed.GET("/documents/:id/headings", activityLimit, h.documentHeadings)
 	authed.GET("/documents/:id/link", activityLimit, h.documentLink)
 	authed.PUT("/documents/:id/notifications", activityLimit, h.setDocumentNotificationPreferences)
-	authed.POST("/documents/:id/presence", presenceLimit, h.postDocumentPresence)
-	authed.POST("/documents/:id/cursor", cursorLimit, h.postDocumentCursor)
+	authed.POST("/documents/:id/presence", presenceLimit.handle, h.postDocumentPresence)
+	authed.POST("/documents/:id/cursor", cursorLimit.handle, h.postDocumentCursor)
 	authed.PATCH("/documents/:id/kv", h.patchDocumentKV)
 	authed.POST("/documents/:id/comments/:comment_id/replies", h.createCommentReply)
-	authed.PATCH("/documents/:id/comments/:comment_id", h.patchComment)
+	authed.PATCH("/documents/:id/comments/:comment_id", commentLimit, h.patchComment)
 	authed.DELETE("/documents/:id/comments/:comment_id", h.deleteComment)
 	authed.PUT("/documents/:id/comments/:comment_id/reactions/:emoji", h.putCommentReaction)
 	authed.DELETE("/documents/:id/comments/:comment_id/reactions/:emoji", h.deleteCommentReaction)
+	authed.PUT("/documents/:id/comments/:comment_id/read", h.markCommentThreadRead)
 	authed.POST("/folders", h.createFolder)
 	authed.GET("/folders", h.listFolders)
 	authed.GET("/folders/:id", h.getFolder)
-	authed.PATCH("/folders/:id", h.patchFolder)
-	authed.DELETE("/folders/:id", h.deleteFolder)
+	authed.PATCH("/folders/:id", accessLimit, h.patchFolder)
+	authed.DELETE("/folders/:id", accessLimit, h.deleteFolder)
 	authed.GET("/folders/:id/access", h.folderAccess)
-	authed.POST("/folders/:id/grants", h.createFolderGrant)
-	authed.PATCH("/folders/:id/grants/:grant_id", h.patchFolderGrant)
-	authed.DELETE("/folders/:id/grants/:grant_id", h.deleteFolderGrant)
+	authed.POST("/folders/:id/grants", accessLimit, h.createFolderGrant)
+	authed.PATCH("/folders/:id/grants/:grant_id", accessLimit, h.patchFolderGrant)
+	authed.DELETE("/folders/:id/grants/:grant_id", accessLimit, h.deleteFolderGrant)
 	authed.GET("/folders/:id/documents", h.listFolderDocs)
-	authed.POST("/folders/:id/documents", h.moveDocToFolder)
-	authed.DELETE("/folders/:id/documents/:doc_id", h.moveDocToRoot)
+	authed.POST("/folders/:id/documents", accessLimit, h.moveDocToFolder)
+	authed.DELETE("/folders/:id/documents/:doc_id", accessLimit, h.moveDocToRoot)
 	authed.GET("/pins", h.listPins)
 	authed.PUT("/pins/:resource_type/:resource_id", h.putPin)
 	authed.DELETE("/pins/:resource_type/:resource_id", h.deletePin)
@@ -363,11 +477,20 @@ func (h handlers) needDocRole(c *gin.Context, docID string, need repo.Role) bool
 		internalErr(c, err)
 		return false
 	}
-	if !atLeast(role, need) {
-		denyDocRole(c, need)
-		return false
+	if atLeast(role, need) {
+		return true
 	}
-	return true
+	// RoleNone also means that the document does not exist. Then the answer
+	// is 404, which GET /v1/documents/{id} already gives to every caller.
+	switch _, err := h.deps.repository.GetDocument(c.Request.Context(), docID); {
+	case errors.Is(err, repo.ErrNotFound):
+		notFound(c)
+	case err != nil:
+		internalErr(c, err)
+	default:
+		denyDocRole(c, need)
+	}
+	return false
 }
 
 // denyDocRole answers a caller whose role on a document is less than need.
@@ -425,6 +548,13 @@ func requireAuth(a auth.Authenticator, appOrigin string, groups *googlegroups.Re
 		p, err := a.Authenticate(c.Request)
 		if err != nil {
 			incAuth("request", "failure")
+			// A credential that could not be examined, as when the database
+			// is down, is not a refusal: a 401 would sign the person out.
+			if !errors.Is(err, auth.ErrUnauthorized) {
+				c.Abort()
+				internalErr(c, err)
+				return
+			}
 			unauthorized(c)
 			return
 		}
@@ -507,7 +637,7 @@ func current(c *gin.Context) *auth.Principal {
 
 var errPayloadTooLarge = errors.New("payload too large")
 
-const maxHTMLBytes = 50 * 1024 * 1024
+const maxHTMLBytes = repo.MaxHTMLBytes
 
 func readMultipartFile(c *gin.Context, field string) ([]byte, error) {
 	f, err := c.FormFile(field)

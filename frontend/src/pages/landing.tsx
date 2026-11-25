@@ -3,6 +3,7 @@ import { Link, Navigate } from "react-router-dom";
 import { History, MessageSquareQuote, ShieldCheck, Users } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { CodeBlock } from "@/components/ui/misc";
+import { Segmented, tabPanel } from "@/components/ui/segmented";
 import {
   SELF_HOSTING_URL,
   SiteFooter,
@@ -37,12 +38,12 @@ const QUESTIONS = [
   {
     icon: MessageSquareQuote,
     title: "Where does feedback go?",
-    body: "On the exact words. Comments stay through new versions, with replies and reactions. Agents pull them, then revise or reply.",
+    body: "On the exact words. Comments stay through edits, with replies and reactions. Agents pull them, then revise or reply.",
   },
   {
     icon: History,
     title: "Which copy is current?",
-    body: "Each push makes a version that never changes. You can roll back to any earlier version.",
+    body: "History keeps every earlier state of the document. You can restore any of them.",
   },
   {
     icon: ShieldCheck,
@@ -134,10 +135,11 @@ export function LandingPage() {
             </h1>
             <p className={cn(lead, "mx-auto mt-6 md:text-xl")}>
               Agents choose the words and the form: the layout, the visuals, and how the
-              document behaves. People comment in the browser. Agents read the comments
-              and publish the next version.
+              document behaves. People comment in the browser, and editors fix words in
+              place. Agents read the comments and publish the next version.
             </p>
             <div className="mx-auto mt-10 flex max-w-xl flex-col gap-3 sm:flex-row sm:items-center">
+              {/* A narrow screen scrolls the command without a scrollbar. */}
               <CodeBlock className="min-w-0 flex-1 bg-[var(--color-surface)] text-left">{`curl -fsSL ${publicURL()}/install.sh | sh`}</CodeBlock>
               <Button asChild size="lg">
                 <Link to="/login">Sign in</Link>
@@ -316,28 +318,23 @@ function Start({ title, children }: { title: string; children: string }) {
 
 // Each way to connect an agent, with the commands for the selected one.
 function Connect() {
-  const [active, setActive] = useState(0);
-  const c = CONNECT[active];
+  const [active, setActive] = useState(CONNECT[0].title);
+  const c = CONNECT.find((t) => t.title === active) ?? CONNECT[0];
   return (
     <div className="min-w-0">
+      <Segmented
+        label="Ways to connect an agent"
+        value={active}
+        options={CONNECT.map((t) => ({ value: t.title, label: t.title }))}
+        onChange={setActive}
+        panel="connect-agent"
+        className="w-fit"
+      />
       <div
-        role="tablist"
-        aria-label="Ways to connect an agent"
-        className="flex w-fit gap-0.5 rounded-sm bg-[var(--color-surface-muted)] p-0.5 ring-1 ring-[var(--color-border)] dark:ring-transparent"
+        {...tabPanel("connect-agent")}
+        key={active}
+        className="mt-6 animate-[rise_300ms_ease-out]"
       >
-        {CONNECT.map((t, i) => (
-          <button
-            key={t.title}
-            role="tab"
-            aria-selected={i === active}
-            onClick={() => setActive(i)}
-            className="rounded-[6px] px-3 py-1.5 text-sm text-[var(--color-fg-muted)] transition-colors duration-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-accent)] aria-selected:bg-[var(--color-surface)] aria-selected:text-[var(--color-fg)] aria-selected:shadow-[var(--shadow-border)]"
-          >
-            {t.title}
-          </button>
-        ))}
-      </div>
-      <div role="tabpanel" key={active} className="mt-6 animate-[rise_300ms_ease-out]">
         <p className="text-[var(--color-fg-muted)]">{c.body}</p>
         <CodeBlock className="mt-4 bg-[var(--color-surface)]">{c.code}</CodeBlock>
       </div>

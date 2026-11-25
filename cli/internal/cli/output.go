@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -15,11 +16,14 @@ import (
 var displayFields = []string{
 	"id", "document_id", "title", "name", "email", "type", "role",
 	"enabled", "effective_enabled", "text", "level", "effective_role", "status", "disabled", "current_version_id", "number",
-	"sha256", "token", "selected_text", "body", "url",
+	"sha256", "token", "selected_text", "body", "url", "decision",
+	"approval_status", "version_number", "note",
 }
 
 // render writes b to out, honoring --quiet and --json. It is the single output
-// path for API response bodies.
+// path for API response bodies. With --json it writes exactly one JSON value:
+// {"ok": true} for an empty body, and a JSON string for a body that is not
+// JSON, such as document HTML.
 func render(out io.Writer, g *globals, b []byte) error {
 	return renderHint(out, g, b, "")
 }
@@ -28,23 +32,78 @@ func renderHint(out io.Writer, g *globals, b []byte, hint string) error {
 	if g.quiet {
 		return nil
 	}
-	var x any
-	if json.Unmarshal(b, &x) == nil {
-		if g.json {
-			enc := json.NewEncoder(out)
-			enc.SetIndent("", "  ")
-			return enc.Encode(x)
-		}
-		_, err := fmt.Fprintln(out, humanize(hint, x))
-		return err
+	if g.json && len(bytes.TrimSpace(b)) == 0 {
+		b = []byte(`{"ok":true}`)
 	}
-	_, err := out.Write(append(bytes.TrimSpace(b), '\n'))
+	var x any
+	if json.Unmarshal(b, &x) != nil {
+		if !g.json {
+			_, err := out.Write(append(bytes.TrimSpace(b), '\n'))
+			return err
+		}
+		x = string(b)
+	}
+	if g.json {
+		enc := json.NewEncoder(out)
+		enc.SetIndent("", "  ")
+		enc.SetEscapeHTML(false)
+		return enc.Encode(x)
+	}
+	_, err := fmt.Fprintln(out, humanize(hint, x))
 	return err
 }
 
+// renderValue renders v, a value that the CLI built, through render.
+func renderValue(out io.Writer, g *globals, v any) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	return render(out, g, b)
+}
+
+// errorEnvelope is the --json form of a failed command, in the shape of the
+// error responses of the server. An API error keeps the response of the
+// server, with its code and details, and the message that the plain output
+// shows, which a command can replace. Other errors get a code from their
+// kind.
+func errorEnvelope(err error) map[string]any {
+	var ae *APIError
+	if errors.As(err, &ae) {
+		var v map[string]any
+		if json.Unmarshal([]byte(ae.Body), &v) == nil && v["error"] != nil {
+			if e, ok := v["error"].(map[string]any); ok {
+				e["message"] = ae.Message
+			}
+			return v
+		}
+	}
+	code := "cli_error"
+	switch {
+	case ae != nil:
+		code = "api_error"
+	case ExitCode(err) == 2:
+		code = "usage"
+	case ExitCode(err) == 6:
+		code = "network"
+	}
+	return map[string]any{"error": map[string]any{"code": code, "message": err.Error()}}
+}
+
+// reportedError is a failure that the command already put in its --json
+// output, so Run does not write a second JSON value.
+type reportedError struct{ err error }
+
+func (e reportedError) Error() string { return e.err.Error() }
+func (e reportedError) Unwrap() error { return e.err }
+
 // message writes a plain human-facing status line, honoring --quiet. It is the
-// single path for non-payload status text (e.g. "Logged in").
+// single path for non-payload status text (e.g. "Logged in"). With --json the
+// line is the "message" of an {"ok": true} value.
 func message(out io.Writer, g *globals, text string) error {
+	if g.json {
+		return renderValue(out, g, map[string]any{"ok": true, "message": text})
+	}
 	if g.quiet {
 		return nil
 	}
@@ -54,13 +113,12 @@ func message(out io.Writer, g *globals, text string) error {
 
 // confirm writes a conversational, action-indicative status line (prefixed with
 // a check mark) so the caller can see what just happened rather than an
-// API-shaped payload. Honors --quiet.
+// API-shaped payload. Honors --quiet and --json, as message does.
 func confirm(out io.Writer, g *globals, text string) error {
-	if g.quiet {
-		return nil
+	if !g.json {
+		text = "\u2713 " + text
 	}
-	_, err := fmt.Fprintln(out, "\u2713 "+text)
-	return err
+	return message(out, g, text)
 }
 
 // action performs a mutating call and reports it conversationally. With --json
@@ -110,13 +168,30 @@ func action(g *globals, out io.Writer, fn func(*Client) ([]byte, error), msg fun
 	return nil
 }
 
-func printPushedVersion(out io.Writer, g *globals, docID, server string, b []byte) error {
+// printPushedVersion reports a push. When other people edited the document
+// since the base of the push, the server saved their edits and the push
+// together, so the saved version is not the pushed file. fileUpdated says
+// that the file now has the saved version. The caller learns that, or that
+// pull, a command, gets the saved version into another file.
+func printPushedVersion(out io.Writer, g *globals, docID, server string, m map[string]any, fileUpdated bool, pull string) error {
+	note := ""
+	if m["rebased"] == true {
+		m["file_updated"] = fileUpdated
+		note = "Other people edited this document while you worked. Your file now has their edits too."
+		if !fileUpdated {
+			note = fmt.Sprintf("Other people edited this document while you worked, and your file does not have their edits. Run %s, and make your next changes in that file.", pull)
+		}
+	}
+	return printSavedVersion(out, g, docID, server, m, note)
+}
+
+// printSavedVersion reports m, the answer of a write that saves a version
+// of a document: the change is in the document, and the link to it, then
+// note when it is not empty. A write that left the document as it is saved
+// no version.
+func printSavedVersion(out io.Writer, g *globals, docID, server string, m map[string]any, note string) error {
 	if g.quiet {
 		return nil
-	}
-	var m map[string]any
-	if json.Unmarshal(b, &m) != nil {
-		return render(out, g, b)
 	}
 	url := browserURL(server, "/app/d/%s", docID)
 	if g.json {
@@ -131,15 +206,10 @@ func printPushedVersion(out io.Writer, g *globals, docID, server string, b []byt
 		}
 		return render(out, g, nb)
 	}
-	// slashdocs local keeps only the current version, so it has no number.
-	version := fmt.Sprint(value(m, "id"))
-	if num := value(m, "number"); num != nil {
-		version = fmt.Sprint(num) + " (" + version + ")"
+	if m["unchanged"] == true {
+		return message(out, g, "Nothing changed.")
 	}
-	if err := confirm(out, g, fmt.Sprintf("Pushed version %s to %s. Review it at %s", version, docID, url)); err != nil {
-		return err
-	}
-	return printOrgWideViewerNudge(out, g, docID)
+	return confirm(out, g, strings.TrimSpace("Your change is in the document: "+url+"\n"+note))
 }
 
 func humanize(hint string, x any) string {
@@ -181,6 +251,13 @@ func humanize(hint string, x any) string {
 		for _, it := range items {
 			row, _ := it.(map[string]any)
 			lines = append(lines, compactRow(row))
+			// A comment thread shows its replies below it, so that an agent
+			// reads the whole conversation.
+			replies, _ := value(row, "replies").([]any)
+			for _, r := range replies {
+				reply, _ := r.(map[string]any)
+				lines = append(lines, "  reply "+compactRow(reply))
+			}
 		}
 		return strings.Join(lines, "\n")
 	}
@@ -232,7 +309,7 @@ func compactRow(m map[string]any) string {
 			parts = append(parts, fmt.Sprintf("%s=%v", k, v))
 		}
 	}
-	for _, key := range []string{"owner", "principal", "created_by"} {
+	for _, key := range []string{"owner", "principal", "created_by", "author", "approver"} {
 		if p, ok := value(m, key).(map[string]any); ok {
 			if label := principalLabel(p); label != "" {
 				parts = append(parts, key+"="+label)
@@ -245,10 +322,34 @@ func compactRow(m map[string]any) string {
 	if mentions := mentionLabels(value(m, "mentions")); len(mentions) > 0 {
 		parts = append(parts, "mentions="+strings.Join(mentions, ","))
 	}
+	if pin := pinLabel(value(m, "anchor")); pin != "" {
+		parts = append(parts, "pin="+pin)
+	}
 	if len(parts) == 0 {
 		return fmt.Sprintf("%v", m)
 	}
 	return strings.Join(parts, "  ")
+}
+
+// pinLabel names the element of a point comment by its label, or else by its
+// target, or "element", or "page" for a point on the body. It is "" for a
+// text comment. The row shows the start of the element's text as
+// selected_text.
+func pinLabel(anchor any) string {
+	a, _ := anchor.(map[string]any)
+	p, ok := value(a, "point").(map[string]any)
+	if !ok {
+		return ""
+	}
+	for _, key := range []string{"label", "target"} {
+		if s, _ := value(p, key).(string); s != "" {
+			return s
+		}
+	}
+	if path, _ := value(p, "path").(string); path == "" {
+		return "page"
+	}
+	return "element"
 }
 
 // sourceGrantIDs collects explicit grant ids from an effective-access row's

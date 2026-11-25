@@ -225,8 +225,8 @@ func (q *Queries) GetMentionUser(ctx context.Context, id string) (GetMentionUser
 }
 
 const insertComment = `-- name: InsertComment :one
-INSERT INTO comments(id,document_id,created_on_version_id,author_type,author_id,author_email,author_name,body,selected_text,anchor_json,status,root_comment_id)
-VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'open',$1)
+INSERT INTO comments(id,document_id,created_on_version_id,author_type,author_id,author_email,author_name,body,selected_text,anchor_json,status,root_comment_id,anchor_seq)
+VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'open',$1,$11)
 RETURNING created_at
 `
 
@@ -241,6 +241,7 @@ type InsertCommentParams struct {
 	Body               string
 	SelectedText       string
 	AnchorJson         []byte
+	AnchorSeq          pgtype.Int8
 }
 
 func (q *Queries) InsertComment(ctx context.Context, arg InsertCommentParams) (pgtype.Timestamptz, error) {
@@ -255,6 +256,7 @@ func (q *Queries) InsertComment(ctx context.Context, arg InsertCommentParams) (p
 		arg.Body,
 		arg.SelectedText,
 		arg.AnchorJson,
+		arg.AnchorSeq,
 	)
 	var created_at pgtype.Timestamptz
 	err := row.Scan(&created_at)
@@ -331,6 +333,40 @@ func (q *Queries) InsertCommentReply(ctx context.Context, arg InsertCommentReply
 	return created_at, err
 }
 
+const listAnchorsBehind = `-- name: ListAnchorsBehind :many
+SELECT c.id, c.anchor_json, c.anchor_seq::bigint AS anchor_seq
+FROM comments c JOIN documents d ON d.id = c.document_id
+WHERE c.document_id = $1 AND c.anchor_seq < d.seq
+`
+
+type ListAnchorsBehindRow struct {
+	ID         string
+	AnchorJson []byte
+	AnchorSeq  int64
+}
+
+// The text comments of a document whose anchors are on a seq before the
+// live document.
+func (q *Queries) ListAnchorsBehind(ctx context.Context, documentID string) ([]ListAnchorsBehindRow, error) {
+	rows, err := q.db.Query(ctx, listAnchorsBehind, documentID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListAnchorsBehindRow
+	for rows.Next() {
+		var i ListAnchorsBehindRow
+		if err := rows.Scan(&i.ID, &i.AnchorJson, &i.AnchorSeq); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listCommentMentions = `-- name: ListCommentMentions :many
 SELECT
   cm.comment_id,
@@ -397,13 +433,14 @@ func (q *Queries) ListCommentMentions(ctx context.Context, commentIds []string) 
 
 const listComments = `-- name: ListComments :many
 SELECT id,document_id,created_on_version_id,author_type,author_id,author_email,author_name,body,selected_text,anchor_json,status,parent_comment_id,root_comment_id,created_at,resolved_at,edited
-FROM comments WHERE document_id= $1 AND ($2::text='' OR status= $2) AND ($3::text='' OR created_on_version_id= $3) ORDER BY created_at, id
+FROM comments c WHERE c.document_id= $1 AND ($2::text='' OR c.root_comment_id IN (SELECT thread.id FROM comments thread WHERE thread.status= $2)) AND ($3::text='' OR created_on_version_id= $3) AND ($4::text='' OR c.root_comment_id= $4) ORDER BY created_at, id
 `
 
 type ListCommentsParams struct {
 	DocumentID string
 	Status     string
 	VersionID  string
+	ThreadID   string
 }
 
 type ListCommentsRow struct {
@@ -426,7 +463,12 @@ type ListCommentsRow struct {
 }
 
 func (q *Queries) ListComments(ctx context.Context, arg ListCommentsParams) ([]ListCommentsRow, error) {
-	rows, err := q.db.Query(ctx, listComments, arg.DocumentID, arg.Status, arg.VersionID)
+	rows, err := q.db.Query(ctx, listComments,
+		arg.DocumentID,
+		arg.Status,
+		arg.VersionID,
+		arg.ThreadID,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -460,6 +502,46 @@ func (q *Queries) ListComments(ctx context.Context, arg ListCommentsParams) ([]L
 		return nil, err
 	}
 	return items, nil
+}
+
+const moveAnchors = `-- name: MoveAnchors :exec
+UPDATE comments c SET anchor_json = m.anchor_json, selected_text = m.anchor_json->>'quote', anchor_seq = $1::bigint
+FROM (SELECT unnest($2::text[]) AS id, unnest($3::bigint[]) AS was, unnest($4::jsonb[]) AS anchor_json) m
+WHERE c.id = m.id AND c.anchor_seq = m.was
+`
+
+type MoveAnchorsParams struct {
+	Seq     int64
+	Ids     []string
+	Was     []int64
+	Anchors [][]byte
+}
+
+// Moves the anchors of text comments to seq, each one only while it is still
+// on its seq in was.
+func (q *Queries) MoveAnchors(ctx context.Context, arg MoveAnchorsParams) error {
+	_, err := q.db.Exec(ctx, moveAnchors,
+		arg.Seq,
+		arg.Ids,
+		arg.Was,
+		arg.Anchors,
+	)
+	return err
+}
+
+const updateCommentAnchor = `-- name: UpdateCommentAnchor :exec
+UPDATE comments SET anchor_json=$1, selected_text=$2 WHERE id=$3
+`
+
+type UpdateCommentAnchorParams struct {
+	AnchorJson   []byte
+	SelectedText string
+	ID           string
+}
+
+func (q *Queries) UpdateCommentAnchor(ctx context.Context, arg UpdateCommentAnchorParams) error {
+	_, err := q.db.Exec(ctx, updateCommentAnchor, arg.AnchorJson, arg.SelectedText, arg.ID)
+	return err
 }
 
 const updateCommentBody = `-- name: UpdateCommentBody :exec

@@ -1,5 +1,6 @@
 import { Tooltip } from "@/components/ui/tooltip";
 import { Button } from "@/components/ui/button";
+import { keepEscape } from "@/components/ui/dropdown";
 import { useRef, useState, type ReactNode } from "react";
 import * as Menu from "@radix-ui/react-dropdown-menu";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
@@ -32,15 +33,19 @@ const REACTIONS: Record<string, { glyph: string; label: string }> = {
 } satisfies Record<ReactionEmoji, { glyph: string; label: string }>;
 
 const feedback =
-  "transition-[background-color,color,box-shadow,transform] duration-150 ease-out motion-safe:active:scale-[0.96] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-accent)] focus-visible:ring-offset-2 focus-visible:ring-offset-[var(--color-surface)]";
+  "transition-[background-color,color,box-shadow,transform] duration-150 ease-out motion-safe:active:scale-[0.96]";
 
 export function ReactionBar({
   c,
   docId,
+  triggerClassName,
   children,
 }: {
   c: Comment;
   docId: string;
+  // A message with no reactions shows only its Add reaction button, in its
+  // header, so that the first reaction is one click away.
+  triggerClassName?: string;
   children?: ReactNode;
 }) {
   const q = useQueryClient();
@@ -181,6 +186,7 @@ export function ReactionBar({
               className={cn(
                 "inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-sm text-xs text-[var(--color-fg-muted)] hover:bg-[var(--color-surface-muted)] data-[state=open]:bg-[var(--color-accent)]/10 data-[state=open]:text-[var(--color-accent)] aria-disabled:cursor-wait",
                 feedback,
+                triggerClassName,
               )}
             >
               <SmilePlus className="h-4 w-4" aria-hidden="true" />
@@ -193,7 +199,6 @@ export function ReactionBar({
               sideOffset={8}
               collisionPadding={12}
               loop
-              aria-label="Choose a reaction"
               onInteractOutside={() => {
                 interactedOutside.current = true;
               }}
@@ -202,7 +207,8 @@ export function ReactionBar({
                 if (!interactedOutside.current)
                   trigger.current?.focus({ preventScroll: true });
               }}
-              className="comment-reaction-picker z-50 w-[172px] rounded-2xl bg-[var(--color-surface)] p-2 text-[var(--color-fg)] shadow-[0_0_0_1px_var(--color-border),0_4px_8px_rgba(0,0,0,0.06),0_12px_32px_rgba(0,0,0,0.12)] outline-none"
+              className="pop z-50 w-[172px] rounded-2xl bg-[var(--color-surface)] p-2 text-[var(--color-fg)] shadow-[0_0_0_1px_var(--color-border),0_4px_8px_rgba(0,0,0,0.06),0_12px_32px_rgba(0,0,0,0.12)] outline-none"
+              onKeyDown={keepEscape}
               onKeyDownCapture={(event) => {
                 const step = {
                   ArrowRight: 1,
@@ -269,7 +275,7 @@ export function ReactionBar({
         </Menu.Root>
         <div className="ml-auto flex shrink-0 items-center">{children}</div>
       </div>
-      <span role="status" className="sr-only">
+      <span aria-live="polite" className="sr-only">
         {announcement}
       </span>
     </div>

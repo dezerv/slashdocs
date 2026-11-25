@@ -12,7 +12,6 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
-	"slices"
 	"strings"
 	"time"
 
@@ -87,6 +86,8 @@ func newMCPHTTPHandler(deps dependencies) http.Handler {
 		protocol,
 		mcpserver.WithStateLess(true),
 		mcpserver.WithDisableStreaming(true),
+		// mcp-go caps bodies at 4 MiB by default; documents may be up to the HTML limit.
+		mcpserver.WithMaxRequestBodyBytes(maxMCPRequestBytes),
 	)
 	authenticator := auth.MCPAuthenticator{
 		Users:         deps.repository,
@@ -142,7 +143,10 @@ func newMCPHTTPHandler(deps dependencies) http.Handler {
 			return
 		}
 		if !observation.hasObservedRequest() {
-			method, outcome := mcpFallbackRequestLabels(r.Method, requestBody, response.Status())
+			// From 2026-07-28, mcp-go returns JSON-RPC errors with 4xx statuses.
+			jsonRPCError := mcp.IsModernProtocol(r.Header.Get("Mcp-Protocol-Version")) &&
+				strings.HasPrefix(response.Header().Get("Content-Type"), "application/json")
+			method, outcome := mcpFallbackRequestLabels(r.Method, requestBody, response.Status(), jsonRPCError)
 			observation.observeRequest(method, outcome)
 		}
 	})
@@ -161,9 +165,8 @@ func mcpTransportHeaderError(r *http.Request) string {
 	if !acceptsJSON || !acceptsEvents {
 		return "Accept must include application/json and text/event-stream"
 	}
-	if version := r.Header.Get("Mcp-Protocol-Version"); version != "" && !slices.Contains(mcp.ValidProtocolVersions, version) {
-		return "unsupported MCP protocol version"
-	}
+	// mcp-go checks Mcp-Protocol-Version and answers an unknown version with
+	// the supported ones (-32022), so a client can retry with one of them.
 	return ""
 }
 
@@ -197,6 +200,8 @@ type mcpAPIResponse struct {
 	status      int
 	contentType string
 	body        []byte
+	// seq is the seq of version HTML, from its response header.
+	seq string
 }
 
 func (a mcpAPIAdapter) call(
@@ -227,6 +232,7 @@ func (a mcpAPIAdapter) call(
 		status:      recorder.Code,
 		contentType: recorder.Header().Get("Content-Type"),
 		body:        recorder.Body.Bytes(),
+		seq:         recorder.Header().Get("X-Slashdocs-Seq"),
 	}, nil
 }
 
@@ -281,9 +287,16 @@ func (a mcpAPIAdapter) multipartResponse(ctx context.Context, target string, fie
 	return a.call(ctx, http.MethodPost, target, writer.FormDataContentType(), &body, params, handler)
 }
 
+// html returns version HTML as text. A second text names the version and
+// the seq of the HTML, which an update that is made from it must send: the
+// content of an open version changes while people type.
 func (a mcpAPIAdapter) html(ctx context.Context, target string, params gin.Params, handler gin.HandlerFunc) (*mcp.CallToolResult, error) {
 	response, err := a.call(ctx, http.MethodGet, target, "", nil, params, handler)
-	return a.result(response, err, true)
+	result, err := a.result(response, err, true)
+	if err == nil && !result.IsError && response.seq != "" {
+		result.Content = append(result.Content, mcp.NewTextContent(fmt.Sprintf("version_id: %s\nseq: %s\nTo publish a change of this HTML, pass them to update_document as base_version_id and base_seq.", params.ByName("version_id"), response.seq)))
+	}
+	return result, err
 }
 
 func (mcpAPIAdapter) result(response mcpAPIResponse, err error, plainText bool) (*mcp.CallToolResult, error) {
@@ -356,6 +369,7 @@ func mutationOptions(destructive, idempotent bool, options ...mcp.ToolOption) []
 func registerMCPTools(server *mcpserver.MCPServer, api mcpAPIAdapter) {
 	registerMCPGeneralTools(server, api)
 	registerMCPDocumentTools(server, api)
+	registerMCPApprovalTools(server, api)
 	registerMCPFolderTools(server, api)
 	registerMCPServiceAccountTools(server, api)
 }

@@ -113,6 +113,71 @@ func TestDocumentLiveStreamStartsAtLiveEdgeAndAnnouncesComments(t *testing.T) {
 	}
 }
 
+// TestCommentEventsCarryTheThread makes sure that each comment write gives
+// the viewers the thread as it is after the write, so that they do not read
+// the comments again.
+func TestCommentEventsCarryTheThread(t *testing.T) {
+	e := newTestEnv(t)
+	ts := httptest.NewServer(e.h)
+	defer ts.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	reader, _ := openLiveStream(ctx, t, ts, e.doc.ID, "", fixtureViewer)
+	as := func(p auth.Principal) map[string]string {
+		return map[string]string{"Content-Type": "application/json", "X-Test-Principal": principalHeader(p)}
+	}
+	type message struct {
+		ID        string `json:"id"`
+		Body      string `json:"body"`
+		Reactions []struct {
+			Reacted  bool             `json:"reacted"`
+			Reactors []auth.Principal `json:"reactors"`
+		} `json:"reactions"`
+		CurrentPlacement *struct{}  `json:"current_placement"`
+		Replies          *[]message `json:"replies"`
+	}
+	thread := func() (data struct {
+		ID     string   `json:"id"`
+		Thread *message `json:"thread"`
+	}) {
+		t.Helper()
+		got := readLiveEvent(t, reader)
+		if err := json.Unmarshal(got.event.Data, &data); got.name != repo.DocumentEventComments || err != nil {
+			t.Fatalf("event = %#v (%v), want a comments event", got, err)
+		}
+		return data
+	}
+
+	rr := do(t, e.h, http.MethodPost, "/v1/documents/"+e.doc.ID+"/comments",
+		`{"version_id":"`+e.ver.ID+`","body":"live","anchor":{"quote":"fixture"}}`, as(fixtureCommenter))
+	assertStatus(t, rr, http.StatusCreated)
+	var created message
+	if err := json.Unmarshal(rr.Body.Bytes(), &created); err != nil {
+		t.Fatal(err)
+	}
+	if got := thread(); got.ID != created.ID || got.Thread == nil || got.Thread.Body != "live" ||
+		got.Thread.CurrentPlacement == nil || got.Thread.Replies == nil || len(*got.Thread.Replies) != 0 {
+		t.Fatalf("created = %#v, want the new thread with its placement", got)
+	}
+
+	assertStatus(t, do(t, e.h, http.MethodPost, "/v1/documents/"+e.doc.ID+"/comments/"+created.ID+"/replies",
+		`{"body":"reply"}`, as(fixtureEditor)), http.StatusCreated)
+	if got := thread(); got.ID != created.ID || len(*got.Thread.Replies) != 1 || (*got.Thread.Replies)[0].Body != "reply" {
+		t.Fatalf("replied = %#v, want the thread with its reply", got)
+	}
+
+	assertStatus(t, do(t, e.h, http.MethodPut, reactionPath(e.doc.ID, created.ID, "heart"), "", as(fixtureEditor)), http.StatusNoContent)
+	reactions := thread().Thread.Reactions
+	if len(reactions) != 1 || reactions[0].Reacted || len(reactions[0].Reactors) != 1 || reactions[0].Reactors[0].ID != fixtureEditor.ID {
+		t.Fatalf("reactions = %#v, want the editor's heart, with no reader's state", reactions)
+	}
+
+	assertStatus(t, do(t, e.h, http.MethodDelete, "/v1/documents/"+e.doc.ID+"/comments/"+created.ID, "", as(fixtureCommenter)), http.StatusNoContent)
+	if got := thread(); got.ID != created.ID || got.Thread != nil {
+		t.Fatalf("deleted = %#v, want the thread gone", got)
+	}
+}
+
 func TestDocumentPresenceSnapshotLiveUpdatesAndLeave(t *testing.T) {
 	e := newTestEnv(t)
 	ts := httptest.NewServer(e.h)
@@ -186,7 +251,7 @@ func TestDocumentCursorRelaysToOpenStreams(t *testing.T) {
 	defer cancel()
 	reader, _ := openLiveStream(ctx, t, ts, e.doc.ID, "?session=viewer-session", fixtureViewer)
 
-	body := `{"session":"editor-session","version":"` + e.ver.ID + `","points":[{"t":5,"path":"0.2","x":0.25,"y":1},{"t":21,"hidden":true}]}`
+	body := `{"session":"editor-session","version":"` + e.ver.ID + `","points":[{"t":5,"path":"0.2","x":0.25,"y":1,"z":2.5,"v":{"path":"0.1","x":-1.5,"y":0.5,"z":2.5},"m":"Look here 👀"},{"t":21,"e":"0.3","c":0,"hidden":true},{"t":22,"e":"0.3","c":1000000,"a":0}]}`
 	assertStatus(t, do(t, e.h, http.MethodPost, "/v1/documents/"+e.doc.ID+"/cursor", body, map[string]string{
 		"Content-Type":     "application/json",
 		"X-Test-Principal": principalHeader(fixtureEditor),
@@ -196,7 +261,7 @@ func TestDocumentCursorRelaysToOpenStreams(t *testing.T) {
 	if got.name != repo.DocumentEventCursor || got.id != "" || got.event.UpdatedBy.ID != fixtureEditor.ID {
 		t.Fatalf("event = %#v, want a cursor event without an id from the editor", got)
 	}
-	want := `{"session":"editor-session","version":"` + e.ver.ID + `","points":[{"t":5,"path":"0.2","x":0.25,"y":1},{"t":21,"path":"","x":0,"y":0,"hidden":true}]}`
+	want := `{"session":"editor-session","version":"` + e.ver.ID + `","points":[{"t":5,"path":"0.2","x":0.25,"y":1,"z":2.5,"v":{"path":"0.1","x":-1.5,"y":0.5,"z":2.5},"m":"Look here 👀"},{"t":21,"path":"","x":0,"y":0,"e":"0.3","c":0,"hidden":true},{"t":22,"path":"","x":0,"y":0,"e":"0.3","c":1000000,"a":0}]}`
 	if string(got.event.Data) != want {
 		t.Fatalf("cursor data = %s, want %s", got.event.Data, want)
 	}
@@ -218,6 +283,20 @@ func TestDocumentCursorRejectsInvalidInput(t *testing.T) {
 		{"bad path", fixtureViewer, point(`{"t":1,"path":"0..1"}`), http.StatusBadRequest},
 		{"deep path", fixtureViewer, point(`{"t":1,"path":"0` + strings.Repeat(".0", 64) + `"}`), http.StatusBadRequest},
 		{"negative time", fixtureViewer, point(`{"t":-1}`), http.StatusBadRequest},
+		{"negative zoom", fixtureViewer, point(`{"t":1,"z":-1}`), http.StatusBadRequest},
+		{"too much zoom", fixtureViewer, point(`{"t":1,"z":101}`), http.StatusBadRequest},
+		{"view too far outside the element", fixtureViewer, point(`{"t":1,"v":{"path":"0","x":1001,"y":0}}`), http.StatusBadRequest},
+		{"long message", fixtureViewer, point(`{"t":1,"m":"` + strings.Repeat("a", 101) + `"}`), http.StatusBadRequest},
+		{"message with a control character", fixtureViewer, point(`{"t":1,"m":"hi\u0007"}`), http.StatusBadRequest},
+		{"view with a bad path", fixtureViewer, point(`{"t":1,"v":{"path":"0..1","x":0,"y":0}}`), http.StatusBadRequest},
+		{"edited block with a bad path", fixtureViewer, point(`{"t":1,"e":"0..1"}`), http.StatusBadRequest},
+		{"caret before the block", fixtureViewer, point(`{"t":1,"e":"0","c":-1}`), http.StatusBadRequest},
+		{"caret too far into the block", fixtureViewer, point(`{"t":1,"e":"0","c":1000001}`), http.StatusBadRequest},
+		{"caret between characters", fixtureViewer, point(`{"t":1,"e":"0","c":1.5}`), http.StatusBadRequest},
+		{"selection with no caret", fixtureViewer, point(`{"t":1,"e":"0","a":1}`), http.StatusBadRequest},
+		{"selection from before the block", fixtureViewer, point(`{"t":1,"e":"0","c":1,"a":-1}`), http.StatusBadRequest},
+		{"selection from too far into the block", fixtureViewer, point(`{"t":1,"e":"0","c":1,"a":1000001}`), http.StatusBadRequest},
+		{"selection from between characters", fixtureViewer, point(`{"t":1,"e":"0","c":1,"a":1.5}`), http.StatusBadRequest},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			rr := do(t, e.h, http.MethodPost, "/v1/documents/"+e.doc.ID+"/cursor", tc.body, map[string]string{
@@ -226,5 +305,134 @@ func TestDocumentCursorRejectsInvalidInput(t *testing.T) {
 			})
 			assertStatus(t, rr, tc.want)
 		})
+	}
+}
+
+// Every change to the approvers or their decisions tells open viewers, so
+// that the owner sees a decision as soon as the approver makes it.
+func TestApprovalChangesAnnounceApprovals(t *testing.T) {
+	e := newTestEnv(t)
+	ts := httptest.NewServer(e.h)
+	defer ts.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	reader, _ := openLiveStream(ctx, t, ts, e.doc.ID, "", fixtureOwner)
+	next := func(by auth.Principal) {
+		t.Helper()
+		got := readLiveEvent(t, reader)
+		if got.name != repo.DocumentEventApprovals || got.event.UpdatedBy.ID != by.ID {
+			t.Fatalf("event = %#v, want an approvals event by %s", got, by.ID)
+		}
+	}
+
+	request := mustAssignApprover(t, e, e.doc.ID, "viewer@example.com", fixtureOwner)
+	next(fixtureOwner)
+	rr := submitApproval(t, e, e.doc.ID, e.ver.ID, "approved", fixtureViewer)
+	assertStatus(t, rr, http.StatusCreated)
+	next(fixtureViewer)
+	assertStatus(t, do(t, e.h, http.MethodDelete, "/v1/documents/"+e.doc.ID+"/approvals/"+jsonField(t, rr.Body.Bytes(), "id"), "", map[string]string{
+		"X-Test-Principal": principalHeader(fixtureViewer),
+	}), http.StatusNoContent)
+	next(fixtureViewer)
+	assertStatus(t, do(t, e.h, http.MethodDelete, "/v1/documents/"+e.doc.ID+"/approvers/"+request, "", map[string]string{
+		"X-Test-Principal": principalHeader(fixtureOwner),
+	}), http.StatusNoContent)
+	next(fixtureOwner)
+}
+
+// A grant on a folder gives access to the documents below it. When that
+// access goes, the streams of those documents end at once, and not at the
+// next keep-alive.
+func TestAccessThatGoesEndsTheStreamsBelowIt(t *testing.T) {
+	type ids struct{ top, below, other, grant, doc string }
+	for _, tc := range []struct {
+		name    string
+		request func(ids) (method, path, body string)
+	}{
+		{"the folder grant goes", func(i ids) (string, string, string) {
+			return http.MethodDelete, "/v1/folders/" + i.top + "/grants/" + i.grant, ""
+		}},
+		{"the folder goes", func(i ids) (string, string, string) { return http.MethodDelete, "/v1/folders/" + i.top, "" }},
+		{"the folder of the document moves", func(i ids) (string, string, string) {
+			return http.MethodPatch, "/v1/folders/" + i.below, `{"parent_folder_id":null}`
+		}},
+		{"the document moves to another folder", func(i ids) (string, string, string) {
+			return http.MethodPost, "/v1/folders/" + i.other + "/documents", `{"document_id":"` + i.doc + `"}`
+		}},
+		{"the document moves to the root", func(i ids) (string, string, string) {
+			return http.MethodDelete, "/v1/folders/" + i.below + "/documents/" + i.doc, ""
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newTestEnv(t)
+			ctx := context.Background()
+			folder := func(title, parent string) string {
+				t.Helper()
+				f, err := e.store.CreateFolder(ctx, fixtureOwner, title, parent)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return f.ID
+			}
+			i := ids{top: folder("Top", ""), other: folder("Other", ""), doc: e.doc.ID}
+			i.below = folder("Below", i.top)
+			if _, err := e.store.MoveDocumentToFolder(ctx, fixtureOwner, i.below, e.doc.ID); err != nil {
+				t.Fatal(err)
+			}
+			grant, err := e.store.CreateGrant(ctx, "folder", i.top, fixtureStranger, repo.RoleViewer, fixtureOwner)
+			if err != nil {
+				t.Fatal(err)
+			}
+			i.grant = grant.ID
+			ts := httptest.NewServer(e.h)
+			defer ts.Close()
+			streamCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			defer cancel()
+			reader, _ := openLiveStream(streamCtx, t, ts, e.doc.ID, "", fixtureStranger)
+
+			method, path, body := tc.request(i)
+			rr := do(t, e.h, method, path, body, map[string]string{"Content-Type": "application/json", "X-Test-Principal": principalHeader(fixtureOwner)})
+			if rr.Code >= 300 {
+				t.Fatalf("status = %d; body=%s", rr.Code, rr.Body)
+			}
+			for {
+				if _, err := reader.ReadString('\n'); err != nil {
+					if streamCtx.Err() != nil {
+						t.Fatal("the stream did not end when the access went")
+					}
+					return
+				}
+			}
+		})
+	}
+}
+
+// TestMovedAnchorsReachTheViewers makes sure that a thread whose text moves
+// with typing reaches the viewers, also when a read of the comments moves it
+// before the follow after the operation does.
+func TestMovedAnchorsReachTheViewers(t *testing.T) {
+	e := newTestEnv(t)
+	d, err := e.store.GetDocument(context.Background(), e.doc.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := `{"version_id":"` + e.ver.ID + `","body":"note","anchor":{"quote":"fixture","dom_path":"body","start_offset":0,"end_offset":7}}`
+	assertStatus(t, do(t, e.h, http.MethodPost, "/v1/documents/"+e.doc.ID+"/comments", body, map[string]string{
+		"Content-Type": "application/json", "X-Test-Principal": principalHeader(fixtureCommenter),
+	}), http.StatusCreated)
+	ts := httptest.NewServer(e.h)
+	defer ts.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	reader, _ := openLiveStream(ctx, t, ts, e.doc.ID, "", fixtureViewer)
+
+	html := "<html><body>fixture</body></html>"
+	typeOp(t, e, e.doc.ID, fixtureEditor, d.Seq, "op_grow", replaceAt(html, "xtu", "xXXtu", 0))
+	listComments(t, e, "")
+	for {
+		got := readLiveEvent(t, reader)
+		if got.name == repo.DocumentEventComments && strings.Contains(string(got.event.Data), `"selected_text":"fixXXture"`) {
+			return
+		}
 	}
 }

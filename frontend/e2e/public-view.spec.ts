@@ -1,25 +1,7 @@
-import { type Browser, type Page } from "@playwright/test";
-import {
-  APP_ORIGIN,
-  continueWithDex,
-  expect,
-  installAppStorage,
-  test,
-  uniqueName,
-} from "./fixtures";
+import { continueWithDex, expect, signedOutPage, test, uniqueName } from "./fixtures";
 
 // A public deployment lets a signed-out reader read a document that is shared
 // with anyone. Commenting or editing sends the reader to sign in first.
-
-async function signedOutPage(browser: Browser): Promise<Page> {
-  const context = await browser.newContext({
-    baseURL: APP_ORIGIN,
-    storageState: { cookies: [], origins: [] },
-  });
-  const page = await context.newPage();
-  await installAppStorage(page);
-  return page;
-}
 
 function documentHTML(title: string) {
   return `<!doctype html><html><head><meta charset="utf-8"><title>${title}</title></head>
@@ -42,6 +24,7 @@ test("a signed-out reader reads a shared document and signs in to comment", asyn
     .frameLocator('iframe[title="Rendered document"]')
     .frameLocator("iframe#slashdocs-doc");
   await expect(rendered.getByRole("heading", { name: title })).toBeVisible();
+  await page.getByRole("button", { name: "Comments", exact: true }).click();
   await expect(
     page.getByRole("heading", { name: "Comments", exact: true }),
   ).toBeVisible();
@@ -49,10 +32,14 @@ test("a signed-out reader reads a shared document and signs in to comment", asyn
 
   await rendered.locator("p").selectText();
   await rendered.getByRole("button", { name: "Comment on selected text" }).click();
-  await expect(page).toHaveURL(`/login?next=${encodeURIComponent(path)}`);
+  await expect(page).toHaveURL(
+    `/login?next=${encodeURIComponent(`${path}?intent=comment`)}`,
+  );
 
+  // After sign-in, the composer opens on the text that the reader selected.
   await continueWithDex(page);
   await expect(page).toHaveURL(path);
+  await expect(page.getByPlaceholder("Add a comment…")).toBeFocused();
   await expect(page.getByRole("button", { name: "Sign in" })).toHaveCount(0);
   await expect(page.getByRole("button", { name: "Share" })).toBeVisible();
   await page.context().close();

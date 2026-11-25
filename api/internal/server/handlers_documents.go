@@ -4,8 +4,10 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
 
@@ -16,9 +18,11 @@ import (
 
 // createDocumentResponse is the payload of POST /v1/documents.
 type createDocumentResponse struct {
-	ID               string        `json:"id"`
-	CurrentVersionID string        `json:"current_version_id"`
-	DefaultGrant     *defaultGrant `json:"default_grant,omitempty"`
+	ID                string             `json:"id"`
+	CurrentVersionID  string             `json:"current_version_id"`
+	FolderID          string             `json:"folder_id,omitempty"`
+	PermissionWarning *permissionWarning `json:"permission_warning,omitempty"`
+	DefaultGrant      *defaultGrant      `json:"default_grant,omitempty"`
 }
 
 // defaultGrant reports the server-applied default "anyone" grant so clients
@@ -42,6 +46,7 @@ type defaultGrantPrincipal struct {
 // @Produce json
 // @Param title formData string true "Document title"
 // @Param file formData file true "Single-file HTML"
+// @Param folder_id formData string false "The folder for the document. The caller needs editor on it. The default is the root."
 // @Param default_permission formData string false "Default sharing applied at create: viewer, commenter, editor or private. Overrides the server-wide default."
 // @Success 201 {object} createDocumentResponse
 // @Router /v1/documents [post]
@@ -54,6 +59,10 @@ func (h handlers) createDocument(c *gin.Context) {
 	}
 	if err != nil {
 		badRequest(c, "invalid document upload")
+		return
+	}
+	if !utf8.Valid(html) {
+		badRequest(c, errHTMLNotUTF8)
 		return
 	}
 	title := c.PostForm("title")
@@ -73,14 +82,14 @@ func (h handlers) createDocument(c *gin.Context) {
 		badRequest(c, "invalid document upload")
 		return
 	}
+	folderID := c.PostForm("folder_id")
+	if folderID != "" && !h.needFolderRole(c, folderID, repo.RoleEditor) {
+		return
+	}
 	observeHTML("document_create", len(html))
-	d, _, err := h.deps.repository.CreateDocument(c.Request.Context(), *p, title, html)
+	d, _, err := h.deps.repository.CreateDocument(c.Request.Context(), *p, title, folderID, html)
 	if err != nil {
-		if errors.Is(err, blob.ErrStorage) {
-			c.JSON(http.StatusBadGateway, errorResponse("blob_storage_failed", "could not upload HTML to blob storage", nil))
-			return
-		}
-		internalErr(c, err)
+		createDocumentErr(c, err)
 		return
 	}
 	incDocument("created", actorType(c))
@@ -100,7 +109,57 @@ func (h handlers) createDocument(c *gin.Context) {
 		incGrant("created", string(g.Role), string(g.Principal.Type), actorType(c))
 		granted = &defaultGrant{GrantID: g.ID, Principal: defaultGrantPrincipal{Type: auth.PrincipalAnyone}, Role: g.Role}
 	}
-	c.JSON(http.StatusCreated, createDocumentResponse{ID: d.ID, CurrentVersionID: d.CurrentVersionID, DefaultGrant: granted})
+	c.JSON(http.StatusCreated, createDocumentResponse{
+		ID:                d.ID,
+		CurrentVersionID:  d.CurrentVersionID,
+		FolderID:          folderID,
+		PermissionWarning: h.folderDocumentWarning(c, folderID, d.Owner),
+		DefaultGrant:      granted,
+	})
+}
+
+func createDocumentErr(c *gin.Context, err error) {
+	switch {
+	case errors.Is(err, blob.ErrStorage):
+		c.JSON(http.StatusBadGateway, errorResponse("blob_storage_failed", "could not upload HTML to blob storage", nil))
+	case errors.Is(err, repo.ErrNotFound): // The folder was deleted after the role check.
+		notFound(c)
+	default:
+		internalErr(c, err)
+	}
+}
+
+// documentListResponse is the payload of GET /v1/documents.
+type documentListResponse struct {
+	Items []repo.Document `json:"items"`
+	// HasMore reports that more documents follow this page.
+	HasMore bool `json:"has_more"`
+}
+
+const (
+	defaultDocumentPageSize = 25
+	maxDocumentPageSize     = 100
+)
+
+// documentPage reads the limit and offset query parameters. A limit above the
+// maximum gets the maximum, and has_more tells the client to ask again.
+func documentPage(c *gin.Context) (repo.Page, error) {
+	page := repo.Page{Limit: defaultDocumentPageSize}
+	if raw := c.Query("limit"); raw != "" {
+		limit, err := strconv.ParseInt(raw, 10, 32)
+		if err != nil || limit < 1 {
+			return page, errors.New("limit must be a positive integer")
+		}
+		page.Limit = int32(min(limit, maxDocumentPageSize))
+	}
+	if raw := c.Query("offset"); raw != "" {
+		offset, err := strconv.ParseInt(raw, 10, 32)
+		if err != nil || offset < 0 {
+			return page, errors.New("offset must be zero or a positive integer")
+		}
+		page.Offset = int32(offset)
+	}
+	return page, nil
 }
 
 // ListDocuments godoc
@@ -109,10 +168,12 @@ func (h handlers) createDocument(c *gin.Context) {
 // @Security bearerAuth
 // @Security cookieAuth
 // @Produce json
-// @Param q query string false "Slack-style search of titles and text: words, \"phrases\", -word, from:, in:, label:, before:, after:, on:, and during:"
+// @Param q query string false "Slack-style search of titles and text: words, \"phrases\", -word, title:, from:, in:, label:, before:, after:, on:, and during:"
 // @Param tz query string false "IANA time zone for date modifiers; defaults to UTC"
 // @Param label query string false "Deprecated exact label filter; use q=label:<label>"
-// @Success 200 {object} listResponse[repo.Document]
+// @Param limit query int false "Page size: 25 by default, 100 at most"
+// @Param offset query int false "The number of documents to skip"
+// @Success 200 {object} documentListResponse
 // @Router /v1/documents [get]
 func (h handlers) listDocuments(c *gin.Context) {
 	if !requireResolvedGroupsForAggregate(c) {
@@ -125,6 +186,11 @@ func (h handlers) listDocuments(c *gin.Context) {
 		return
 	}
 	search, err := parseDocumentSearch(q, *current(c), time.Now().In(zone))
+	if err != nil {
+		badRequest(c, err.Error())
+		return
+	}
+	page, err := documentPage(c)
 	if err != nil {
 		badRequest(c, err.Error())
 		return
@@ -143,25 +209,45 @@ func (h handlers) listDocuments(c *gin.Context) {
 	}
 	if q != "" || len(search.Labels) > 0 {
 		includeOrgWide := h.deps.deployment == DeploymentOrg
-		items, err := h.deps.repository.SearchDocuments(c.Request.Context(), *current(c), search, includeOrgWide, 25)
+		items, more, err := h.deps.repository.SearchDocuments(c.Request.Context(), *current(c), search, includeOrgWide, page)
 		if err != nil {
 			internalErr(c, err)
 			return
 		}
-		c.JSON(http.StatusOK, listResponse[repo.Document]{Items: items})
+		h.hideUnseenParentFolders(c, items)
+		// Search hits are the same documents as the plain listing, so they
+		// carry the same approval status rather than losing it mid-query.
+		h.annotateApprovalSummaries(c, items)
+		c.JSON(http.StatusOK, documentListResponse{Items: items, HasMore: more})
 		return
 	}
-	items, err := h.deps.repository.ListDocuments(c.Request.Context(), *current(c))
+	items, more, err := h.deps.repository.ListDocuments(c.Request.Context(), *current(c), page, h.deps.labelsEnabled)
 	if err != nil {
 		internalErr(c, err)
 		return
 	}
-	if h.deps.labelsEnabled {
-		for i := range items {
-			items[i].Labels, _ = h.deps.repository.ListDocumentLabels(c.Request.Context(), items[i].ID)
+	h.annotateApprovalSummaries(c, items)
+	c.JSON(http.StatusOK, documentListResponse{Items: items, HasMore: more})
+}
+
+// hideUnseenParentFolders removes the parent folder of a search result when
+// the caller cannot view that folder, as getDocument does. A failed lookup
+// also removes it, because the folder is decorative.
+func (h handlers) hideUnseenParentFolders(c *gin.Context, docs []repo.Document) {
+	seen := map[string]bool{}
+	for i, d := range docs {
+		if d.ParentFolder == nil {
+			continue
+		}
+		id := d.ParentFolder.ID
+		if _, ok := seen[id]; !ok {
+			role, err := h.deps.repository.RoleForFolder(c.Request.Context(), *current(c), id)
+			seen[id] = err == nil && atLeast(role, repo.RoleViewer)
+		}
+		if !seen[id] {
+			docs[i].ParentFolder = nil
 		}
 	}
-	c.JSON(http.StatusOK, listResponse[repo.Document]{Items: items})
 }
 
 // GetDocument godoc
@@ -196,6 +282,9 @@ func (h handlers) getDocument(c *gin.Context) {
 	if p.Type != auth.PrincipalAnonymous && (p.Type != d.Owner.Type || p.ID != d.Owner.ID) {
 		_ = h.deps.repository.RecordDocumentOpened(c.Request.Context(), d.ID, *p)
 	}
+	// The document view offers Move only to those who can move the document.
+	// A failed lookup offers no Move, and the move itself checks again.
+	d.CanMove, _ = h.canMoveDoc(c, d, role)
 	// Show parent folder in breadcrumb only if viewer has access to it. The
 	// breadcrumb is decorative, so a failed role lookup omits it rather than
 	// failing the whole request.
@@ -210,7 +299,9 @@ func (h handlers) getDocument(c *gin.Context) {
 	if h.deps.labelsEnabled {
 		d.Labels, _ = h.deps.repository.ListDocumentLabels(c.Request.Context(), d.ID)
 	}
-	c.JSON(http.StatusOK, d)
+	docs := []repo.Document{d}
+	h.annotateApprovalSummaries(c, docs)
+	c.JSON(http.StatusOK, docs[0])
 }
 
 // PatchDocument godoc

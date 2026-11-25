@@ -2,10 +2,14 @@ package server_test
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/razorpay/slashdocs/api/internal/repo"
 )
 
 func assertRFC3339Timestamp(t *testing.T, value string) {
@@ -229,6 +233,32 @@ func TestPatchCommentRejectsWrongDocument(t *testing.T) {
 	assertStatus(t, rr, http.StatusNotFound)
 }
 
+// An edit names the body that it started from. A client that did not see a
+// newer body gets 409 and does not replace it. A patch without base_body, as
+// from the CLI or MCP, still applies.
+func TestPatchCommentRefusesAStaleEdit(t *testing.T) {
+	e := newTestEnv(t)
+	path := "/v1/documents/" + e.doc.ID + "/comments/" + e.cmt.ID
+	headers := map[string]string{"Content-Type": "application/json", "X-Test-Principal": principalHeader(fixtureCommenter)}
+
+	rr := do(t, e.h, http.MethodPatch, path, `{"body":"from tab A","base_body":"original"}`, headers)
+	assertStatus(t, rr, http.StatusOK)
+	rr = do(t, e.h, http.MethodPatch, path, `{"body":"from tab B","base_body":"original"}`, headers)
+	assertStatus(t, rr, http.StatusConflict)
+	if !strings.Contains(rr.Body.String(), `"comment_changed"`) {
+		t.Fatalf("body = %s, want the comment_changed code", rr.Body.String())
+	}
+	got, err := e.store.GetComment(context.Background(), e.cmt.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Body != "from tab A" {
+		t.Fatalf("body = %q, want the newer edit to stay", got.Body)
+	}
+	rr = do(t, e.h, http.MethodPatch, path, `{"body":"from the CLI"}`, headers)
+	assertStatus(t, rr, http.StatusOK)
+}
+
 func TestPatchCommentRejectsInvalidStatus(t *testing.T) {
 	e := newTestEnv(t)
 	rr := do(t, e.h, http.MethodPatch, "/v1/documents/"+e.doc.ID+"/comments/"+e.cmt.ID, `{"status":"closed"}`, map[string]string{
@@ -237,4 +267,58 @@ func TestPatchCommentRejectsInvalidStatus(t *testing.T) {
 	})
 
 	assertStatus(t, rr, http.StatusBadRequest)
+}
+
+// The fixture comment is an open thread. The test adds a resolved thread
+// whose reply is still stored as open: replies travel with their thread.
+func TestListCommentsFiltersThreadsByStatus(t *testing.T) {
+	e := newTestEnv(t)
+	ctx := context.Background()
+	resolved, err := e.store.CreateComment(ctx, e.doc.ID, e.ver.ID, "resolved", repo.Anchor{Quote: "fixture"}, 0, fixtureCommenter, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reply, err := e.store.CreateCommentReply(ctx, e.doc.ID, resolved.ID, "still talking", fixtureCommenter, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.store.UpdateComment(ctx, resolved.ID, repo.CommentUpdate{Status: "resolved"}); err != nil {
+		t.Fatal(err)
+	}
+	openThread := e.cmt.ID + "[]"
+	resolvedThread := resolved.ID + "[" + reply.ID + "]"
+	for _, tc := range []struct{ status, want string }{
+		{"", openThread + " " + resolvedThread},
+		{"all", openThread + " " + resolvedThread},
+		{"open", openThread},
+		{"resolved", resolvedThread},
+	} {
+		rr := do(t, e.h, http.MethodGet, "/v1/documents/"+e.doc.ID+"/comments?status="+tc.status, "", map[string]string{"X-Test-Principal": principalHeader(fixtureCommenter)})
+		assertStatus(t, rr, http.StatusOK)
+		var list struct {
+			Items []commentWire `json:"items"`
+		}
+		if err := json.Unmarshal(rr.Body.Bytes(), &list); err != nil {
+			t.Fatal(err)
+		}
+		threads := make([]string, 0, len(list.Items))
+		for _, item := range list.Items {
+			replies := make([]string, 0, len(item.Replies))
+			for _, r := range item.Replies {
+				replies = append(replies, r.ID)
+			}
+			threads = append(threads, item.ID+"["+strings.Join(replies, ",")+"]")
+		}
+		if got := strings.Join(threads, " "); got != tc.want {
+			t.Errorf("status=%q: got %s, want %s", tc.status, got, tc.want)
+		}
+	}
+}
+
+func TestListCommentsRejectsUnknownStatus(t *testing.T) {
+	e := newTestEnv(t)
+	for _, status := range []string{"stale", "orphaned", "OPEN"} {
+		rr := do(t, e.h, http.MethodGet, "/v1/documents/"+e.doc.ID+"/comments?status="+status, "", map[string]string{"X-Test-Principal": principalHeader(fixtureCommenter)})
+		assertStatus(t, rr, http.StatusBadRequest)
+	}
 }

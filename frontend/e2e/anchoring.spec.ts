@@ -1,10 +1,13 @@
-import { type FrameLocator, type Page } from "@playwright/test";
-import { expect, test, uniqueName } from "./fixtures";
+import { type Page } from "@playwright/test";
+import { expect, renderedDocument, startEditing, test, uniqueName } from "./fixtures";
 
-function renderedDocument(page: Page): FrameLocator {
+// listedThread finds a thread in the comments list, which the bar opens.
+async function listedThread(page: Page, body: string) {
+  await page.getByRole("button", { name: "Comments", exact: true }).click();
   return page
-    .frameLocator('iframe[title="Rendered document"]')
-    .frameLocator("iframe#slashdocs-doc");
+    .getByRole("dialog", { name: "Comments" })
+    .getByRole("listitem")
+    .filter({ hasText: body });
 }
 
 function documentHTML(heading: string, body: string) {
@@ -117,7 +120,7 @@ test("copies a text link without opening a comment and reveals the selected occu
   await expect(copy).toBeVisible();
   await expect(
     doc.getByRole("button", { name: "Comment on selected text" }),
-  ).toHaveText("");
+  ).toContainText("Comment");
   await expect(page.getByPlaceholder("Add a comment…")).toBeHidden();
   await copy.click();
   await expect(page.getByText("Link to text copied.", { exact: true })).toBeVisible();
@@ -164,13 +167,9 @@ test("re-anchors a comment on content rendered by script after load", async ({
     .filter({ hasText: "Late content appears after load." });
   await expect(mark.first()).toBeVisible({ timeout: 20_000 });
 
-  const card = page
-    .getByRole("button")
-    .filter({ hasText: "Anchor survives late rendering." });
-  await expect(card).toBeVisible();
-  await expect(
-    card.getByText("Highlight not currently visible", { exact: true }),
-  ).not.toBeVisible();
+  const item = await listedThread(page, "Anchor survives late rendering.");
+  await expect(item).toBeVisible();
+  await expect(item.getByText("Not found in this version")).toHaveCount(0);
 });
 
 test("flags a comment whose text vanished from the new version", async ({
@@ -206,16 +205,18 @@ test("flags a comment whose text vanished from the new version", async ({
 
   await expect(renderedDocument(page).locator("#replacement")).toBeVisible();
 
-  const card = page
-    .getByRole("button")
-    .filter({ hasText: "This anchor is about to be orphaned." });
-  await expect(card).toBeVisible();
-  await expect(
-    card.getByText("Highlight not currently visible", { exact: true }),
-  ).toBeVisible({
+  const item = await listedThread(page, "This anchor is about to be orphaned.");
+  await expect(item.getByText("Not found in this version")).toBeVisible({
     timeout: 20_000,
   });
   await expect(renderedDocument(page).locator("mark.slashdocs-mark")).toHaveCount(0);
+  // Its thread still opens, at the top right of the document.
+  await item.click();
+  await expect(
+    page
+      .getByRole("dialog", { name: "Comment thread" })
+      .getByText("This anchor is about to be orphaned."),
+  ).toBeVisible();
 });
 
 test("text links wait for a custom panel to be revealed", async ({
@@ -248,7 +249,12 @@ test("comments on a selection with C and lists every shortcut with ?", async ({
     title,
     documentHTML(title, "<p>Keys beat clicks.</p>"),
   );
-  await page.goto(`/app/d/${document.id}`);
+  // An earlier version from the history does not change, so C comments.
+  await slashdocs.pushVersion(
+    document.id,
+    documentHTML(title, "<p>Keys beat clicks, again.</p>"),
+  );
+  await page.goto(`/app/d/${document.id}?version=${document.current_version_id}`);
   const doc = renderedDocument(page);
   // A mouse selection focuses the document. selectText alone does not.
   await doc.locator("p").click();
@@ -257,13 +263,27 @@ test("comments on a selection with C and lists every shortcut with ?", async ({
   const composer = page.getByPlaceholder("Add a comment…");
   await expect(composer).toBeFocused();
   await expect(composer).toHaveValue("");
-  await page.getByRole("button", { name: "Cancel comment" }).click();
+  await page.getByRole("button", { name: "Discard comment" }).click();
 
-  await doc.locator("h1").click();
+  // The owner edits the current document in Edit mode, so in its text C
+  // types and Ctrl or Cmd with Alt and M comments.
+  await page.goto(`/app/d/${document.id}`);
+  await startEditing(page);
+  await doc.locator("p").click();
+  await doc.locator("p").selectText();
+  await page.keyboard.press("ControlOrMeta+Alt+m");
+  await expect(composer).toBeFocused();
+  await page.getByRole("button", { name: "Discard comment" }).click();
+  await expect(doc.locator("p")).toHaveText("Keys beat clicks, again.");
+
+  // Esc leaves Edit mode, so ? lists every shortcut and types nothing.
+  await doc.locator("p").click();
+  await page.keyboard.press("Escape");
   await page.keyboard.press("?");
   const dialog = page.getByRole("dialog", { name: "Keyboard shortcuts" });
   await expect(dialog.getByText("Comment on the selected text")).toBeVisible();
   await expect(dialog.getByText("Full screen")).toBeVisible();
+  await expect(doc.locator("p")).toHaveText("Keys beat clicks, again.");
 });
 
 test("holding j scrolls faster than tapping it and stops on release", async ({
@@ -278,7 +298,12 @@ test("holding j scrolls faster than tapping it and stops on release", async ({
   await page.goto(`/app/d/${document.id}`);
   const doc = renderedDocument(page);
   const scrollY = () => doc.locator("html").evaluate(() => window.scrollY);
-  await doc.locator("p").click();
+  await expect(doc.locator("p")).toBeVisible();
+  // The owner edits the document, so in its text j types. Outside it, j
+  // scrolls.
+  await page.evaluate(() =>
+    (window.document.activeElement as HTMLElement | null)?.blur(),
+  );
 
   // A key repeats about every 33 ms while it is held.
   await page.keyboard.down("j");
@@ -287,26 +312,64 @@ test("holding j scrolls faster than tapping it and stops on release", async ({
     await page.keyboard.down("j");
   }
   await page.keyboard.up("j");
+  // The key up reaches the document a frame or so later, through the frames
+  // between.
+  await page.waitForTimeout(100);
   const held = await scrollY();
   expect(held).toBeGreaterThan(1000);
   await page.waitForTimeout(300);
   expect(await scrollY()).toBe(held);
 });
 
-test("a comment started with the comments hidden hides them again when it posts", async ({
+test("a posted comment opens beside its text, and Esc closes it", async ({
   page,
   slashdocs,
 }) => {
-  const title = uniqueName("Peek");
+  const title = uniqueName("Popover");
   const document = await slashdocs.createDocument(
     title,
-    documentHTML(title, "<p>Comment on me while the rail is hidden.</p>"),
+    documentHTML(title, "<p>Comment on me in a popover.</p>"),
   );
   await page.goto(`/app/d/${document.id}`);
-  await page.getByRole("button", { name: "Hide comments" }).click();
-  await renderedDocument(page).locator("p").selectText();
-  await postComment(page, document.id, "Posted while hidden");
-  await expect(page.getByRole("button", { name: "Show comments" })).toBeVisible();
-  await page.reload();
-  await expect(page.getByRole("button", { name: "Show comments" })).toBeVisible();
+  const doc = renderedDocument(page);
+  await doc.locator("p").selectText();
+  await postComment(page, document.id, "Posted in a popover");
+  const thread = page.getByRole("dialog", { name: "Comment thread" });
+  await expect(thread.getByText("Posted in a popover")).toBeVisible();
+  // There is no side panel: the thread floats next to its highlight.
+  const mark = await doc.locator("mark.slashdocs-mark").first().boundingBox();
+  const box = await thread.boundingBox();
+  expect(box && mark && Math.abs(box.y - mark.y)).toBeLessThan(40);
+
+  await thread.press("Escape");
+  await expect(thread).toBeHidden();
+  // The owner edits the text: one click opens the thread, and leaves the
+  // caret in the text.
+  await doc.locator("mark.slashdocs-mark").first().click();
+  await expect(thread.getByText("Posted in a popover")).toBeVisible();
+});
+
+test("Edit in the thread menu opens the message in a field to type in", async ({
+  page,
+  slashdocs,
+}) => {
+  const title = uniqueName("Edit in place");
+  const document = await slashdocs.createDocument(
+    title,
+    documentHTML(title, "<p>Change my comment.</p>"),
+  );
+  await slashdocs.createComment(document.id, "First words", {
+    quote: "Change my comment.",
+  });
+  await page.goto(`/app/d/${document.id}`);
+  await (await listedThread(page, "First words")).click();
+  const thread = page.getByRole("dialog", { name: "Comment thread" });
+  await thread.getByRole("button", { name: "More actions" }).click();
+  await page.getByRole("menuitem", { name: "Edit" }).click();
+  await expect(thread.getByRole("combobox").first()).toBeFocused();
+  await page.keyboard.press("ControlOrMeta+a");
+  await page.keyboard.type("Better words");
+  await page.keyboard.press("Enter");
+  await expect(thread.getByText("Better words")).toBeVisible();
+  await expect(thread.getByText("edited")).toBeVisible();
 });

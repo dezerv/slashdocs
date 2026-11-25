@@ -12,6 +12,8 @@ type CommentNotification struct {
 	RecipientID string
 	Reason      string
 	Attempts    int
+	// FinishedProviders names the providers that need no further attempt.
+	FinishedProviders []string
 }
 
 type DocumentAccessNotification struct {
@@ -22,6 +24,8 @@ type DocumentAccessNotification struct {
 	PreviousRole Role
 	Role         Role
 	Attempts     int
+	// FinishedProviders names the providers that need no further attempt.
+	FinishedProviders []string
 }
 
 type DocumentAccessRequestNotification struct {
@@ -31,4 +35,24 @@ type DocumentAccessRequestNotification struct {
 	RequesterLabel string
 	RecipientID    string
 	Attempts       int
+	// FinishedProviders names the providers that need no further attempt.
+	FinishedProviders []string
+}
+
+// Approval notification reasons. A request goes to the approver. A decision
+// goes to the document owner.
+const (
+	ApprovalNotificationRequested = "approval_requested"
+	ApprovalNotificationDecided   = "approval_decided"
+)
+
+type ApprovalNotification struct {
+	DocumentID   string
+	ApproverType string
+	ApproverID   string
+	Reason       string
+	RecipientID  string
+	Attempts     int
+	// FinishedProviders names the providers that need no further attempt.
+	FinishedProviders []string
 }

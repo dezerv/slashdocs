@@ -84,6 +84,13 @@ spec:
             - name: GOOGLE_GROUPS_REQUEST_TIMEOUT
               value: {{ .Values.googleGroups.requestTimeout | quote }}
             {{- end }}
+            {{- if .Values.googleChat.webhookSecret }}
+            - name: SLASHDOCS_GOOGLE_CHAT_WEBHOOK_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.googleChat.webhookSecret }}
+                  key: {{ .Values.googleChat.webhookKey }}
+            {{- end }}
             {{- if eq .Values.deployment.mode "org" }}
             - name: SLASHDOCS_ORG_DOMAINS
               value: {{ required "deployment.orgDomains is required when deployment.mode=org" .Values.deployment.orgDomains | quote }}
@@ -156,6 +163,18 @@ spec:
                   name: {{ default (include "slashdocs.secretName" .) .Values.kvEvents.existingSecret }}
                   key: {{ .Values.kvEvents.listenerDatabaseURLKey }}
             {{- end }}
+            {{- if or .Values.approvalWebhook.existingSecret .Values.approvalWebhook.url }}
+            - name: SLASHDOCS_APPROVAL_WEBHOOK_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ default (include "slashdocs.secretName" .) .Values.approvalWebhook.existingSecret }}
+                  key: {{ .Values.approvalWebhook.urlKey }}
+            - name: SLASHDOCS_APPROVAL_WEBHOOK_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ default (include "slashdocs.secretName" .) .Values.approvalWebhook.existingSecret }}
+                  key: {{ .Values.approvalWebhook.secretKey }}
+            {{- end }}
             {{- if .Values.oidc.issuerURL }}
             - name: SLASHDOCS_OIDC_ISSUER_URL
               value: {{ .Values.oidc.issuerURL | quote }}
@@ -166,6 +185,10 @@ spec:
             {{- if .Values.oidc.internalIssuerURL }}
             - name: SLASHDOCS_OIDC_INTERNAL_ISSUER_URL
               value: {{ .Values.oidc.internalIssuerURL | quote }}
+            {{- end }}
+            {{- with .Values.oidc.previousIssuerURLs }}
+            - name: SLASHDOCS_OIDC_PREVIOUS_ISSUER_URLS
+              value: {{ . | quote }}
             {{- end }}
             - name: SLASHDOCS_OIDC_CLIENT_ID
               valueFrom:

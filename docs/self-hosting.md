@@ -36,6 +36,10 @@ hostnames match; local or throwaway setups can override this with
 `SLASHDOCS_ALLOW_UNSAFE_RENDER_ORIGIN=true`, accepting that uploaded documents
 can then script against the app origin.
 
+Direct visits to frontend pages on the render hostname redirect to the app
+hostname. Tokenized `/v/...` and `/print/...` document routes continue to run
+on the render hostname.
+
 ## Configure sign-in
 
 slashdocs authenticates humans through OpenID Connect. Pick one provider:
@@ -47,6 +51,11 @@ slashdocs authenticates humans through OpenID Connect. Pick one provider:
   (see [Generic OIDC providers](#generic-oidc-providers)).
 
 Set exactly one of the two; the server refuses to start with both.
+
+slashdocs does not connect to LDAP directly. To sign in with an LDAP or Active
+Directory account, use an OIDC provider with an LDAP connector, such as Dex
+([LDAP connector](https://dexidp.io/docs/connectors/ldap/)) or Keycloak (user
+federation), and configure it as a generic OIDC provider.
 
 ### Google, step by step (Google Cloud Console)
 
@@ -138,6 +147,26 @@ must dial `http://dex:5556`), set `SLASHDOCS_OIDC_INTERNAL_ISSUER_URL` to the
 server-side URL. Discovery, token exchange, and JWKS fetches then use the
 internal URL while ID tokens are still validated against the public
 `SLASHDOCS_OIDC_ISSUER_URL`.
+
+Each user's identity key in `users.google_sub` comes from the exact issuer
+URL and the token `sub`. If you change `SLASHDOCS_OIDC_ISSUER_URL` (a new
+host, port, scheme, or trailing slash, or a backup restored into another
+deployment), add the earlier issuer URL to `SLASHDOCS_OIDC_PREVIOUS_ISSUER_URLS`.
+The next sign-in of each user then moves their existing account to the new
+key when the verified email and the token `sub` are the same. The server logs
+`relinked user to a new oidc identity` with the old and new keys.
+
+Any other sign-in whose verified email belongs to an account with another key
+fails with `409 conflict`, and the log names both keys. This includes a new
+`sub` at the same issuer, for example when the IdP deletes and recreates a
+user or gives a mailbox to a new person. It also includes a move between
+Google and a generic OIDC provider. To move such an account on purpose, clear
+its key. The next sign-in with the same verified email then adopts the
+account:
+
+```sql
+UPDATE users SET google_sub = NULL WHERE email = 'person@example.com';
+```
 
 Example: a minimal [Dex](https://dexidp.io/) setup for local testing —
 
@@ -280,6 +309,39 @@ and fixed secrets. Production deployments configure a real identity provider
 stack and runs a non-interactive end-to-end test: OIDC login, service
 accounts, CLI push/pull, comments, sharing, folders, sandboxed rendering, and
 the KV events stream. `scripts/e2e.sh down` removes the stack and its volumes.
+
+### Use your own Postgres and object storage
+
+The Helm chart bundles no database or object storage: set `database.*` and
+`blob.*` in your values (see [Kubernetes with Helm](#kubernetes-with-helm)).
+For S3-compatible storage other than AWS, also set `blob.endpoint` and
+`blob.forcePathStyle: true`.
+
+To point the compose stack at external services, put a
+`docker-compose.external.yml` next to `docker-compose.yml`. Git ignores this
+file, so its credentials stay out of commits:
+
+```yaml
+services:
+  slashdocs:
+    environment:
+      DATABASE_URL: postgres://slashdocs:...@db.example.com:5432/slashdocs?sslmode=require
+      BLOB_BUCKET: slashdocs-documents
+      BLOB_REGION: us-east-1
+      BLOB_ENDPOINT: "" # empty for AWS S3, else the MinIO or R2 URL
+      BLOB_FORCE_PATH_STYLE: "false" # "true" for most non-AWS storage
+      BLOB_ACCESS_KEY_ID: ...
+      BLOB_SECRET_ACCESS_KEY: ...
+    depends_on: !override # Compose 2.24.4 or later
+      dex:
+        condition: service_healthy
+```
+
+Then run
+`docker compose -f docker-compose.yml -f docker-compose.external.yml up slashdocs`.
+Compose starts only slashdocs and Dex, not the bundled Postgres and versitygw.
+Other `docker compose` commands, such as `make e2e`, do not read this file.
+For production, also replace Dex and the dev secrets, or use [Docker](#docker) or [Helm](#kubernetes-with-helm).
 
 ## Docker
 
@@ -454,8 +516,10 @@ Sealed Secrets, etc.).
 | `deployment.{mode,orgDomains,orgName,defaultDocPermission}`                | `public` (default) or `org`; org mode gates login to `orgDomains` and may set a sharing default for new documents.              |
 | `allowedOAuthDomains`                                                      | Comma-separated email domain allowlist (public mode); empty = no gate.                                                          |
 | `kvEvents.{mode,listenerDatabaseURL,existingSecret}`                       | Realtime KV events: `SLASHDOCS_KV_EVENTS_MODE` and the dedicated LISTEN connection URL (secret-backed). Rendered only when set. |
+| `approvalWebhook.{url,secret,existingSecret}`                              | Webhook for [approval events](#approval-events) (secret-backed). Rendered only when set.                                        |
 | `commitSha`                                                                | Optional revision surfaced at `/commit.txt`.                                                                                    |
 | `ingress`                                                                  | Standard ingress block; supports multiple hosts.                                                                                |
+| `googleChat.{webhookSecret,webhookKey}`                                    | Google Chat webhook notifications: Secret holding the webhook URL.                                                              |
 | `extraEnv` / `extraEnvFrom`                                                | Append arbitrary env vars / envFrom sources.                                                                                    |
 | `resources`                                                                | CPU/memory requests and limits.                                                                                                 |
 | `livenessProbe` / `readinessProbe`                                         | HTTP probes against `/livez` and `/readyz`.                                                                                     |
@@ -522,20 +586,36 @@ Terminate TLS at nginx, Caddy, or any reverse proxy of your choice.
 
 ### Sign-in (exactly one provider)
 
-| Variable                             | Purpose                                                                                                                                        |
-| ------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------- |
-| `GOOGLE_OAUTH_CLIENT_ID`             | Google OAuth web client ID.                                                                                                                    |
-| `GOOGLE_OAUTH_CLIENT_SECRET`         | Google OAuth web client secret.                                                                                                                |
-| `SLASHDOCS_OIDC_ISSUER_URL`          | Issuer URL of a generic OIDC provider (Okta, Entra ID, Keycloak, Dex, ...). Endpoints are discovered from `/.well-known/openid-configuration`. |
-| `SLASHDOCS_OIDC_CLIENT_ID`           | OIDC client ID.                                                                                                                                |
-| `SLASHDOCS_OIDC_CLIENT_SECRET`       | OIDC client secret.                                                                                                                            |
-| `SLASHDOCS_OIDC_PROVIDER_NAME`       | Optional display label for the login button. Defaults to `SSO` (`Google` when the Google pair is used).                                        |
-| `SLASHDOCS_OIDC_INTERNAL_ISSUER_URL` | Optional server-side base URL for the IdP when it differs from the browser-facing issuer (split horizon, e.g. docker-compose).                 |
+| Variable                              | Purpose                                                                                                                                                                                        |
+| ------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `GOOGLE_OAUTH_CLIENT_ID`              | Google OAuth web client ID.                                                                                                                                                                    |
+| `GOOGLE_OAUTH_CLIENT_SECRET`          | Google OAuth web client secret.                                                                                                                                                                |
+| `SLASHDOCS_OIDC_ISSUER_URL`           | Issuer URL of a generic OIDC provider (Okta, Entra ID, Keycloak, Dex, ...). Endpoints are discovered from `/.well-known/openid-configuration`.                                                 |
+| `SLASHDOCS_OIDC_CLIENT_ID`            | OIDC client ID.                                                                                                                                                                                |
+| `SLASHDOCS_OIDC_CLIENT_SECRET`        | OIDC client secret.                                                                                                                                                                            |
+| `SLASHDOCS_OIDC_PROVIDER_NAME`        | Optional display label for the login button. Defaults to `SSO` (`Google` when the Google pair is used).                                                                                        |
+| `SLASHDOCS_OIDC_INTERNAL_ISSUER_URL`  | Optional server-side base URL for the IdP when it differs from the browser-facing issuer (split horizon, e.g. docker-compose).                                                                 |
+| `SLASHDOCS_OIDC_PREVIOUS_ISSUER_URLS` | Optional comma-separated issuer URLs that the deployment used before. A user with the same `sub` under one of them keeps their account. See [Generic OIDC providers](#generic-oidc-providers). |
 
 Set either the `GOOGLE_OAUTH_*` pair or the `SLASHDOCS_OIDC_*` variables, never
 both. The redirect URI to register is
 `<SLASHDOCS_APP_ORIGIN>/v1/auth/google/callback` for Google and
 `<SLASHDOCS_APP_ORIGIN>/v1/auth/oidc/callback` for everything else.
+
+### Notifications
+
+Comment and access notifications are off unless one of these is set. When both
+are set, each provider delivers every notification. See
+[Comment notifications](comment-notifications.md) for provider setup.
+
+| Variable                            | Purpose                                                                                                                     |
+| ----------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| `SLASHDOCS_SLACK_BOT_TOKEN`         | Slack bot token; DMs each recipient.                                                                                        |
+| `SLASHDOCS_GOOGLE_CHAT_WEBHOOK_URL` | Google Chat incoming webhook (`https://chat.googleapis.com/v1/spaces/…/messages?…`); posts every notification to one space. |
+
+The webhook URL and the Slack token both grant posting rights, so keep them in
+a secret store. The server needs outbound HTTPS to `chat.googleapis.com` or
+`slack.com`.
 
 ### Optional
 
@@ -546,15 +626,20 @@ both. The redirect URI to register is
 | `SLASHDOCS_MIGRATE`                         | `true`      | Run database migrations on boot. Set `false` to skip.                                                                                                                                                                                                                                               |
 | `SLASHDOCS_DEFAULT_DOC_PERMISSION`          | `private`   | Server-wide default sharing applied when a document is created: `viewer`, `commenter`, `editor`, or `private` (no grant). Non-private values require `SLASHDOCS_DEPLOYMENT=org`; requests may override per document via the `default_permission` form field.                                        |
 | `SLASHDOCS_FEATURED`                        | unset       | JSON object of sections that the Documents page shows above each user's own items. See [Featured sections](#featured-sections).                                                                                                                                                                     |
+| `SLASHDOCS_LABELS_ENABLED`                  | `false`     | Set `true` to turn on document labels: the labels API, `label:` in search, and labels in the UI.                                                                                                                                                                                                    |
 | `SLASHDOCS_KV_EVENTS_MODE`                  | `auto`      | `auto`, `notify`, or `poll`; controls how document KV streams discover persisted events.                                                                                                                                                                                                            |
 | `SLASHDOCS_KV_EVENTS_LISTENER_DATABASE_URL` | unset       | Direct or session-pooled URL to the same database for the dedicated LISTEN connection. Never use a transaction-pooling endpoint.                                                                                                                                                                    |
+| `SLASHDOCS_APPROVAL_WEBHOOK_URL`            | unset       | Webhook that receives [approval events](#approval-events). Unset turns them off.                                                                                                                                                                                                                    |
+| `SLASHDOCS_APPROVAL_WEBHOOK_SECRET`         | unset       | At least 32 random bytes that sign each approval event. Required with the URL.                                                                                                                                                                                                                      |
 | `SLASHDOCS_PREVIOUS_ORIGINS`                | unset       | Comma-separated app origins that this deployment used before. Requests to them get a permanent redirect to the same path on `SLASHDOCS_APP_ORIGIN`, and the CLI saves the new URL. MCP clients on an old origin get one tool that tells the agent the new MCP URL. Route these hosts to the server. |
 | `SLASHDOCS_ALLOW_UNSAFE_RENDER_ORIGIN`      | `false`     | Set `true` to allow app and render origins on the same hostname. Unsafe: documents can script against the app. Never in prod.                                                                                                                                                                       |
 | `SLASHDOCS_COMMIT_SHA` / `COMMIT_SHA`       | unset       | Build revision exposed at `/commit.txt`.                                                                                                                                                                                                                                                            |
 | `ALLOWED_OAUTH_DOMAINS`                     | unset       | Comma-separated email-domain allowlist for OAuth logins (public deployments).                                                                                                                                                                                                                       |
 | `SLASHDOCS_DEPLOYMENT`                      | `public`    | `public` or `org`. An org deployment gates login to `SLASHDOCS_ORG_DOMAINS`.                                                                                                                                                                                                                        |
 | `SLASHDOCS_ORG_DOMAINS`                     | unset       | Comma-separated org domains. Required when `SLASHDOCS_DEPLOYMENT=org`; also the login gate.                                                                                                                                                                                                         |
-| `SLASHDOCS_ORG_NAME`                        | unset       | Org display name used in share UI copy (e.g. "Anyone in Razorpay").                                                                                                                                                                                                                                     |
+| `SLASHDOCS_ORG_NAME`                        | unset       | Org display name used in share UI copy (e.g. "Anyone in Razorpay").                                                                                                                                                                                                                                 |
+| `SLASHDOCS_SLACK_LINK_PREVIEWS`             | `false`     | Set `true` to unfurl document links in Slack. Requires `SLASHDOCS_SLACK_BOT_TOKEN` and `SLASHDOCS_SLACK_SIGNING_SECRET`; startup fails without them. See [Slack link previews](comment-notifications.md#slack-link-previews).                                                                       |
+| `SLASHDOCS_SLACK_SIGNING_SECRET`            | unset       | Slack app signing secret, used to verify `/v1/slack/events` requests. Keep it in your secret store.                                                                                                                                                                                                 |
 | `BLOB_REGION`                               | `us-east-1` | AWS region for the S3 client.                                                                                                                                                                                                                                                                       |
 | `BLOB_ENDPOINT`                             | unset       | Custom S3 endpoint (MinIO, R2, etc.).                                                                                                                                                                                                                                                               |
 | `BLOB_ACCESS_KEY_ID`                        | unset       | Override AWS-SDK default credential chain.                                                                                                                                                                                                                                                          |
@@ -572,10 +657,24 @@ events. Open viewers refresh comments, hear about new versions, and see who
 else is viewing, whichever replica served each request. Presence rows expire
 after ten minutes, so the event table does not grow with viewing time.
 
-Live cursors use the same stream but are never stored. In `notify` mode, each
+Live cursors use the same stream but are never stored. Each cursor also
+carries the center of its viewer's view, so another viewer can follow them, and
+a cursor chat message of at most 100 characters, which the viewer types after /.
+A signed-out reader of a public document sees the cursors and their chat, but
+sends neither. In `notify` mode, each
 batch of pointer positions goes to every replica as a notification. In `poll`
 mode, a viewer sees only the cursors of viewers that the same replica serves.
 Thus, use `notify` when you run more than one replica.
+
+The document page holds one WebSocket for each open document, at
+`GET /v1/documents/{id}/live`. It carries the events of the stream to the
+page, and the presence and the cursor of the viewer to the server. The server
+lists a viewer while their connection is open. The SSE stream at
+`GET /v1/documents/{id}/kv/events` and the presence and cursor POST routes stay
+for older pages and other clients. A proxy in front of slashdocs must pass
+WebSocket upgrades. Traefik and ingress-nginx do this by default. The server
+pings each connection every 25 seconds, so an idle timeout of 60 seconds or
+more keeps the connection open.
 
 `notify` fails startup if LISTEN cannot be verified. It prefers the listener URL
 and otherwise uses `DATABASE_URL`, which is an explicit assertion by the
@@ -591,6 +690,83 @@ URL in a pre-created Secret) instead of `extraEnv`.
 If `BLOB_ACCESS_KEY_ID` and `BLOB_SECRET_ACCESS_KEY` are omitted, the
 AWS SDK default credential chain is used (IRSA, instance profile,
 shared config, etc.).
+
+## Approval events
+
+Set `SLASHDOCS_APPROVAL_WEBHOOK_URL` and `SLASHDOCS_APPROVAL_WEBHOOK_SECRET` to
+send approval changes to another system, for example a task tracker that files
+a review task for each approver. Each change writes one event in the database
+transaction of the change. A worker posts the event as JSON and deletes it when
+the webhook answers with a 2xx status.
+
+| `type`                     | When                                                                                                         |
+| -------------------------- | ------------------------------------------------------------------------------------------------------------ |
+| `approval.requested`       | The owner asks someone to approve                                                                            |
+| `approval.removed`         | The owner removes an approver, or an approver loses read access                                              |
+| `approval.approved`        | An approver approves                                                                                         |
+| `approval.rejected`        | An approver rejects                                                                                          |
+| `approval.revoked`         | An approver revokes their decision                                                                           |
+| `approval.version_created` | The current version of a document that has approvers changes (see below)                                     |
+
+```json
+{
+  "id": "evt_…",
+  "type": "approval.rejected",
+  "sequence": 42,
+  "created_at": "2026-11-01T12:00:00.000000Z",
+  "document": {
+    "id": "doc_…",
+    "title": "Launch plan",
+    "url": "https://slashdocs.example.com/app/d/doc_…"
+  },
+  "version": { "id": "ver_…", "number": 3, "sha256": "…" },
+  "approver": {
+    "type": "user",
+    "id": "usr_…",
+    "email": "reviewer@example.com",
+    "name": "Reviewer"
+  },
+  "actor": {
+    "type": "user",
+    "id": "usr_…",
+    "email": "reviewer@example.com",
+    "name": "Reviewer"
+  },
+  "note": "Needs a rollback plan.",
+  "status": "rejected",
+  "summary": { "total": 2, "approved": 1, "rejected": 1, "pending": 0 }
+}
+```
+
+`version` is the document's current version after the change, and `status` and
+`summary` are its approval state. `approver` is absent on
+`approval.version_created`; `note`, `status` and the names are absent when
+empty. `version.sha256` is absent while people edit that version in the
+browser: its content is not fixed yet.
+
+`approval.version_created` comes for a push, an upload, an API edit and a
+restore. It also comes when people start to edit in the browser, which makes a
+new version with no decisions. When their edits end on the text where they
+started, the version before is the current one again, with its decisions, and
+the event comes again with that status.
+
+Each request has three headers, in the
+[Standard Webhooks](https://www.standardwebhooks.com/) layout:
+
+- `webhook-id`: the event `id`. Delivery is at least once, so use it to drop
+  duplicates.
+- `webhook-timestamp`: Unix seconds when the request was sent.
+- `webhook-signature`: `v1,` and the base64 HMAC-SHA256 of
+  `<webhook-id>.<webhook-timestamp>.<body>`, keyed with the secret bytes.
+  Compute it over the raw body, compare in constant time, and refuse old
+  timestamps.
+
+A failed request (an error, a timeout after 10 seconds, or a non-2xx status)
+is tried again after 2 seconds, then after double the delay, up to one hour.
+Events still undelivered after seven days are dropped with an error log.
+Events can arrive out of order after a retry. Order the events of one document
+by `sequence`: the changes to a document take turns, so a higher number is a
+later change. A repeated decision with the same note sends no event.
 
 ## Health and metadata endpoints
 
@@ -617,11 +793,45 @@ boot. This drives copy-paste-correct commands in the UI:
 No extra API call is made; the value comes from the same env you already
 configured for the server.
 
+## Document titles and link previews
+
+For a document page (`/app/d/:id`), the server also puts the document's title,
+a short description and Open Graph tags into `index.html`, so that browser
+tabs, bookmarks and link previews show the document before the app loads. The
+description is the start of the document's text, or the owner and the date of
+the last version when the text is not indexed yet. Sensitive values such as
+one-time codes are redacted from the description.
+
+Only a caller who may read the document gets them. Everyone else, including a
+chat app that fetches the link to preview it, gets the generic page. On a
+`public` deployment, a document shared with everyone therefore previews in any
+chat app; on an `org` deployment, link previews stay generic, because the app
+that fetches the link is not signed in. There, the Slack app can still preview
+documents that everyone in the organization can open (see [Slack link
+previews](comment-notifications.md#slack-link-previews)). `og:url` needs
+`SLASHDOCS_APP_ORIGIN`.
+
+Document pages are sent with `Cache-Control: private, no-cache`, because their
+content depends on who asks. If the lookups take longer than a second, the
+server sends the generic page. With Google Groups enabled, a reader whose access
+comes from a group gets the document's head only while their memberships are
+cached; the page never asks the directory.
+
 ## Storage notes
 
 `slashdocs` stores uploaded HTML versions in blob storage and metadata,
-comments, grants, sessions, and OAuth state in Postgres. Documents are
-versioned immutably; each push creates a new version.
+comments, grants, sessions, and OAuth state in Postgres. Each create, push,
+upload, API edit or restore makes a new version. Typing in the browser makes
+no version: each edit is an operation, and Postgres keeps the operations in a
+log (`document_ops`). While people type, the newest version is open. Its blob
+is a snapshot, and the operations after it complete it. A server seals the
+open version 10 minutes after the last operation, or before the next push,
+upload, API edit, restore or approval. A sealed version is immutable. Thus one
+sitting of typing, by one person or by several, is one version. The log drops
+the text of an operation 10 minutes after the seal, and the operation when it
+is 7 days old. The UI shows the versions as the document's history. To find the source of
+an edit by position, the render adds a `data-slashdocs-source` attribute to
+each element of the document. The stored HTML never contains it.
 
 For search, Postgres also keeps the visible text of each new version. After an
 upgrade from a release without content search, every server reads the older
@@ -642,6 +852,36 @@ Postgres migrations are applied automatically at startup unless
 roll back, deploy the previous image tag and pre-apply any matching
 down-migration manually if needed; the binary does not auto-rollback.
 
+### Rolling deploy to the release with live editing
+
+Migration 44 makes an edit an operation in a log, and a version a checkpoint.
+After it, a server of the release before cannot save a version:
+`versions.seq` has no default, so its insert fails and no version is saved.
+That server would otherwise save a stale snapshot and remove text that people
+typed. Thus the order of the deploy matters:
+
+1. If you set `SLASHDOCS_MIGRATE=false`, apply the migrations first.
+2. Deploy the new server image. The first new server applies the migration
+   when it starts. The image also carries the CLI of the same release (see
+   [The CLI ships with the server](releasing.md#the-cli-ships-with-the-server)).
+3. Let the rollout replace every old server with no pause. Keep this window
+   short.
+
+While old and new servers run side by side:
+
+- A create, a push or an upload that reaches an old server fails with a
+  server error (500). The agent or the person sends it again.
+- Typing that reaches an old server gets 404. The browser sends the text
+  again by itself, and no typed text is lost.
+- A page or a pull that an old server serves can miss the newest typing.
+- A reader whose page asks an old server for changes can see the "no access"
+  page. A reload shows the document.
+
+To roll back to the release before, apply the down migrations of this
+release (45 to 34) before you deploy the earlier image. The down migration of
+44 refuses while a version is open. The servers seal a version 10 minutes
+after its last edit, so apply it when nobody edited for that time.
+
 ## Production checklist
 
 - [ ] `SLASHDOCS_APP_ORIGIN` and `SLASHDOCS_RENDER_ORIGIN` on different hostnames
@@ -652,6 +892,8 @@ down-migration manually if needed; the binary does not auto-rollback.
 - [ ] OAuth/OIDC redirect URIs registered at the IdP match `SLASHDOCS_APP_ORIGIN`.
 - [ ] `ALLOWED_OAUTH_DOMAINS` set if you don't want public sign-ups.
 - [ ] Postgres backups configured.
+- [ ] If notifications are on: each provider's secret in a secret manager, and
+      outbound HTTPS to each configured provider allowed.
 - [ ] Blob storage versioning / lifecycle rules configured.
 - [ ] `SLASHDOCS_COMMIT_SHA` baked into your image so `/commit.txt`
       reports the running build.

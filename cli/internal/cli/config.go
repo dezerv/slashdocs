@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/zalando/go-keyring"
 )
@@ -24,9 +25,32 @@ type Config struct {
 }
 
 type Context struct {
-	Server     string            `json:"server"`
-	Credential map[string]any    `json:"credential,omitempty"`
-	Pulled     map[string]string `json:"pulled"`
+	Server     string         `json:"server"`
+	Credential map[string]any `json:"credential,omitempty"`
+	// Pulled is the version of each document that the last pull, push or
+	// create gave. An approval is for that version.
+	Pulled map[string]string `json:"pulled"`
+	// Bases holds the base of each local file, by its absolute path. A push
+	// of the file sends it.
+	Bases   map[string]Base    `json:"bases,omitempty"`
+	Reviews map[string]*Review `json:"reviews,omitempty"`
+}
+
+// Base is the state of a document that a local file holds: the version that
+// a pull or a push gave, and the seq of its HTML when the server gave one.
+// The version can be open, and its HTML then changes while people type.
+type Base struct {
+	DocumentID string `json:"document_id"`
+	VersionID  string `json:"version_id"`
+	Seq        string `json:"seq,omitempty"`
+}
+
+// Review is what the CLI knows of the review of a document: the messages
+// that it wrote, which are not feedback, and the time up to which wait gave
+// the feedback.
+type Review struct {
+	Mine  []string  `json:"mine,omitempty"`
+	Since time.Time `json:"since,omitzero"`
 }
 
 func configBase() string {

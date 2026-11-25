@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"slices"
 	"strings"
 	"unicode"
 
@@ -12,10 +13,14 @@ import (
 
 	"github.com/razorpay/slashdocs/api/internal/blob"
 	dbsqlc "github.com/razorpay/slashdocs/api/internal/db/sqlc"
+	"github.com/razorpay/slashdocs/api/internal/repo"
 )
 
 // maxSearchTextBytes keeps a version's tsvector below the PostgreSQL limit of
-// 1 MB. It is about 40,000 words, more than almost any document has.
+// 1 MB. A text of short words that are all different, such as IDs, makes a
+// tsvector 2.4 times its size, and a write fails above the limit. It is about
+// 40,000 words, more than almost any document has. PostgreSQL also keeps word
+// positions up to 16,383 only, so a phrase matches in the first 16,383 words.
 const maxSearchTextBytes = 256 << 10
 
 // searchText returns the words that a reader sees in an HTML document. Tags
@@ -52,27 +57,79 @@ func searchText(doc []byte) string {
 			}
 		}
 	}
-	// PostgreSQL text must be UTF-8. A document can have bytes in another
-	// encoding, and the size limit can cut a character in two.
-	return strings.ToValidUTF8(text.String()[:min(text.Len(), maxSearchTextBytes)], "")
+	// The limit cuts after the last whole word, because a part of a word
+	// matches searches for other words. Text with no space in the limit, such
+	// as CJK prose, is cut at the limit.
+	s := text.String()
+	if len(s) > maxSearchTextBytes {
+		if i := strings.LastIndexByte(s[:maxSearchTextBytes+1], ' '); i > 0 {
+			s = s[:i]
+		} else {
+			s = s[:maxSearchTextBytes]
+		}
+	}
+	// PostgreSQL text must be UTF-8, and a document can have bytes in another
+	// encoding.
+	return strings.ToValidUTF8(s, "")
 }
 
 var hiddenElements = map[string]bool{"script": true, "style": true, "template": true, "noscript": true}
 
 func isSeparator(r rune) bool { return unicode.IsSpace(r) || unicode.IsControl(r) }
 
-// tsquery returns PostgreSQL tsquery text that matches words that start with
-// each term, joined with op. Quoting makes every term a literal, and a quoted
-// phrase matches its words in order.
-func tsquery(terms []string, op string) string {
+// tsqueries are the PostgreSQL tsquery texts of a search.
+type tsqueries struct {
+	// match finds documents with every term, and a phrase matches its words
+	// in order.
+	match string
+	// words finds the same documents and more, as it matches the words of
+	// every term in any order: a phrase "error budget" becomes 'error':* &
+	// 'budget':*. Search finds these documents in the index and checks the
+	// order of the words, which reads a document's text vector, on the sorted
+	// candidates only.
+	words string
+	// exclude finds documents with any excluded term.
+	exclude string
+	// rank orders matches by the terms in their titles.
+	rank string
+	// snippet marks the terms in the text, so it has no title terms.
+	snippet string
+}
+
+// searchQueries returns the tsquery texts of a search. A title term matches
+// title words only. The search vector gives title words weight A.
+func searchQueries(search repo.DocumentSearch) tsqueries {
+	terms := slices.Concat(tsqueryTerms(search.Terms, ""), tsqueryTerms(search.TitleTerms, "A"))
+	words := slices.Concat(tsqueryTerms(splitWords(search.Terms), ""), tsqueryTerms(splitWords(search.TitleTerms), "A"))
+	return tsqueries{
+		match:   strings.Join(terms, " & "),
+		words:   strings.Join(words, " & "),
+		exclude: strings.Join(tsqueryTerms(search.ExcludedTerms, ""), " | "),
+		rank:    strings.Join(tsqueryTerms(slices.Concat(search.Terms, search.TitleTerms), ""), " | "),
+		snippet: strings.Join(tsqueryTerms(search.Terms, ""), " & "),
+	}
+}
+
+// tsqueryTerms returns a tsquery operand for each term, which matches words
+// that start with the term and have the weight ("" is any weight). Quoting
+// makes every term a literal.
+func tsqueryTerms(terms []string, weight string) []string {
 	quoted := make([]string, len(terms))
 	for i, term := range terms {
-		quoted[i] = "'" + tsqueryEscaper.Replace(term) + "':*"
+		quoted[i] = "'" + tsqueryEscaper.Replace(term) + "':*" + weight
 	}
-	return strings.Join(quoted, op)
+	return quoted
 }
 
 var tsqueryEscaper = strings.NewReplacer(`\`, `\\`, `'`, `''`)
+
+func splitWords(terms []string) []string {
+	var words []string
+	for _, term := range terms {
+		words = append(words, strings.Fields(term)...)
+	}
+	return words
+}
 
 // IndexVersions gives search text to current versions that were created
 // before content search. Each batch locks its versions, so all servers can

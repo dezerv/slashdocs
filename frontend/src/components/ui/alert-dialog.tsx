@@ -2,22 +2,26 @@ import * as React from "react";
 import * as AD from "@radix-ui/react-alert-dialog";
 import { cn } from "@/lib/cn";
 import { Button } from "./button";
+import { useLayerFocus } from "./sheet";
 
 export const AlertDialog = AD.Root;
 export const AlertDialogTrigger = AD.Trigger;
 
 export function AlertDialogContent({
   className,
+  onOpenAutoFocus,
+  onCloseAutoFocus,
   ...p
 }: React.ComponentPropsWithoutRef<typeof AD.Content>) {
   return (
     <AD.Portal>
-      <AD.Overlay className="fixed inset-0 z-50 bg-[hsl(218_30%_12%/0.24)] backdrop-blur-[2px] dark:bg-black/60 transition-opacity duration-150 ease-out data-[state=closed]:opacity-0 data-[state=open]:opacity-100" />
+      <AD.Overlay className="sheet-overlay fixed inset-0 z-50 bg-[hsl(218_30%_12%/0.24)] backdrop-blur-[2px] dark:bg-black/60" />
       <AD.Content
         className={cn(
-          "fixed left-1/2 top-1/2 z-50 w-full max-w-md -translate-x-1/2 rounded-lg border border-[var(--color-border)] bg-[var(--color-surface)] p-6 shadow-[var(--shadow-pop)] dark:border-transparent transition-[opacity,transform] duration-200 ease-out data-[state=closed]:-translate-y-[calc(50%-4px)] data-[state=open]:-translate-y-1/2 data-[state=closed]:scale-[0.98] data-[state=open]:scale-100 data-[state=closed]:opacity-0 data-[state=open]:opacity-100 focus:outline-none",
+          "dialog-content fixed left-1/2 top-1/2 z-50 w-full max-w-md -translate-x-1/2 -translate-y-1/2 rounded-lg border border-[var(--color-border)] bg-[var(--color-surface)] p-6 shadow-[var(--shadow-pop)] dark:border-transparent focus:outline-none",
           className,
         )}
+        {...useLayerFocus({ onOpenAutoFocus, onCloseAutoFocus })}
         {...p}
       />
     </AD.Portal>

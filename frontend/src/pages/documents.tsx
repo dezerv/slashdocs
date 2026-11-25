@@ -1,20 +1,22 @@
 import { useTitle } from "@/lib/use-title";
 import { useEffect, useMemo, useState } from "react";
-import { Link, useNavigate } from "react-router-dom";
+import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import { useOnboarding, autoMarkFirstDoc, onboardingProgress } from "@/lib/onboarding";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { toast } from "sonner";
+import { useInfiniteQuery, useQuery } from "@tanstack/react-query";
 import { errorMessage } from "@/lib/errors";
+import { useDebounced } from "@/lib/hooks";
 import { MoreHorizontal, Plus, Sparkles } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Page } from "@/components/layout/page";
 import { beat } from "@/lib/enter";
 import { Skeleton, EmptyState } from "@/components/ui/misc";
+import { LoadError, LoadErrorLine } from "@/components/error-state";
 import { Dropdown, DropdownContent, DropdownTrigger } from "@/components/ui/dropdown";
-import { api, docID, docTitle, type Folder, type FolderEntry } from "@/api";
+import { api, APIError, docID, docTitle, type Folder, type FolderEntry } from "@/api";
 import { queryKeys } from "@/lib/queryKeys";
 import { viewModeStore } from "@/lib/view-mode";
 import { DRAG_TYPE, type ActiveDrag } from "@/components/browse/drag";
+import { useMoveResource } from "@/components/browse/use-resource-actions";
 import { BrowseDragOverlay } from "@/components/browse/drag-overlay";
 import { UnifiedGrid } from "@/components/browse/unified-grid";
 import { UnifiedTable } from "@/components/browse/unified-table";
@@ -26,7 +28,12 @@ import {
 } from "@/components/browse/upload-backup";
 import { DocumentSearchInput } from "@/components/browse/document-search-input";
 import { FeaturedItems } from "@/components/browse/featured-items";
-import { hasDocumentSearchOperators } from "@/lib/search-query";
+import { sortEntries } from "@/components/browse/sort-entries";
+import {
+  folderSearchText,
+  hasDocumentSearchOperators,
+  searchTokens,
+} from "@/lib/search-query";
 import {
   DndContext,
   PointerSensor,
@@ -38,17 +45,40 @@ import {
 
 export function DocumentsPage() {
   useTitle("Documents");
-  const [q, setQ] = useState("");
-  const [debouncedQ, setDebouncedQ] = useState("");
-  useEffect(() => {
-    const t = window.setTimeout(() => setDebouncedQ(q.trim()), 250);
-    return () => window.clearTimeout(t);
-  }, [q]);
+  // The search is in the URL, so Back from a result returns to the results.
+  // Each key writes the field to the URL at once, in place of the history
+  // entry, so that a result opened at once keeps the whole query, and Back
+  // does not step through letters. The search waits for a pause. The URL
+  // shows a write after the next key can come, so the field keeps its own
+  // value: a query that the field did not write, from Back, forward or a
+  // link, replaces it.
+  const [params, setParams] = useSearchParams();
+  const urlQ = params.get("q") || "";
+  const [q, setQ] = useState(urlQ);
+  const [seen, setSeen] = useState({ url: urlQ, written: [] as string[] });
+  if (urlQ !== seen.url) {
+    const i = seen.written.lastIndexOf(urlQ);
+    setSeen({ url: urlQ, written: i < 0 ? [] : seen.written.slice(i + 1) });
+    if (i < 0) setQ(urlQ);
+  }
+  const search = (next: string) => {
+    setQ(next);
+    setSeen((s) => ({ ...s, written: [...s.written, next] }));
+    setParams(next ? { q: next } : {}, { replace: true });
+  };
+  const pausedQ = useDebounced(q, 250);
+  const debouncedQ = pausedQ.trim();
   const me = useQuery({ queryKey: queryKeys.me(), queryFn: api.me });
-  const docs = useQuery({
+  // The server sends documents a page at a time.
+  const docs = useInfiniteQuery({
     queryKey: [...queryKeys.documents(), debouncedQ],
-    queryFn: () => api.listDocuments(debouncedQ || undefined),
+    queryFn: ({ pageParam }) => api.listDocuments(debouncedQ || undefined, pageParam),
+    initialPageParam: 0,
+    getNextPageParam: (last, pages) =>
+      last.has_more ? pages.reduce((n, page) => n + page.items.length, 0) : undefined,
     placeholderData: (prev) => prev,
+    // The page shows the error.
+    meta: { suppressGlobalError: true },
   });
   const pins = useQuery({
     queryKey: queryKeys.pins(),
@@ -57,23 +87,33 @@ export function DocumentsPage() {
   const structuredSearch = hasDocumentSearchOperators(debouncedQ);
   const rootFolders = useQuery({
     queryKey: [...queryKeys.folders(), debouncedQ],
-    queryFn: () => api.listFolders(undefined, undefined, debouncedQ || undefined),
+    queryFn: () =>
+      api.listFolders(undefined, undefined, folderSearchText(debouncedQ) || undefined),
     placeholderData: (prev) => prev,
     enabled: !structuredSearch,
+    // The page shows the error.
+    meta: { suppressGlobalError: true },
   });
+  // Folders that did not load are not an empty list: the page says so.
+  const foldersFailed = !structuredSearch && rootFolders.isError;
+  const documents = useMemo(
+    () => docs.data?.pages.flatMap((page) => page.items) || [],
+    [docs.data],
+  );
+  // A new reader, with no documents and no setup progress on this browser,
+  // starts at the setup guide.
   const { state: onb } = useOnboarding();
   const nav = useNavigate();
+  const noDocuments =
+    docs.isSuccess && !docs.isPlaceholderData && !debouncedQ && documents.length === 0;
   useEffect(() => {
-    if (onb.status === "active" && onboardingProgress(onb).done === 0) {
+    if (noDocuments && onb.status === "active" && onboardingProgress(onb).done === 0) {
       nav("/app/start", { replace: true });
     }
-  }, [onb, nav]);
+  }, [noDocuments, onb, nav]);
   useEffect(() => {
-    if (docs.data && (docs.data.items || []).length > 0) {
-      autoMarkFirstDoc();
-    }
-  }, [docs.data]);
-  const documents = useMemo(() => docs.data?.items || [], [docs.data]);
+    if (documents.length > 0) autoMarkFirstDoc();
+  }, [documents]);
   const folderEntries = (structuredSearch ? [] : rootFolders.data?.items || []).filter(
     (e): e is FolderEntry & { folder: Folder } => e.type === "folder" && !!e.folder,
   );
@@ -100,66 +140,20 @@ export function DocumentsPage() {
     [folderEntries, documents],
   );
 
-  // Browsing sorts by pinned status, last activity, then title. Search
-  // results keep the server's order, which is by relevance.
-  const merged = useMemo(
-    () =>
-      [...entries].sort((a, b) => {
-        const ap = pinnedIds.has(a.folder?.id || docID(a.document!));
-        const bp = pinnedIds.has(b.folder?.id || docID(b.document!));
-        if (ap !== bp) return ap ? -1 : 1;
-        const ta = a.last_active || "";
-        const tb = b.last_active || "";
-        if (ta && tb) return tb.localeCompare(ta);
-        if (tb) return 1;
-        if (ta) return -1;
-        const na = (a.folder?.title || a.document?.title || "").toLowerCase();
-        const nb = (b.folder?.title || b.document?.title || "").toLowerCase();
-        return na.localeCompare(nb);
-      }),
-    [entries, pinnedIds],
-  );
+  // Search results keep the server's order: documents with the words in the
+  // title first, then the latest.
+  const merged = useMemo(() => sortEntries(entries, pinnedIds), [entries, pinnedIds]);
 
   const viewMode = viewModeStore.useStore();
   const [newFolderOpen, setNewFolderOpen] = useState(false);
   const [uploadOpen, setUploadOpen] = useState(false);
-  const qc = useQueryClient();
 
   // Drag and drop
   const [activeDrag, setActiveDrag] = useState<ActiveDrag | null>(null);
-  const [accessWarning, setAccessWarning] = useState<string | null>(null);
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 8 } }),
   );
-  const moveMutation = useMutation({
-    mutationFn: async ({
-      dragType,
-      dragId,
-      targetFolderId,
-    }: {
-      dragType: string;
-      dragId: string;
-      targetFolderId: string;
-    }) => {
-      if (dragType === DRAG_TYPE.folder) {
-        return api.updateFolder(dragId, undefined, targetFolderId);
-      } else {
-        return api.moveDocumentToFolder(targetFolderId, dragId);
-      }
-    },
-    onSuccess: (data) => {
-      qc.invalidateQueries({ queryKey: queryKeys.foldersAll() });
-      qc.invalidateQueries({ queryKey: queryKeys.documents() });
-      const warning = (data as Record<string, unknown>)?.permission_warning as
-        { message?: string } | undefined;
-      if (warning?.message) {
-        setAccessWarning(warning.message);
-      } else {
-        toast.success("Moved.");
-      }
-    },
-    onError: (e) => toast.error(errorMessage(e, "Move failed")),
-  });
+  const { move, warning, clearWarning } = useMoveResource();
 
   function handleDragStart(event: DragStartEvent) {
     const raw = event.active.id as string;
@@ -183,7 +177,12 @@ export function DocumentsPage() {
     const [dragType, dragId] = (active.id as string).split(":", 2);
     const targetFolderId = (over.id as string).replace("drop:", "");
     if (dragType === DRAG_TYPE.folder && dragId === targetFolderId) return;
-    moveMutation.mutate({ dragType, dragId, targetFolderId });
+    move.mutate({
+      type: dragType === DRAG_TYPE.folder ? "folder" : "document",
+      id: dragId,
+      to: targetFolderId,
+      toTitle: folders.find((f) => f.id === targetFolderId)?.title,
+    });
   }
 
   if (docs.isLoading) {
@@ -195,7 +194,11 @@ export function DocumentsPage() {
     );
   }
   const searching = debouncedQ.length > 0;
-  const empty = !searching && documents.length === 0 && folders.length === 0;
+  const empty =
+    !searching && !foldersFailed && documents.length === 0 && folders.length === 0;
+  // The server rejects a search it cannot read with a 400 and says why.
+  const invalidSearch =
+    searching && docs.error instanceof APIError && docs.error.status === 400;
 
   const name = (me.data?.user || me.data?.principal)?.name?.split(" ")[0];
 
@@ -212,7 +215,7 @@ export function DocumentsPage() {
           What did your agents publish?
         </h1>
         <div className="enter mx-auto mt-8 max-w-2xl" style={beat(2)}>
-          <DocumentSearchInput value={q} onChange={setQ} />
+          <DocumentSearchInput value={q} onChange={search} />
         </div>
       </section>
       <div
@@ -224,17 +227,18 @@ export function DocumentsPage() {
         </h2>
         <div className="flex items-center gap-2">
           <ViewModeToggle />
-          <Button
-            variant="outline"
-            size="md"
-            aria-label="New folder"
-            tooltip="New folder"
-            onClick={() => setNewFolderOpen(true)}
-            className="shrink-0 px-3 sm:px-4"
-          >
-            <Plus className="h-3.5 w-3.5 sm:mr-1.5" />{" "}
-            <span className="hidden sm:inline">New folder</span>
-          </Button>
+          {!searching && (
+            <Button
+              variant="outline"
+              size="md"
+              aria-label="New folder"
+              onClick={() => setNewFolderOpen(true)}
+              className="shrink-0 px-3 sm:px-4"
+            >
+              <Plus className="h-3.5 w-3.5 sm:mr-1.5" />{" "}
+              <span className="hidden sm:inline">New folder</span>
+            </Button>
+          )}
           <Dropdown>
             <DropdownTrigger asChild>
               <Button
@@ -255,18 +259,50 @@ export function DocumentsPage() {
 
       {!searching && <FeaturedItems />}
 
-      {docs.error ? (
-        <EmptyState
-          title={searching ? "Search query not valid" : "Could not load documents"}
-          description={errorMessage(docs.error, "Could not search documents.")}
-        />
+      {foldersFailed ? (
+        <LoadErrorLine boxed query={rootFolders}>
+          Could not load folders. Documents show below.
+        </LoadErrorLine>
+      ) : null}
+      {pins.isError && entries.length ? (
+        <LoadErrorLine boxed query={pins}>
+          Could not load your pins. Pinned items show in their usual place.
+        </LoadErrorLine>
+      ) : null}
+
+      {docs.isRefetchError ? (
+        <LoadErrorLine boxed query={docs}>
+          Could not refresh the documents. The list may be out of date.
+        </LoadErrorLine>
+      ) : null}
+
+      {docs.error && !docs.data ? (
+        invalidSearch ? (
+          <EmptyState
+            title="Search query not valid"
+            description={errorMessage(docs.error)}
+          />
+        ) : (
+          <LoadError
+            title={
+              searching ? "Could not search documents" : "Could not load documents"
+            }
+            error={docs.error}
+            query={docs}
+          />
+        )
       ) : empty ? (
         <EmptyDocs />
       ) : searching ? (
         documents.length === 0 && folders.length === 0 ? (
           <EmptyState
             title="No matches"
-            description={`We read every page of every document. "${q}" is not on any of them.`}
+            description={noMatches(debouncedQ)}
+            action={
+              <Button variant="outline" onClick={() => search("")}>
+                Clear search
+              </Button>
+            }
           />
         ) : viewMode === "list" ? (
           <UnifiedTable
@@ -296,13 +332,30 @@ export function DocumentsPage() {
         </DndContext>
       )}
 
+      {/* The pages of the last search show while a new search loads. */}
+      {docs.isFetchNextPageError ? (
+        <LoadErrorLine
+          query={{ isFetching: docs.isFetchingNextPage, refetch: docs.fetchNextPage }}
+          className="mx-auto mt-6 max-w-md"
+        >
+          Could not load more documents.
+        </LoadErrorLine>
+      ) : docs.hasNextPage && !docs.isPlaceholderData ? (
+        <div className="mt-6 flex justify-center">
+          <Button
+            variant="outline"
+            disabled={docs.isFetchingNextPage}
+            onClick={() => docs.fetchNextPage()}
+          >
+            Show more documents
+          </Button>
+        </div>
+      ) : null}
+
       <NewFolderDialog open={newFolderOpen} onOpenChange={setNewFolderOpen} />
       <UploadBackupDialog open={uploadOpen} onOpenChange={setUploadOpen} />
 
-      <AccessWarningDialog
-        warning={accessWarning}
-        onClose={() => setAccessWarning(null)}
-      />
+      <AccessWarningDialog warning={warning} onClose={clearWarning} />
     </Page>
   );
 }
@@ -327,4 +380,20 @@ function EmptyDocs() {
       </div>
     </div>
   );
+}
+
+// noMatches says what a search with no results looked for: its words on the
+// pages, the documents that its filters name, or both.
+function noMatches(q: string) {
+  const tokens = searchTokens(q);
+  const words = tokens
+    .filter((t) => !t.key)
+    .map((t) => t.text)
+    .join(" ");
+  const filters = tokens.filter((t) => t.key).map((t) => t.text);
+  if (!filters.length)
+    return `We read every page of every document. "${words}" is not on any of them.`;
+  const named = `the ${filters.length === 1 ? "filter" : "filters"} ${filters.join(" ")}`;
+  if (!words) return `No documents match ${named}.`;
+  return `No documents that match ${named} have "${words}" on a page.`;
 }

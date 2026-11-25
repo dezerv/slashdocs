@@ -1,0 +1,362 @@
+// Small DOM helpers that several bridge modules share.
+
+// The blocks of text of a document.
+export const BLOCKS = "p,li,h1,h2,h3,h4,h5,h6,blockquote,pre,td,th,dt,dd,figcaption";
+
+// A caret offset is at most this, like the server takes.
+export const MAX_CARET = 1_000_000;
+
+// sameEnds gives the lengths of the common start and of the common end of
+// two texts, or of two lists. The two do not overlap. The end counts first:
+// typed text ends at the caret, so the text after it is the common end.
+export function sameEnds(
+  a: ArrayLike<unknown>,
+  b: ArrayLike<unknown>,
+  same = (i: number, j: number) => a[i] === b[j],
+): [number, number] {
+  const most = Math.min(a.length, b.length);
+  let end = 0;
+  while (end < most && same(a.length - 1 - end, b.length - 1 - end)) end++;
+  let start = 0;
+  while (start < most - end && same(start, start)) start++;
+  return [start, end];
+}
+
+// Two lists pair in at most this many steps. Longer lists give no pairs.
+const MOST_STEPS = 1_000_000;
+
+// equalPairs gives the longest list of pairs [i, j], in order, of one of n
+// items and one of m items that are equal.
+export function equalPairs(
+  n: number,
+  m: number,
+  equal: (i: number, j: number) => boolean,
+): [number, number][] {
+  if (n * m > MOST_STEPS) return [];
+  // lengths[i * width + j] is the count of the pairs from items i and j on.
+  const width = m + 1;
+  const lengths = new Uint32Array((n + 1) * width);
+  for (let i = n - 1; i >= 0; i--) {
+    for (let j = m - 1; j >= 0; j--) {
+      lengths[i * width + j] = equal(i, j)
+        ? lengths[(i + 1) * width + j + 1] + 1
+        : Math.max(lengths[(i + 1) * width + j], lengths[i * width + j + 1]);
+    }
+  }
+  const pairs: [number, number][] = [];
+  for (let i = 0, j = 0; i < n && j < m;) {
+    if (equal(i, j)) pairs.push([i++, j++]);
+    else if (lengths[(i + 1) * width + j] >= lengths[i * width + j + 1]) i++;
+    else j++;
+  }
+  return pairs;
+}
+
+// isEditableTarget tells whether a key at target, or else at the focused
+// element, types into document d: a text field, focused editable content, or
+// a document in design mode. The bridge's own shortcuts leave such keys
+// alone. The document editor's body types only while it has the caret, as in
+// Google Docs: after Esc blurs it, the shortcuts work again.
+export function isEditableTarget(d: Document, target: EventTarget | null): boolean {
+  if (d.designMode.toLowerCase() === "on") return true;
+  const node = (target ?? d.activeElement) as Node | null;
+  const el = node?.nodeType === 1 ? (node as Element) : node?.parentElement;
+  const editable = el?.closest?.(
+    "input,textarea,select,[contenteditable],[role='textbox']",
+  );
+  if (!editable) return false;
+  if (editable.hasAttribute("contenteditable"))
+    return (
+      editable.getAttribute("contenteditable")?.toLowerCase() !== "false" &&
+      editable.matches(":focus-within")
+    );
+  if (editable.localName !== "input") return true;
+  const type = (editable.getAttribute("type") || "text").toLowerCase();
+  return !/^(button|checkbox|radio|submit|reset|file|image|color|range|hidden)$/.test(
+    type,
+  );
+}
+
+// caretRange gives a collapsed range at the text position nearest a point in
+// the viewport, or null where the browser finds none.
+export function caretRange(d: Document, x: number, y: number): Range | null {
+  if (!d.caretPositionFromPoint) return d.caretRangeFromPoint?.(x, y) ?? null;
+  const position = d.caretPositionFromPoint(x, y);
+  if (!position) return null;
+  const range = d.createRange();
+  range.setStart(position.offsetNode, position.offset);
+  return range;
+}
+
+// reducedMotion tells whether the reader of document d asks for less motion.
+export function reducedMotion(d: Document | null | undefined): boolean {
+  return !!d?.defaultView?.matchMedia("(prefers-reduced-motion: reduce)").matches;
+}
+
+// scrollBehavior gives a smooth scroll, or an instant one for a reader who
+// asks for less motion.
+export function scrollBehavior(d: Document | null | undefined): ScrollBehavior {
+  return reducedMotion(d) ? "instant" : "smooth";
+}
+
+// blockOf gives the nearest ancestor laid out as a block, such as a paragraph
+// or list item.
+export function blockOf(node: Node): Element | null {
+  let element =
+    node.nodeType === Node.ELEMENT_NODE ? (node as Element) : node.parentElement;
+  const view = node.ownerDocument?.defaultView;
+  while (element && view) {
+    if (!view.getComputedStyle(element).display.startsWith("inline")) return element;
+    element = element.parentElement;
+  }
+  return element;
+}
+
+// markSurface sets data-slashdocs-surface on the document element to "dark"
+// or "light", from the background that the document shows behind its text:
+// the background of the body, else of the html element, else white. The
+// bridge's controls in the document take their colors from it.
+export function markSurface(d: Document) {
+  const [r, g, b] = paperOf(d);
+  // The brightness of the color, from 0 to 255, with the sRGB weights.
+  const surface = 0.2126 * r + 0.7152 * g + 0.0722 * b < 128 ? "dark" : "light";
+  if (d.documentElement.getAttribute("data-slashdocs-surface") !== surface)
+    d.documentElement.setAttribute("data-slashdocs-surface", surface);
+}
+
+// paperOf gives the color of the page behind the document, as [r, g, b].
+function paperOf(d: Document): number[] {
+  const view = d.defaultView;
+  return (
+    [d.body, d.documentElement]
+      .map((el) => (el && view?.getComputedStyle(el).backgroundColor) || "")
+      .map((color) =>
+        /^rgba?\(/.test(color) ? color.match(/[\d.]+/g)!.map(Number) : [],
+      )
+      // A transparent background shows the one behind it.
+      .find((rgba) => rgba.length >= 3 && rgba[3] !== 0) ?? [255, 255, 255]
+  );
+}
+
+// The room that a control keeps clear of text on each side, and the distance
+// between the points at which coversText looks for text.
+const CLEAR_MARGIN = 4;
+const CLEAR_STEP = 10;
+
+// placeClear puts el, fixed in the viewport, at the first place where it
+// covers none of lines and no text of d, with a margin of CLEAR_MARGIN around
+// it. It tries places, as [left, top], then the sides of lines. When each
+// place covers text, el stays near lines: at the first place that covers
+// none of them, over other text. With overText, a place only has to keep
+// clear of lines. With dock, el also tries the bottom and the top of the
+// viewport, and docks there when each place covers text. When el sits at an
+// edge of the viewport, placeClear gives that edge.
+export function placeClear(
+  d: Document,
+  el: HTMLElement,
+  lines: DOMRect[],
+  places: number[][],
+  { dock = false, overText = false } = {},
+): "bottom" | "top" | null {
+  const { width: viewWidth, height: viewHeight } = viewOf(d, true);
+  const { offsetWidth: width, offsetHeight: height } = el;
+  const span = lines.reduce(union, lines[0] ?? new DOMRect());
+  const first = lines[0] ?? span;
+  const beside = first.top + (first.height - height) / 2;
+  const center = (viewWidth - width) / 2;
+  const at = ([left, top]: number[]) =>
+    DOMRect.fromRect({
+      x: Math.max(8, Math.min(left, viewWidth - width - 8)),
+      y: Math.max(8, Math.min(top, viewHeight - height - 8)),
+      width,
+      height,
+    });
+  const near = [
+    ...places,
+    [span.right + CLEAR_MARGIN * 2, beside],
+    [span.left - CLEAR_MARGIN * 2 - width, beside],
+  ].map(at);
+  const edges = dock ? [at([center, viewHeight]), at([center, 0])] : [];
+  const coversLines = (box: DOMRect) => lines.some((line) => overlap(box, line));
+  // The hit test for text must not find el, so el waits out of the viewport.
+  // It keeps its layout there, and so the focus of a field in it.
+  el.style.setProperty("left", `${-width - viewWidth}px`, "important");
+  const fallbacks = dock ? edges : near;
+  const place =
+    [...near, ...edges].find((box) => {
+      const room = grow(box, CLEAR_MARGIN);
+      return !coversLines(room) && (overText || !coversText(d, room));
+    }) ??
+    fallbacks.find((box) => !coversLines(box)) ??
+    fallbacks[0];
+  el.style.setProperty("left", `${place.left}px`, "important");
+  el.style.setProperty("top", `${place.top}px`, "important");
+  return place === edges[0] ? "bottom" : place === edges[1] ? "top" : null;
+}
+
+export function union(a: DOMRect, b: DOMRect): DOMRect {
+  const [left, top] = [Math.min(a.left, b.left), Math.min(a.top, b.top)];
+  return new DOMRect(
+    left,
+    top,
+    Math.max(a.right, b.right) - left,
+    Math.max(a.bottom, b.bottom) - top,
+  );
+}
+
+function grow(box: DOMRect, by: number): DOMRect {
+  return new DOMRect(box.x - by, box.y - by, box.width + by * 2, box.height + by * 2);
+}
+
+export function overlap(a: DOMRect, b: DOMRect): boolean {
+  return a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom;
+}
+
+// coversText tells whether box, in the viewport, covers text of document d.
+function coversText(d: Document, box: DOMRect): boolean {
+  return textLines(d, box).length > 0;
+}
+
+// textLines gives the boxes of the lines of text of document d that overlap
+// box, in the viewport. It finds the text near points on a grid of
+// CLEAR_STEP, edges included, which finds every line of text and every word
+// that is taller and wider than the step.
+export function textLines(d: Document, box: DOMRect): DOMRect[] {
+  const nodes = new Set<Node>();
+  for (const y of steps(box.top, box.bottom))
+    for (const x of steps(box.left, box.right)) {
+      const node = caretRange(d, x, y)?.startContainer;
+      if (node?.nodeType === Node.TEXT_NODE && node.textContent!.trim())
+        nodes.add(node);
+    }
+  const words = d.createRange();
+  return Array.from(nodes).flatMap((node) => {
+    words.selectNodeContents(node);
+    return Array.from(words.getClientRects()).filter((line) => overlap(box, line));
+  });
+}
+
+// scrollerOf gives the nearest ancestor of an element that scrolls, or else
+// the document's scrolling element. Many documents scroll an inner element.
+// With vertical, only an ancestor that scrolls up and down counts.
+export function scrollerOf(el: Element, vertical = false): Element {
+  const d = el.ownerDocument;
+  const root = d.scrollingElement ?? d.documentElement;
+  for (let node = el.parentElement; node && node !== root; node = node.parentElement) {
+    const style = d.defaultView?.getComputedStyle(node);
+    const scrolls = (overflow = "") => /auto|scroll|overlay/.test(overflow);
+    if (
+      (scrolls(style?.overflowY) && node.scrollHeight > node.clientHeight) ||
+      (!vertical && scrolls(style?.overflowX) && node.scrollWidth > node.clientWidth)
+    )
+      return node;
+  }
+  return root;
+}
+
+// viewOf gives the viewport of document d without its scroll bars, and,
+// when clear, without the bottom that the app covers, as a comment sheet does.
+export function viewOf(d: Document, clear = false): DOMRect {
+  const { clientWidth, clientHeight } = d.scrollingElement ?? d.documentElement;
+  return new DOMRect(0, 0, clientWidth, clientHeight - (clear ? covered(d) : 0));
+}
+
+// covered gives how much of the bottom of the viewport of d the app covers.
+export function covered(d: Document): number {
+  return Number(d.getElementById(COVER)?.dataset.px) || 0;
+}
+
+const COVER = "slashdocs-cover";
+const SLIDE = "slashdocs-slide";
+
+// cover tells document d that the app covers the bottom px of its viewport,
+// or none for 0. Its scroll padding then centers what comes into view above
+// that part, and as much room after the page lets the end of the page come
+// up above it. While a sheet stays open, the room keeps all of it that the
+// view shows, so that the words above a sheet that shrinks stay still.
+export function cover(d: Document, px: number) {
+  const root = d.scrollingElement ?? d.documentElement;
+  const room =
+    covered(d) && parseFloat(d.defaultView!.getComputedStyle(root).paddingBottom);
+  // The last scroll position in the page itself.
+  const end = root.scrollHeight - room - root.clientHeight;
+  makeRoom(
+    d,
+    COVER,
+    px,
+    `html{scroll-padding-bottom:${px}px!important;padding-bottom:${Math.max(px, root.scrollTop - end)}px!important}`,
+    { top: Math.min(root.scrollTop, end) },
+  );
+}
+
+// slide moves the content of document d px to the left, from under a panel,
+// or back for 0. It scrolls into room after the right edge of the page, so
+// that the scroll bar stays at the edge of the viewport.
+export function slide(d: Document, px: number) {
+  makeRoom(
+    d,
+    SLIDE,
+    px,
+    `html{overflow-x:hidden!important}html::after{content:""!important;position:absolute!important;top:0!important;left:0!important;width:calc(100% + ${px}px)!important;height:1px!important;pointer-events:none!important}`,
+    { left: 0 },
+  );
+  if (px > 0) d.defaultView!.scrollTo({ left: px, behavior: scrollBehavior(d) });
+}
+
+// makeRoom keeps px of room in document d, with the style id and its css, or
+// none for 0. Room that goes stays until the view scrolls to back, so that
+// the page does not jump.
+function makeRoom(
+  d: Document,
+  id: string,
+  px: number,
+  css: string,
+  back: ScrollToOptions,
+) {
+  const last = d.getElementById(id);
+  last?.removeAttribute("id");
+  if (px > 0) {
+    last?.remove();
+    const style = d.createElement("style");
+    style.id = id;
+    style.dataset.px = String(px);
+    style.setAttribute("data-slashdocs-injected", "");
+    style.textContent = css;
+    d.head.appendChild(style);
+  } else if (last) {
+    const view = d.defaultView!;
+    view.scrollTo({ ...back, behavior: scrollBehavior(d) });
+    settled(view, () => last.remove());
+  }
+}
+
+// settled calls fn once the view stops scrolling, as at the end of a smooth
+// scroll.
+export function settled(view: Window, fn: () => void) {
+  let last = "";
+  let still = 0;
+  const check = () => {
+    const at = `${view.scrollX} ${view.scrollY}`;
+    still = at === last ? still + 1 : 0;
+    last = at;
+    if (still < 2) requestAnimationFrame(check);
+    else fn();
+  };
+  requestAnimationFrame(check);
+}
+
+// holds tells whether box a holds all of box b.
+export function holds(a: DOMRect, b: DOMRect): boolean {
+  return (
+    b.left >= a.left && b.right <= a.right && b.top >= a.top && b.bottom <= a.bottom
+  );
+}
+
+// steps gives points from start to end, end included, at most CLEAR_STEP apart.
+function steps(start: number, end: number): number[] {
+  const count = Math.max(1, Math.ceil((end - start) / CLEAR_STEP));
+  return Array.from(
+    { length: count + 1 },
+    (_, i) => start + ((end - start) * i) / count,
+  );
+}

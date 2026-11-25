@@ -1,11 +1,11 @@
 import { NotificationToggle } from "@/components/notification-toggle";
-import { Page, PageHeader } from "@/components/layout/page";
+import { Page, PageHeader, SettingsNav } from "@/components/layout/page";
 import { beat } from "@/lib/enter";
 import { useTitle } from "@/lib/use-title";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { GitBranch, LogOut, Monitor, Moon, Sun } from "lucide-react";
-import { Avatar, Center, Skeleton } from "@/components/ui/misc";
+import { Avatar, Center, RetryButton, Skeleton } from "@/components/ui/misc";
 import { Button } from "@/components/ui/button";
 import {
   Card,
@@ -15,9 +15,10 @@ import {
   CardTitle,
 } from "@/components/ui/card";
 import { useMe } from "@/lib/hooks";
+import { principalColor } from "@/lib/principals";
 import { useTheme } from "@/lib/theme";
 import { useSignOut } from "@/lib/auth-state";
-import { api } from "@/api";
+import { api, type GitHubStatus } from "@/api";
 import { errorMessage } from "@/lib/errors";
 
 export function ProfilePage() {
@@ -31,12 +32,18 @@ export function ProfilePage() {
     queryKey: ["github-connection"],
     queryFn: api.githubStatus,
     retry: false,
+    // The card shows the failure, with Retry.
+    meta: { suppressGlobalError: true },
   });
   const disconnectGitHub = useMutation({
     mutationFn: api.githubDisconnect,
     onSuccess: () => {
+      // The account that went, from the status before it loads again.
+      const login = qc.getQueryData<GitHubStatus>(["github-connection"])?.login;
       qc.invalidateQueries({ queryKey: ["github-connection"] });
-      toast.success("GitHub disconnected.");
+      toast.success(
+        login ? `Disconnected GitHub account ${login}.` : "GitHub disconnected.",
+      );
     },
     onError: (e) => toast.error(errorMessage(e, "Could not disconnect GitHub")),
   });
@@ -54,24 +61,33 @@ export function ProfilePage() {
   }
   return (
     <Page lane="focus">
+      <SettingsNav />
       <PageHeader
         title="Profile"
         description="How you appear, and how slashdocs works for you."
       />
       <div className="enter space-y-4" style={beat(2)}>
-        <Card className="flex flex-wrap items-center gap-4 p-5">
-          <Avatar size={56} src={user.picture_url} name={user.name || user.email} />
-          <div className="min-w-0 flex-1">
-            <div className="font-heading text-lg font-medium">
-              {user.name || "Signed-in user"}
-            </div>
-            <div className="truncate text-sm text-[var(--color-fg-muted)]">
-              {user.email || user.id}
+        {/* Narrow screens put Sign out under the identity. */}
+        <Card className="flex flex-col items-start gap-4 p-5 sm:flex-row sm:items-center">
+          <div className="flex min-w-0 flex-1 items-center gap-4">
+            <Avatar
+              size={56}
+              src={user.picture_url}
+              name={user.name || user.email}
+              color={me.data && principalColor(me.data.principal)}
+            />
+            <div className="min-w-0">
+              <div className="font-heading text-lg font-medium">
+                {user.name || "Signed-in user"}
+              </div>
+              <div className="break-all text-sm text-[var(--color-fg-muted)]">
+                {user.email || user.id}
+              </div>
             </div>
           </div>
           <Button
             variant="outline"
-            disabled={signOut.isPending}
+            busy={signOut.isPending}
             onClick={() => signOut.mutate()}
           >
             <LogOut className="h-4 w-4" /> Sign out
@@ -122,17 +138,21 @@ export function ProfilePage() {
             <div className="min-w-0 text-sm">
               {github.isLoading
                 ? "Checking connection…"
-                : github.data?.connected
-                  ? `Connected as ${github.data.login}`
-                  : github.data?.configured === false
-                    ? "Not configured for this deployment"
-                    : "Not connected"}
+                : github.error
+                  ? `Could not check the connection. ${errorMessage(github.error)}`
+                  : github.data?.connected
+                    ? `Connected as ${github.data.login}`
+                    : github.data?.configured === false
+                      ? "Not configured for this deployment"
+                      : "Not connected"}
             </div>
-            {github.data?.connected ? (
+            {github.error ? (
+              <RetryButton query={github} variant="outline" />
+            ) : github.data?.connected ? (
               <Button
                 variant="outline"
                 onClick={() => disconnectGitHub.mutate()}
-                disabled={disconnectGitHub.isPending}
+                busy={disconnectGitHub.isPending}
               >
                 Disconnect
               </Button>
@@ -140,11 +160,7 @@ export function ProfilePage() {
               <Button
                 variant="outline"
                 onClick={() => window.location.assign(api.githubConnectURL())}
-                disabled={
-                  github.isLoading ||
-                  !!github.error ||
-                  github.data?.configured === false
-                }
+                disabled={github.isLoading || github.data?.configured === false}
               >
                 Connect GitHub
               </Button>

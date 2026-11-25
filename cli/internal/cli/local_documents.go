@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
 	"net/http"
@@ -11,10 +12,12 @@ import (
 	"os"
 	"path"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
 	docrender "github.com/razorpay/slashdocs/internal/render"
+	"github.com/razorpay/slashdocs/internal/textedit"
 )
 
 // Local documents are the HTML files of the documents folder. The ID of a
@@ -45,6 +48,7 @@ func (s *localDocs) registerDocuments(mux *http.ServeMux) {
 	mux.HandleFunc("PATCH "+doc, s.handle(s.rename))
 	mux.HandleFunc("DELETE "+doc, s.handle(s.deleteDocument))
 	mux.HandleFunc("POST "+doc+"/versions", s.handle(s.push))
+	mux.HandleFunc("POST "+doc+"/edits", s.handle(s.edit))
 	mux.HandleFunc("GET "+doc+"/versions/{version}/html", s.html)
 	mux.HandleFunc("GET "+doc+"/headings", s.handle(s.headings))
 	mux.HandleFunc("GET "+doc+"/link", s.handle(s.link))
@@ -66,12 +70,17 @@ func (s *localDocs) document(doc string) (localDocument, error) {
 	return localDocument{ID: doc, Title: docTitle(s.root.FS(), doc), Owner: s.me, CurrentVersionID: localVersion(b), ParentFolderID: parent, UpdatedAt: st.ModTime().UTC()}, err
 }
 
-// listDocuments returns the documents with the most recent change first. A query
-// keeps the documents that have each of its words in the title or the path.
+// listDocuments returns a page of the documents with the most recent change
+// first, as the server does. A query keeps the documents that have each of its
+// words in the title or the path.
 func (s *localDocs) listDocuments(r *http.Request) (any, error) {
+	limit, offset, err := localPage(r.URL.Query())
+	if err != nil {
+		return nil, err
+	}
 	words := strings.Fields(strings.ToLower(r.URL.Query().Get("q")))
 	items := []localDocument{}
-	err := fs.WalkDir(s.root.FS(), ".", func(p string, de fs.DirEntry, err error) error {
+	err = fs.WalkDir(s.root.FS(), ".", func(p string, de fs.DirEntry, err error) error {
 		switch {
 		case err != nil:
 			return err
@@ -92,8 +101,27 @@ func (s *localDocs) listDocuments(r *http.Request) (any, error) {
 		}
 		return nil
 	})
-	slices.SortFunc(items, func(a, b localDocument) int { return b.UpdatedAt.Compare(a.UpdatedAt) })
-	return map[string][]localDocument{"items": items}, err
+	// The sort is stable, so that the pages do not overlap.
+	slices.SortStableFunc(items, func(a, b localDocument) int { return b.UpdatedAt.Compare(a.UpdatedAt) })
+	end := min(offset+limit, len(items))
+	return map[string]any{"items": items[min(offset, end):end], "has_more": end < len(items)}, err
+}
+
+// localPage reads the limit and offset parameters with the defaults and the
+// maximum of the server.
+func localPage(q url.Values) (limit, offset int, err error) {
+	limit, offset = 25, 0
+	if raw := q.Get("limit"); raw != "" {
+		if limit, err = strconv.Atoi(raw); err != nil || limit < 1 {
+			return 0, 0, localError{http.StatusBadRequest, "limit must be a positive integer"}
+		}
+	}
+	if raw := q.Get("offset"); raw != "" {
+		if offset, err = strconv.Atoi(raw); err != nil || offset < 0 {
+			return 0, 0, localError{http.StatusBadRequest, "offset must be zero or a positive integer"}
+		}
+	}
+	return min(limit, 100), offset, nil
 }
 
 // createDocument writes the file in the documents folder with the name of the
@@ -104,11 +132,19 @@ func (s *localDocs) createDocument(r *http.Request) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	doc := path.Base(cleanLocal(name))
-	if !isHTML(doc) || strings.HasPrefix(doc, ".") {
+	file := path.Base(cleanLocal(name))
+	if !isHTML(file) || strings.HasPrefix(file, ".") {
 		return nil, localError{http.StatusBadRequest, "the file name must end in .html"}
 	}
+	// A folder ID is the path of the folder.
+	doc := path.Join(cleanLocal(r.FormValue("folder_id")), file)
+	if isHidden(doc) {
+		return nil, localError{http.StatusBadRequest, "a folder that starts with a dot is hidden, so it cannot keep documents"}
+	}
 	if err := s.free(doc); err != nil {
+		return nil, err
+	}
+	if err := s.root.MkdirAll(path.Dir(doc), configDirPerm); err != nil {
 		return nil, err
 	}
 	f, err := s.root.OpenFile(doc, os.O_WRONLY|os.O_CREATE|os.O_EXCL, pulledFilePerm)
@@ -160,6 +196,45 @@ func (s *localDocs) push(r *http.Request, doc string) (any, error) {
 	}
 	sum := sha256.Sum256(b)
 	return map[string]string{"id": localVersion(b), "sha256": hex.EncodeToString(sum[:])}, s.write(doc, b)
+}
+
+// edit replaces exact text in the document, as the server does. Without a
+// base version the edits apply to the current content.
+func (s *localDocs) edit(r *http.Request, doc string) (any, error) {
+	var in struct {
+		BaseVersionID string          `json:"base_version_id"`
+		ChangeSummary string          `json:"change_summary"`
+		Edits         []textedit.Edit `json:"edits"`
+	}
+	if err := decodeLocal(r, &in); err != nil {
+		return nil, err
+	}
+	if len(in.Edits) == 0 || len(in.Edits) > textedit.MaxEdits {
+		return nil, localError{http.StatusBadRequest, fmt.Sprintf("pass between 1 and %d edits", textedit.MaxEdits)}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	current, err := s.root.ReadFile(doc)
+	if err != nil {
+		return nil, err
+	}
+	base := localVersion(current)
+	if in.BaseVersionID != "" && in.BaseVersionID != base {
+		return nil, localError{http.StatusConflict, "base_version_id is stale: the current version is " + base}
+	}
+	b, err := textedit.Apply(current, in.Edits)
+	var editErr *textedit.Error
+	if errors.As(err, &editErr) {
+		return nil, localError{http.StatusUnprocessableEntity, editErr.Error()}
+	}
+	if err != nil {
+		return nil, err
+	}
+	if len(b) > localMaxHTML {
+		return nil, localError{http.StatusRequestEntityTooLarge, "edited HTML exceeds 50 MiB"}
+	}
+	sum := sha256.Sum256(b)
+	return map[string]any{"id": localVersion(b), "sha256": hex.EncodeToString(sum[:]), "base_version_id": base, "edits_applied": len(in.Edits)}, s.write(doc, b)
 }
 
 // html sends the document as a download, as the server does, because it is

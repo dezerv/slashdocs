@@ -1,15 +1,24 @@
 package cli
 
 import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/url"
 	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
+	"unicode"
 
 	"github.com/spf13/cobra"
+
+	"github.com/razorpay/slashdocs/internal/textedit"
 )
 
 // defaultDocPermissionEnv is the CLI-side per-user override for the sharing
@@ -27,16 +36,23 @@ func docsCmd(g *globals, out io.Writer) *cobra.Command {
 		documentHeadingsCmd(g, out),
 		documentLinkCmd(g, out),
 		documentCreateCmd(g, out),
-		simplePath(g, out, "show", "GET", "/v1/documents/%s"),
+		simplePath(g, out, "show <doc_id>", "GET", "/v1/documents/%s"),
 		documentUpdateCmd(g, out),
 		del,
 		documentMoveCmd(g, out),
 		pullCmd(g, out),
 		docsPushCmd(g, out),
+		docsEditCmd(g, out),
 		versionsCmd(g, out),
 		commentsCmd(g, out),
+		waitCmd(g, out),
 		documentLabelsCmd(g, out),
 		grantsCmd(g, out),
+		approversCmd(g, out),
+		approvalsCmd(g, out),
+		decisionCmd(g, out, "approve", "Approve a document version", "approved", "Approved"),
+		decisionCmd(g, out, "reject", "Reject a document version", "rejected", "Rejected"),
+		revokeApprovalCmd(g, out),
 	)
 	return c
 }
@@ -45,7 +61,7 @@ func documentRequestAccessCmd(g *globals, out io.Writer) *cobra.Command {
 	return &cobra.Command{
 		Use:   "request-access <doc_id>",
 		Short: "Ask the document owner for access",
-		Args:  exactArgs(1),
+		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return action(g, out, func(c *Client) ([]byte, error) {
 				return c.doJSON("POST", apiPath("/v1/documents/%s/access-requests", args[0]), map[string]any{})
@@ -56,14 +72,16 @@ func documentRequestAccessCmd(g *globals, out io.Writer) *cobra.Command {
 
 func documentListCmd(g *globals, out io.Writer) *cobra.Command {
 	var query string
+	var limit, offset int
 	cmd := &cobra.Command{
 		Use:   "list [query]",
 		Short: "List or search documents",
 		Long: "List documents, or search with the same Slack-style language as the web application.\n\n" +
-			"Every word must appear in the title or the text. The most relevant documents come first.\n" +
+			"Every word must appear in the title or the text. Documents with the words in the title come first, then the latest.\n" +
 			"Modifiers narrow the results:\n" +
 			"  \"exact phrase\"       Match the words together\n" +
 			"  -word                Exclude documents that contain the word\n" +
+			"  title:<word>         Match the word in the title only (title:\"a phrase\" for a phrase)\n" +
 			"  from:<person>        The owner: an email, the name before the @, or me\n" +
 			"  in:<folder>          A folder, or any folder above the document\n" +
 			"  label:<a,b>          Require every label\n" +
@@ -74,8 +92,12 @@ func documentListCmd(g *globals, out io.Writer) *cobra.Command {
 			"a month, or a year (last week, september, this year, 2026), or last 7 days.\n" +
 			"Dates use UTC. Repeat from: or in: to match any value.\n" +
 			"Quote the whole query when it contains spaces.\n\n" +
+			"Search reads the first 256 KiB of the text of a document (about 40,000 words).\n" +
+			"An exact phrase matches in the first 16,383 words only.\n\n" +
+			"A list shows 25 documents. Use --limit for up to 100, and --offset to see the next documents.\n\n" +
 			"With --local, the query finds each word in the title or the path of a document, and modifiers are not available.",
 		Example: "  slashdocs docs list 'incident from:alice@example.com label:api,review in:\"Product Specs\"'\n" +
+			"  slashdocs docs list 'title:\"rollout plan\"'\n" +
 			"  slashdocs docs list --query 'rollout -draft from:me after:last week'",
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -85,24 +107,57 @@ func documentListCmd(g *globals, out io.Writer) *cobra.Command {
 			if len(args) == 1 {
 				query = args[0]
 			}
-			path := "/v1/documents"
+			params := url.Values{}
 			if strings.TrimSpace(query) != "" {
-				params := url.Values{"q": []string{query}}
+				params.Set("q", query)
+			}
+			if limit > 0 {
+				params.Set("limit", strconv.Itoa(limit))
+			}
+			if offset > 0 {
+				params.Set("offset", strconv.Itoa(offset))
+			}
+			path := "/v1/documents"
+			if len(params) > 0 {
 				path += "?" + params.Encode()
 			}
-			return run(g, out, func(c *Client) ([]byte, error) {
-				return c.do("GET", path, nil, "")
-			})
+			c, err := client(g)
+			if err != nil {
+				return err
+			}
+			b, err := c.do("GET", path, nil, "")
+			if err != nil {
+				return err
+			}
+			if err := render(out, g, b); err != nil {
+				return err
+			}
+			return renderMoreDocuments(out, g, b, offset)
 		},
 	}
 	cmd.Flags().StringVar(&query, "query", "", "search query")
+	cmd.Flags().IntVar(&limit, "limit", 0, "the number of documents to show, up to 100 (default 25)")
+	cmd.Flags().IntVar(&offset, "offset", 0, "the number of documents to skip")
 	return cmd
+}
+
+// renderMoreDocuments tells a person how to see the next page of a list. JSON
+// output has has_more instead.
+func renderMoreDocuments(out io.Writer, g *globals, b []byte, offset int) error {
+	var page struct {
+		Items   []json.RawMessage `json:"items"`
+		HasMore bool              `json:"has_more"`
+	}
+	if g.json || json.Unmarshal(b, &page) != nil || !page.HasMore {
+		return nil
+	}
+	return message(out, g, fmt.Sprintf("More documents follow. Use --offset %d to see them.", offset+len(page.Items)))
 }
 
 func documentLabelsCmd(g *globals, out io.Writer) *cobra.Command {
 	root := &cobra.Command{Use: "labels", Short: "Manage document labels"}
 	root.AddCommand(
-		simplePath(g, out, "list", "GET", "/v1/documents/%s/labels"),
+		simplePath(g, out, "list <doc_id>", "GET", "/v1/documents/%s/labels"),
 		documentLabelsSetCmd(g, out),
 		documentLabelsClearCmd(g, out),
 	)
@@ -133,7 +188,7 @@ func documentLabelsClearCmd(g *globals, out io.Writer) *cobra.Command {
 	return &cobra.Command{
 		Use:   "clear <doc_id>",
 		Short: "Remove every label from a document",
-		Args:  exactArgs(1),
+		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return action(g, out, func(c *Client) ([]byte, error) {
 				return c.doJSON("PUT", apiPath("/v1/documents/%s/labels", args[0]), map[string]any{"labels": []string{}})
@@ -161,8 +216,8 @@ func normalizedLabelArgs(args []string) ([]string, error) {
 }
 
 func documentCreateCmd(g *globals, out io.Writer) *cobra.Command {
-	var title string
-	cmd := &cobra.Command{Use: "create <file>", Short: "Create a document from an HTML file", Long: "Create a document from a single self-contained HTML file.\n\nThe sharing default for new documents is controlled by the server. Set SLASHDOCS_DEFAULT_DOC_PERMISSION to viewer, commenter, editor, or private to override it per-user; private keeps new documents private.\n\nRun 'slashdocs guidelines' for authoring rules (single-file, base64 images, reader theme).", Example: "  slashdocs docs create report.html --title 'Report'", Args: exactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
+	var title, folderID string
+	cmd := &cobra.Command{Use: "create <file>", Short: "Create a document from an HTML file", Long: "Create a document from a single self-contained HTML file.\n\nWith --folder-id, the document is in the folder from the start. Use 'slashdocs docs labels set' to label it.\n\nThe sharing default for new documents is controlled by the server. Set SLASHDOCS_DEFAULT_DOC_PERMISSION to viewer, commenter, editor, or private to override it per-user; private keeps new documents private.\n\nRun 'slashdocs guidelines' for authoring rules (single-file, base64 images, reader theme).", Example: "  slashdocs docs create report.html --title 'Report'\n  slashdocs docs create report.html --title 'Report' --folder-id fld_123", Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
 		perm, err := defaultDocPermission()
 		if err != nil {
 			return err
@@ -178,7 +233,7 @@ func documentCreateCmd(g *globals, out io.Writer) *cobra.Command {
 		if err != nil {
 			return err
 		}
-		fields := map[string]string{"title": title}
+		fields := map[string]string{"title": title, "folder_id": folderID}
 		if perm != "" {
 			fields["default_permission"] = perm
 		}
@@ -193,12 +248,13 @@ func documentCreateCmd(g *globals, out io.Writer) *cobra.Command {
 		if err := json.Unmarshal(b, &created); err != nil {
 			return err
 		}
-		if err := recordBaseVersion(g, created.ID, created.VersionID); err != nil {
+		if err := recordBase(g, args[0], Base{DocumentID: created.ID, VersionID: created.VersionID}); err != nil {
 			return err
 		}
 		return renderCreatedDocument(out, g, cl, title, perm, b)
 	}}
 	cmd.Flags().StringVar(&title, "title", "", "document title (defaults to the file name)")
+	cmd.Flags().StringVar(&folderID, "folder-id", "", "folder for the document (defaults to the root)")
 	return cmd
 }
 
@@ -251,7 +307,12 @@ func renderCreatedDocument(out io.Writer, g *globals, cl *Client, title, request
 	if g.json {
 		return renderCreatedDocumentJSON(out, g, id, requestedPermission, documentURL, role, grantID, payload)
 	}
-	if err := confirm(out, g, fmt.Sprintf("Created document %q (%s). Review it at %s", title, id, documentURL)); err != nil {
+	msg := fmt.Sprintf("Created document %q (%s). Review it at %s", title, id, documentURL)
+	// The URL ends the line, so the warning goes on a line of its own.
+	if w, ok := payload["permission_warning"].(map[string]any); ok {
+		msg += "\nWarning: " + fmt.Sprint(value(w, "message"))
+	}
+	if err := confirm(out, g, msg); err != nil {
 		return err
 	}
 	if grantID != "" {
@@ -294,9 +355,9 @@ func renderCreatedDocumentJSON(out io.Writer, g *globals, id, requestedPermissio
 
 func documentUpdateCmd(g *globals, out io.Writer) *cobra.Command {
 	var ut string
-	cmd := &cobra.Command{Use: "update <doc_id>", Short: "Update document metadata", Long: "Rename a document. Sharing is managed separately with 'slashdocs docs grants'.", Args: exactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
+	cmd := &cobra.Command{Use: "update <doc_id>", Short: "Update document metadata", Long: "Rename a document. Sharing is managed separately with 'slashdocs docs grants'.", Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
 		if !cmd.Flags().Changed("title") {
-			return errors.New("nothing to update; pass --title")
+			return usageError{errors.New("nothing to update; pass --title")}
 		}
 		return action(g, out, func(c *Client) ([]byte, error) {
 			return c.doJSON("PATCH", apiPath("/v1/documents/%s", args[0]), map[string]any{"title": ut})
@@ -314,13 +375,7 @@ func documentUpdateCmd(g *globals, out io.Writer) *cobra.Command {
 func documentMoveCmd(g *globals, out io.Writer) *cobra.Command {
 	var moveFolderID string
 	var moveRoot bool
-	cmd := &cobra.Command{Use: "move <doc_id>", Short: "Move a document to a folder or back to root", Args: exactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
-		if moveRoot && moveFolderID != "" {
-			return errors.New("--folder-id and --root are mutually exclusive")
-		}
-		if !moveRoot && moveFolderID == "" {
-			return errors.New("pass --folder-id <fld_…> or --root")
-		}
+	cmd := &cobra.Command{Use: "move <doc_id>", Short: "Move a document to a folder or back to root", Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
 		if moveRoot {
 			cl, err := client(g)
 			if err != nil {
@@ -354,6 +409,8 @@ func documentMoveCmd(g *globals, out io.Writer) *cobra.Command {
 	}}
 	cmd.Flags().StringVar(&moveFolderID, "folder-id", "", "destination folder ID")
 	cmd.Flags().BoolVar(&moveRoot, "root", false, "move document to workspace root")
+	cmd.MarkFlagsOneRequired("folder-id", "root")
+	cmd.MarkFlagsMutuallyExclusive("folder-id", "root")
 	return cmd
 }
 
@@ -372,7 +429,7 @@ func grantsCmd(g *globals, out io.Writer) *cobra.Command {
 			"  slashdocs docs grants add doc_… --to report-creator@brave.otter.bot --role editor\n" +
 			"  slashdocs docs grants add doc_… --group tech-infra@org.example --role commenter\n" +
 			"  slashdocs docs grants add doc_… --everyone --role viewer",
-		Args: exactArgs(1),
+		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			body := map[string]any{"role": role}
 			var target string
@@ -414,23 +471,25 @@ func grantsCmd(g *globals, out io.Writer) *cobra.Command {
 	add.Flags().StringVar(&principal, "principal", "", "legacy: sa:<id> or user:<email>")
 	add.Flags().StringVar(&role, "role", "viewer", "viewer, commenter, or editor")
 	var r string
-	upd := &cobra.Command{Use: "update <doc_id> <grant_id>", Short: "Update a grant role", Args: exactArgs(2), RunE: func(cmd *cobra.Command, args []string) error {
+	upd := &cobra.Command{Use: "update <doc_id> <grant_id>", Short: "Update a grant role", Args: cobra.ExactArgs(2), RunE: func(cmd *cobra.Command, args []string) error {
 		return action(g, out, func(c *Client) ([]byte, error) {
 			return c.doJSON("PATCH", apiPath("/v1/documents/%s/grants/%s", args[0], args[1]), map[string]any{"role": r})
 		}, func(map[string]any) string { return "Changed grant " + args[1] + " on " + args[0] + " to " + r + "." })
 	}}
-	upd.Flags().StringVar(&r, "role", "viewer", "new grant role: viewer, commenter, or editor")
+	upd.Flags().StringVar(&r, "role", "", "new grant role: viewer, commenter, or editor")
+	_ = upd.MarkFlagRequired("role")
 	revoke := mutate(g, out, "revoke <doc_id> <grant_id>", "Revoke a document grant", "DELETE", "/v1/documents/%s/grants/%s", 2, func(a []string) string { return "Revoked grant " + a[1] + " on " + a[0] + "." })
-	list := simplePath(g, out, "list", "GET", "/v1/documents/%s/access")
+	list := simplePath(g, out, "list <doc_id>", "GET", "/v1/documents/%s/access")
 	list.Short = "List effective document access"
-	c.AddCommand(list, add, upd, revoke)
+	requests := simplePath(g, out, "requests <doc_id>", "GET", "/v1/documents/%s/access-requests")
+	requests.Short = "List requests for access to a document"
+	c.AddCommand(list, requests, add, upd, revoke)
 	return c
 }
 
 func versionsCmd(g *globals, out io.Writer) *cobra.Command {
 	c := &cobra.Command{Use: "versions", Short: "Inspect document versions"}
-	list := simplePath(g, out, "list", "GET", "/v1/documents/%s/versions")
-	list.Use = "list <doc_id>"
+	list := simplePath(g, out, "list <doc_id>", "GET", "/v1/documents/%s/versions")
 	c.AddCommand(
 		list,
 		docVersionCmd(g, out, "show", "GET", "/v1/documents/%s/versions/%s"),
@@ -442,7 +501,7 @@ func versionsCmd(g *globals, out io.Writer) *cobra.Command {
 // docVersionCmd builds a versions subcommand scoped to a document, taking
 // <doc_id> <version_id> and filling a path template with two %s segments.
 func docVersionCmd(g *globals, out io.Writer, use, method, tmpl string) *cobra.Command {
-	return &cobra.Command{Use: use + " <doc_id> <version_id>", Short: shortFor(use), Args: exactArgs(2), RunE: func(cmd *cobra.Command, args []string) error {
+	return &cobra.Command{Use: use + " <doc_id> <version_id>", Short: shortFor(use), Args: cobra.ExactArgs(2), RunE: func(cmd *cobra.Command, args []string) error {
 		return run(g, out, func(c *Client) ([]byte, error) {
 			return c.do(method, apiPath(tmpl, args[0], args[1]), nil, "")
 		})
@@ -451,7 +510,7 @@ func docVersionCmd(g *globals, out io.Writer, use, method, tmpl string) *cobra.C
 
 func pullCmd(g *globals, out io.Writer) *cobra.Command {
 	var ver, outp string
-	cmd := &cobra.Command{Use: "pull <doc_id>", Short: "Download a document HTML version", Example: "  slashdocs docs pull doc_123 --out report.html\n  slashdocs docs pull doc_123 --version ver_123", Args: exactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
+	cmd := &cobra.Command{Use: "pull <doc_id>", Short: "Download a document HTML version", Long: "Download the HTML of a document version, the current one by default.\n\nWith --out, the CLI records the version and the seq of the HTML as the base of that file. A push of the file sends them, so the server keeps the edits that other people make after the pull.", Example: "  slashdocs docs pull doc_123 --out report.html\n  slashdocs docs pull doc_123 --version ver_123", Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
 		cl, err := client(g)
 		if err != nil {
 			return err
@@ -471,33 +530,67 @@ func pullCmd(g *globals, out io.Writer) *cobra.Command {
 				return errors.New("document response did not include current_version_id")
 			}
 		}
-		b, err := cl.do("GET", apiPath("/v1/documents/%s/versions/%s/html", args[0], v), nil, "")
+		b, header, err := cl.doResponse("GET", apiPath("/v1/documents/%s/versions/%s/html", args[0], v), nil, "")
 		if err != nil {
 			return err
 		}
-		if err := recordBaseVersion(g, args[0], v); err != nil {
-			return err
-		}
-		if outp != "" {
-			if err := os.WriteFile(outp, b, pulledFilePerm); err != nil {
+		got := Base{DocumentID: args[0], VersionID: v, Seq: header.Get(seqHeader)}
+		// A base must match what the file holds, so a failed write keeps the
+		// base of the last pull. A pull to stdout is the base of no file.
+		if outp == "" {
+			if g.json {
+				err = render(out, g, b)
+			} else {
+				_, err = out.Write(b)
+			}
+			if err != nil {
 				return err
 			}
-			return confirm(out, g, "Pulled version "+v+" of "+args[0]+" to "+outp+".")
+			err = recordBase(g, "-", got)
+			if err != nil && g.json {
+				// The HTML is already the one JSON value on stdout.
+				return reportedError{err}
+			}
+			return err
 		}
-		_, err = out.Write(b)
-		return err
+		if err := os.WriteFile(outp, b, pulledFilePerm); err != nil {
+			return err
+		}
+		if err := recordBase(g, outp, got); err != nil {
+			return err
+		}
+		return confirm(out, g, "Pulled version "+v+" of "+args[0]+" to "+outp+".")
 	}}
 	cmd.Flags().StringVar(&ver, "version", "", "specific version ID to pull (defaults to the current version)")
 	cmd.Flags().StringVar(&outp, "out", "", "write HTML to this file instead of stdout")
 	return cmd
 }
 
-func recordBaseVersion(g *globals, docID, versionID string) error {
-	if docID == "" || versionID == "" {
+// seqHeader is the response header with the seq of version HTML.
+const seqHeader = "X-Slashdocs-Seq"
+
+// recordBase saves base as the state of its document that file holds, and
+// its version as the one that the person got last. file is "-" for stdin
+// and stdout, which have no base.
+func recordBase(g *globals, file string, base Base) error {
+	if base.DocumentID == "" || base.VersionID == "" {
 		return nil
 	}
-	name, cx, cfg := currentContext(g)
-	cx.Pulled[docID] = versionID
+	name, cx, cfg, err := currentContextE(g)
+	if err != nil {
+		return err
+	}
+	cx.Pulled[base.DocumentID] = base.VersionID
+	if file != "-" {
+		path, err := filepath.Abs(file)
+		if err != nil {
+			return err
+		}
+		if cx.Bases == nil {
+			cx.Bases = map[string]Base{}
+		}
+		cx.Bases[path] = base
+	}
 	cfg.Contexts[name] = cx
 	if cfg.ActiveContext == "" && !g.local {
 		cfg.ActiveContext = name
@@ -505,50 +598,307 @@ func recordBaseVersion(g *globals, docID, versionID string) error {
 	return saveConfig(cfg)
 }
 
+// baseOf returns the base of file when it holds a state of the document, or
+// else no base.
+func baseOf(cx *Context, doc, file string) Base {
+	path, err := filepath.Abs(file)
+	if base := cx.Bases[path]; err == nil && file != "-" && base.DocumentID == doc {
+		return base
+	}
+	return Base{}
+}
+
 func docsPushCmd(g *globals, out io.Writer) *cobra.Command {
 	var base, summary string
-	cmd := &cobra.Command{Use: "push <doc_id> <file>", Short: "Upload a new document version", Example: "  slashdocs docs push doc_123 report.html --base-version ver_123\n  slashdocs docs push doc_123 report.html --summary 'Address comments'", Args: exactArgs(2), RunE: func(cmd *cobra.Command, args []string) error {
+	cmd := &cobra.Command{Use: "push <doc_id> <file>", Short: "Upload a new document version", Long: "Upload a file as a new version of a document. Pull the document with --out first, edit that file, and push it: the push sends the base that the pull recorded.\n\nWhen other people changed other text after the base, the server merges the push with their edits, and the CLI writes the merged version into the file. When they changed the same text, the push is refused and their text stays: pull again, and make the change again. A file that equals the document makes no version.", Example: "  slashdocs docs push doc_123 report.html --base-version ver_123\n  slashdocs docs push doc_123 report.html --summary 'Address comments'", Args: cobra.ExactArgs(2), RunE: func(cmd *cobra.Command, args []string) error {
 		doc, file := args[0], args[1]
 		data, fn, err := readFileArg(file)
 		if err != nil {
 			return err
 		}
-		if base == "" {
-			_, cx, _ := currentContext(g)
-			base = cx.Pulled[doc]
+		// A pull to another file keeps the changes in this one.
+		pullBeside := pullCommand(doc, latestFile(file))
+		fields := map[string]string{"change_summary": summary}
+		_, cx, _ := currentContext(g)
+		held := baseOf(cx, doc, file)
+		named := base != ""
+		if !named {
+			base = held.VersionID
 		}
 		if base == "" {
-			return errors.New("no base version known; run slashdocs docs pull <doc_id> first or pass --base-version")
+			return fmt.Errorf("slashdocs does not know which version of %s this file holds, and a push on a guessed version can remove the text of other people. Run %s, make your change in that file, and push that file", doc, pullBeside)
+		}
+		fields["base_version_id"] = base
+		// The seq of the file is the seq of the HTML of its base version.
+		if base == held.VersionID && held.Seq != "" {
+			fields["base_seq"] = held.Seq
 		}
 		cl, err := client(g)
 		if err != nil {
 			return err
 		}
-		b, err := cl.multipart(apiPath("/v1/documents/%s/versions", doc), map[string]string{"base_version_id": base, "change_summary": summary}, "file", fn, data)
+		b, err := cl.multipart(apiPath("/v1/documents/%s/versions", doc), fields, "file", fn, data)
+		if err != nil {
+			return pushRefusal(err, doc, file, base, named, fields["base_seq"] != "")
+		}
+		var saved pushAnswer
+		if err := json.Unmarshal(b, &saved); err != nil {
+			return err
+		}
+		pushed, err := savedVersion(b)
 		if err != nil {
 			return err
 		}
-		var pushed struct {
-			ID string `json:"id"`
+		// The server saved the push together with the edits of other people,
+		// so the saved version is not the file. The file must be the base of
+		// the next push: else that push takes out their edits.
+		now := data
+		if saved.Rebased {
+			now = writeSavedVersion(cl, doc, saved.ID, file, data)
 		}
-		if err := json.Unmarshal(b, &pushed); err != nil {
-			return err
+		// The answer is the base of the file only when the file is its
+		// content. The answer for a file that changes nothing has the hash
+		// of the file only with a version and a seq that the file holds.
+		if sum := sha256.Sum256(now); now != nil && hex.EncodeToString(sum[:]) == saved.SHA256 {
+			if err := recordBase(g, file, Base{DocumentID: doc, VersionID: saved.ID, Seq: saved.Seq.String()}); err != nil {
+				return err
+			}
 		}
-		if err := recordBaseVersion(g, doc, pushed.ID); err != nil {
-			return err
-		}
-		return printPushedVersion(out, g, doc, cl.Base, b)
+		return printPushedVersion(out, g, doc, cl.Base, pushed, now != nil, pullBeside)
 	}}
-	cmd.Flags().StringVar(&base, "base-version", "", "base version ID")
+	cmd.Flags().StringVar(&base, "base-version", "", "base version ID, in place of the one that the pull recorded (while people edit, the server refuses it)")
 	cmd.Flags().StringVar(&summary, "summary", "", "change summary, one change per line")
 	return cmd
+}
+
+// pushRefusal gives a refused push of file to doc on base the message of the
+// CLI in place of that of the server: it says what is true and names the
+// command to run. A person reads only that message. The code of the error
+// stays in --json and in the exit code, and its details go. named says that
+// the caller named base, and seqSent that the push sent the seq of the file.
+// pushRefusal returns other errors as they are.
+func pushRefusal(err error, doc, file, base string, named, seqSent bool) error {
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		return err
+	}
+	again := fmt.Sprintf(" Run %s to get the document as it is now, then make your change again.", pullCommand(doc, file))
+	text, _ := apiErr.Details["text"].(string)
+	// The text is of a document, and goes to a terminal.
+	text = strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return -1
+		}
+		return r
+	}, text)
+	switch {
+	case apiErr.Code == "version_conflict" && text != "":
+		apiErr.Message = `Other people changed the same text, in "` + text + `", and their text stays.` + again
+	case apiErr.Code == "version_conflict":
+		apiErr.Message = "Other people changed the same text, and their text stays." + again
+	case apiErr.Code == "base_version_not_found":
+		apiErr.Message = base + " is not a version of this document." + again
+	case apiErr.Code == "stale" && !seqSent:
+		// The server does not know which state of the open version the
+		// file holds: the caller named the version, or an older CLI pulled
+		// the file and recorded no seq.
+		push := "push that file"
+		if named {
+			push += " without --base-version"
+		}
+		apiErr.Message = fmt.Sprintf("People are editing this document, and slashdocs does not know which state of it this file holds. Run %s, make your change in that file, and %s.", pullCommand(doc, latestFile(file)), push)
+	case apiErr.Code == "stale":
+		apiErr.Message = "This document changed after your pull." + again
+	default:
+		return err
+	}
+	apiErr.Details = nil
+	return plainError{apiErr}
+}
+
+// pushAnswer is what a push reads of the answer of the server. The output
+// shows all of the answer (savedVersion).
+type pushAnswer struct {
+	ID      string      `json:"id"`
+	Seq     json.Number `json:"seq"`
+	SHA256  string      `json:"sha256"`
+	Rebased bool        `json:"rebased"`
+}
+
+// savedVersion reads the answer of a write that saves a version. A number
+// stays as the server wrote it.
+func savedVersion(b []byte) (map[string]any, error) {
+	var m map[string]any
+	d := json.NewDecoder(bytes.NewReader(b))
+	d.UseNumber()
+	return m, d.Decode(&m)
+}
+
+// pullCommand is the command that writes the document as it is now to the
+// file of a push.
+func pullCommand(doc, file string) string {
+	if file == "-" {
+		file = "<file>"
+	} else if strings.ContainsFunc(file, func(r rune) bool {
+		return !unicode.IsLetter(r) && !unicode.IsDigit(r) && !strings.ContainsRune("/._-+:@%,=~", r)
+	}) {
+		// A shell splits or expands the path without quotes.
+		file = "'" + strings.ReplaceAll(file, "'", `'\''`) + "'"
+	}
+	return fmt.Sprintf("slashdocs docs pull %s --out %s", doc, file)
+}
+
+// plainError is an API error that a person reads as its message only.
+type plainError struct{ *APIError }
+
+func (e plainError) Error() string { return e.Message }
+func (e plainError) Unwrap() error { return e.APIError }
+
+// latestFile is a path beside file for the document as it is now: report.html
+// gives report.latest.html.
+func latestFile(file string) string {
+	if file == "-" {
+		return file
+	}
+	ext := filepath.Ext(file)
+	return strings.TrimSuffix(file, ext) + ".latest" + ext
+}
+
+// writeSavedVersion writes the HTML of the saved version over the pushed
+// file, and returns it, or nil when the file does not have it. It does not
+// write when the file is not the data that the push sent: the file changed
+// during the push, or the data came from stdin. It also returns nil when it
+// cannot read the saved version or write the file. The push is saved all
+// the same, so none of these is an error: the author learns how to get the
+// saved version.
+func writeSavedVersion(cl *Client, doc, version, file string, pushed []byte) []byte {
+	if file == "-" {
+		return nil
+	}
+	saved, err := cl.do("GET", apiPath("/v1/documents/%s/versions/%s/html", doc, version), nil, "")
+	if err != nil {
+		return nil
+	}
+	//nolint:gosec // G304: file is the explicit document path supplied by the CLI user.
+	if now, err := os.ReadFile(file); err != nil || !bytes.Equal(now, pushed) {
+		return nil
+	}
+	// The file exists, so it keeps its mode.
+	if os.WriteFile(file, saved, pulledFilePerm) != nil {
+		return nil
+	}
+	return saved
+}
+
+func docsEditCmd(g *globals, out io.Writer) *cobra.Command {
+	var olds, news []string
+	var editsFile, summary string
+	var all bool
+	cmd := &cobra.Command{
+		Use:   "edit <doc_id>",
+		Short: "Replace text in a document without uploading it again",
+		Long: `Replace exact text in the HTML of a document. The server applies the edits
+and saves the result as a new version, so only the changed text is sent and
+everything else stays byte-for-byte the same.
+
+Each --old must occur exactly once in the current HTML; include surrounding
+text to make it unique, or pass --all to replace every occurrence. Pair each
+--old with a --new, in order, or pass --edits with a JSON list of
+{"old_string", "new_string", "replace_all"} objects. Edits apply in order, and
+if one does not match, nothing is saved.
+
+The edits apply to the document as it is now, even when someone else changed
+another part of it since you read it.`,
+		Example: `  slashdocs docs edit doc_123 --old 'TTL of 10 minutes' --new 'TTL of 5 minutes'
+  slashdocs docs edit doc_123 --all --old 'Cache design' --new 'Cache plan'
+  slashdocs docs edit doc_123 --edits edits.json --summary 'Shorten cache TTLs'`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			edits, err := editArgs(olds, news, all, editsFile)
+			if err != nil {
+				return err
+			}
+			payload := map[string]any{"edits": edits}
+			if summary != "" {
+				payload["change_summary"] = summary
+			}
+			cl, err := client(g)
+			if err != nil {
+				return err
+			}
+			b, err := cl.doJSON("POST", apiPath("/v1/documents/%s/edits", args[0]), payload)
+			var apiErr *APIError
+			if errors.As(err, &apiErr) && apiErr.Code == "edit_failed" {
+				apiErr.Message = strings.Replace(apiErr.Message, "set replace_all", "pass --all", 1)
+			}
+			if err != nil {
+				return err
+			}
+			saved, err := savedVersion(b)
+			if err != nil {
+				return err
+			}
+			// The base of each file stays as it was: a later push of a
+			// pulled file must not overwrite these edits without a conflict.
+			return printSavedVersion(out, g, args[0], cl.Base, saved, "")
+		},
+	}
+	cmd.Flags().StringArrayVar(&olds, "old", nil, "exact text to replace; repeat with --new for several edits")
+	cmd.Flags().StringArrayVar(&news, "new", nil, "replacement for the --old at the same position")
+	cmd.Flags().BoolVar(&all, "all", false, "replace every occurrence of each --old, not just one")
+	cmd.Flags().StringVar(&editsFile, "edits", "", `JSON file of [{"old_string": ..., "new_string": ..., "replace_all": false}], or - for stdin`)
+	cmd.Flags().StringVar(&summary, "summary", "", "change summary, one change per line (defaults to one line per edit)")
+	return cmd
+}
+
+// editArgs builds the edits from --old/--new pairs or an --edits file. all
+// applies to the pairs. Each edit in the file says for itself.
+func editArgs(olds, news []string, all bool, file string) ([]textedit.Edit, error) {
+	if len(olds) != len(news) {
+		return nil, fmt.Errorf("pass one --new for each --old (got %d --old and %d --new)", len(olds), len(news))
+	}
+	edits := make([]textedit.Edit, 0, len(olds))
+	for i := range olds {
+		edits = append(edits, textedit.Edit{OldString: olds[i], NewString: news[i], ReplaceAll: all})
+	}
+	if file != "" {
+		b, _, err := readFileArg(file)
+		if err != nil {
+			return nil, err
+		}
+		var fromFile []textedit.Edit
+		if err := json.Unmarshal(b, &fromFile); err != nil {
+			return nil, fmt.Errorf("could not parse %s: want a JSON list of {\"old_string\", \"new_string\"} objects: %w", file, err)
+		}
+		edits = append(edits, fromFile...)
+	}
+	if len(edits) == 0 {
+		return nil, errors.New("nothing to edit; pass --old and --new, or --edits")
+	}
+	return edits, nil
+}
+
+// commentPoint builds the point of a point comment from --target, --label,
+// --x and --y, or returns nil when none of them is set.
+func commentPoint(cmd *cobra.Command, target, label string, x, y float64) (map[string]any, error) {
+	f := cmd.Flags()
+	if !f.Changed("target") && !f.Changed("label") && !f.Changed("x") && !f.Changed("y") {
+		return nil, nil
+	}
+	if target == "" || !f.Changed("x") || !f.Changed("y") {
+		return nil, usageError{errors.New("a point comment needs --target, --x and --y")}
+	}
+	if math.Abs(x) > maxPointFraction || math.Abs(y) > maxPointFraction {
+		return nil, usageError{errors.New("--x and --y must be between -1000 and 1000")}
+	}
+	return map[string]any{"target": target, "label": label, "x": x, "y": y}, nil
 }
 
 func commentsCmd(g *globals, out io.Writer) *cobra.Command {
 	c := &cobra.Command{Use: "comments", Short: "Manage document review comments"}
 
 	var listStatus, listVersion string
-	list := &cobra.Command{Use: "list <doc_id>", Short: "List document comments", Args: exactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
+	list := &cobra.Command{Use: "list <doc_id>", Short: "List document comments", Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
 		q := url.Values{}
 		if listStatus != "" {
 			q.Set("status", listStatus)
@@ -564,23 +914,34 @@ func commentsCmd(g *globals, out io.Writer) *cobra.Command {
 			return c.do("GET", path, nil, "")
 		})
 	}}
-	list.Flags().StringVar(&listStatus, "status", "", "filter by status: open or resolved")
+	list.Flags().StringVar(&listStatus, "status", "", "filter threads by status: open, resolved or all")
 	list.Flags().StringVar(&listVersion, "version", "", "filter by version ID")
 
-	var createBody, createQuote, createPrefix, createSuffix, createVersion string
+	var createBody, createQuote, createPrefix, createSuffix, createVersion, createTarget, createLabel string
+	var createX, createY float64
 	var createMentions []string
 	var createBodyFile string
-	create := &cobra.Command{Use: "create <doc_id>", Short: "Create a document comment", Args: exactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
+	create := &cobra.Command{Use: "create <doc_id>", Short: "Create a document comment", Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
 		var err error
 		createBody, err = commentBody(cmd, createBody, createBodyFile)
 		if err != nil {
 			return err
 		}
-		if createBody == "" || createVersion == "" || createQuote == "" {
-			return errors.New("--body (or --body-file), --version, and --quote are required")
+		if createBody == "" || createVersion == "" {
+			return usageError{errors.New("--body (or --body-file) and --version are required")}
+		}
+		anchor := map[string]any{"quote": createQuote, "prefix": createPrefix, "suffix": createSuffix}
+		point, err := commentPoint(cmd, createTarget, createLabel, createX, createY)
+		if err != nil {
+			return err
+		}
+		if point != nil {
+			anchor["point"] = point
+		} else if createQuote == "" {
+			return usageError{errors.New("--quote is required, or --target with --x and --y for a point comment")}
 		}
 		return action(g, out, func(c *Client) ([]byte, error) {
-			return c.commentJSON("POST", apiPath("/v1/documents/%s/comments", args[0]), map[string]any{"body": createBody, "version_id": createVersion, "anchor": map[string]any{"quote": createQuote, "prefix": createPrefix, "suffix": createSuffix}}, createMentions, false)
+			return mine(g, args[0])(c.commentJSON("POST", apiPath("/v1/documents/%s/comments", args[0]), map[string]any{"body": createBody, "version_id": createVersion, "anchor": anchor}, createMentions, false))
 		}, func(m map[string]any) string {
 			return "Added comment " + fmt.Sprint(value(m, "id")) + " on " + args[0] + "."
 		})
@@ -591,22 +952,26 @@ func commentsCmd(g *globals, out io.Writer) *cobra.Command {
 	create.Flags().StringVar(&createQuote, "quote", "", "anchor: the exact quoted text")
 	create.Flags().StringVar(&createPrefix, "prefix", "", "anchor: text immediately before the quote")
 	create.Flags().StringVar(&createSuffix, "suffix", "", "anchor: text immediately after the quote")
+	create.Flags().StringVar(&createTarget, "target", "", "point anchor: data-slashdocs-target value or id of the element to pin on; needs --x and --y, and --quote may give the start of its text")
+	create.Flags().StringVar(&createLabel, "label", "", "point anchor: a short name for the element in comment lists")
+	create.Flags().Float64Var(&createX, "x", 0, "point anchor: horizontal position as a fraction of the element's box, 0 (left) to 1 (right); a value outside 0 to 1 is beside the box")
+	create.Flags().Float64Var(&createY, "y", 0, "point anchor: vertical position as a fraction of the element's box, 0 (top) to 1 (bottom); a value outside 0 to 1 is above or below the box")
 	create.Flags().StringVar(&createVersion, "version", "", "version ID the comment anchors to")
 
 	var replyBody string
 	var replyMentions []string
 	var replyBodyFile string
-	reply := &cobra.Command{Use: "reply <doc_id> <comment_id>", Short: "Create a reply in a comment thread", Args: exactArgs(2), RunE: func(cmd *cobra.Command, args []string) error {
+	reply := &cobra.Command{Use: "reply <doc_id> <comment_id>", Short: "Create a reply in a comment thread", Args: cobra.ExactArgs(2), RunE: func(cmd *cobra.Command, args []string) error {
 		var err error
 		replyBody, err = commentBody(cmd, replyBody, replyBodyFile)
 		if err != nil {
 			return err
 		}
 		if replyBody == "" {
-			return errors.New("--body is required")
+			return usageError{errors.New("--body (or --body-file) is required")}
 		}
 		return action(g, out, func(c *Client) ([]byte, error) {
-			return c.commentJSON("POST", apiPath("/v1/documents/%s/comments/%s/replies", args[0], args[1]), map[string]any{"body": replyBody}, replyMentions, false)
+			return mine(g, args[0])(c.commentJSON("POST", apiPath("/v1/documents/%s/comments/%s/replies", args[0], args[1]), map[string]any{"body": replyBody}, replyMentions, false))
 		}, func(m map[string]any) string {
 			return "Created reply " + fmt.Sprint(value(m, "id")) + " on comment " + args[1] + "."
 		})
@@ -635,7 +1000,8 @@ const reactionSlugs = "+1, -1, laugh, hooray, confused, heart, rocket, eyes, plu
 func reactionCmd(g *globals, out io.Writer, name, short, method string, msg func(args []string) string) *cobra.Command {
 	cmd := mutate(g, out, name+" <doc_id> <comment_id> <emoji>", short, method, "/v1/documents/%s/comments/%s/reactions/%s", 3, msg)
 	cmd.Long = short + ".\n\nReactions work on both root comments and replies.\nValid values: " + reactionSlugs + "."
-	cmd.Example = "  slashdocs docs comments " + name + " doc_123 cmt_456 +1"
+	cmd.Example = "  slashdocs docs comments " + name + " doc_123 cmt_456 +1\n" +
+		"  slashdocs docs comments " + name + " doc_123 cmt_456 -- -1   # -- stops flag parsing, so -1 is the emoji"
 	return cmd
 }
 
@@ -646,33 +1012,49 @@ func resolveCmd(g *globals, out io.Writer, name, status string) *cobra.Command {
 		short = "Reopen document comments"
 		verb = "Reopened"
 	}
-	return &cobra.Command{Use: name + " <doc_id> <comment_id>...", Short: short, Args: minArgs(2), RunE: func(cmd *cobra.Command, args []string) error {
+	return &cobra.Command{Use: name + " <doc_id> <comment_id>...", Short: short, Args: cobra.MinimumNArgs(2), RunE: func(cmd *cobra.Command, args []string) error {
 		cl, err := client(g)
 		if err != nil {
 			return err
 		}
-		docID := args[0]
+		// Every id is tried, so one failure does not hide the result of
+		// the others. With --json, the result is one list with an item for
+		// each id: the comment, or the error envelope with the id.
+		var items []any
+		var errs []error
 		for _, id := range args[1:] {
-			b, err := cl.doJSON("PATCH", apiPath("/v1/documents/%s/comments/%s", docID, id), map[string]any{"status": status})
-			if err != nil {
-				return err
-			}
-			if g.json {
-				if err := render(out, g, b); err != nil {
+			b, err := cl.doJSON("PATCH", apiPath("/v1/documents/%s/comments/%s", args[0], id), map[string]any{"status": status})
+			switch {
+			case err != nil:
+				err = fmt.Errorf("comment %s: %w", id, err)
+				errs = append(errs, err)
+				item := errorEnvelope(err)
+				item["id"] = id
+				items = append(items, item)
+			case g.json:
+				items = append(items, json.RawMessage(b))
+			default:
+				if err := confirm(out, g, verb+" comment "+id+"."); err != nil {
 					return err
 				}
-				continue
 			}
-			if err := confirm(out, g, verb+" comment "+id+"."); err != nil {
-				return err
-			}
+		}
+		failed := errors.Join(errs...)
+		if !g.json {
+			return failed
+		}
+		if err := renderValue(out, g, map[string]any{"items": items}); err != nil {
+			return err
+		}
+		if failed != nil {
+			return reportedError{failed}
 		}
 		return nil
 	}}
 }
 
 func openCmd(g *globals, out io.Writer) *cobra.Command {
-	return &cobra.Command{Use: "open <doc_id>", Short: "Open a document in the browser", Args: exactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
+	return &cobra.Command{Use: "open <doc_id>", Short: "Open a document in the browser", Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
 		c, err := client(g)
 		if err != nil {
 			return err
@@ -693,7 +1075,7 @@ func updateCommentCmd(g *globals, out io.Writer) *cobra.Command {
 	var updateMentions []string
 	var updateBodyFile string
 	var clearMentions bool
-	update := &cobra.Command{Use: "update <doc_id> <comment_id>", Short: "Update a document comment", Args: exactArgs(2), RunE: func(cmd *cobra.Command, args []string) error {
+	update := &cobra.Command{Use: "update <doc_id> <comment_id>", Short: "Update a document comment", Args: cobra.ExactArgs(2), RunE: func(cmd *cobra.Command, args []string) error {
 		var err error
 		updateBody, err = commentBody(cmd, updateBody, updateBodyFile)
 		if err != nil {
@@ -702,7 +1084,7 @@ func updateCommentCmd(g *globals, out io.Writer) *cobra.Command {
 		body := map[string]any{}
 		if cmd.Flags().Changed("body") || cmd.Flags().Changed("body-file") {
 			if updateBody == "" {
-				return errors.New("--body cannot be empty")
+				return usageError{errors.New("--body cannot be empty")}
 			}
 			body["body"] = updateBody
 		}
@@ -710,7 +1092,7 @@ func updateCommentCmd(g *globals, out io.Writer) *cobra.Command {
 			body["status"] = updateStatus
 		}
 		if len(body) == 0 && !clearMentions {
-			return errors.New("nothing to update; pass --body, --status, or --clear-mentions")
+			return usageError{errors.New("nothing to update; pass --body, --status, or --clear-mentions")}
 		}
 		return action(g, out, func(c *Client) ([]byte, error) {
 			return c.commentJSON("PATCH", apiPath("/v1/documents/%s/comments/%s", args[0], args[1]), body, updateMentions, clearMentions)

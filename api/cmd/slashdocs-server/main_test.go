@@ -27,7 +27,7 @@ func TestServeShutsDownSiblingWhenListenerFails(t *testing.T) {
 	// Both servers race to bind the same address. One succeeds and the other
 	// reports EADDRINUSE; serve must close the successful sibling before it
 	// returns the original listener error.
-	err = serve(context.Background(), http.NewServeMux(), addr, addr)
+	err = serve(context.Background(), http.NewServeMux(), func() {}, addr, addr)
 	if !errors.Is(err, syscall.EADDRINUSE) {
 		t.Fatalf("serve error = %v, want EADDRINUSE", err)
 	}
@@ -92,6 +92,28 @@ func TestBoolEnv(t *testing.T) {
 	t.Setenv("SLASHDOCS_TEST_FEATURE_ENABLED", "yes")
 	if _, err := boolEnv("SLASHDOCS_TEST_FEATURE_ENABLED", false); err == nil {
 		t.Fatal("boolEnv accepted a non-boolean value")
+	}
+}
+
+func TestLoadApprovalWebhook(t *testing.T) {
+	const secret = "0123456789abcdef0123456789abcdef"
+	for _, tc := range []struct {
+		name, url, secret string
+		on, fails         bool
+	}{
+		{name: "off by default"},
+		{name: "on", url: "https://tracker.example.com/hooks/slashdocs", secret: secret, on: true},
+		{name: "needs a secret", url: "https://tracker.example.com/hooks", secret: "short", fails: true},
+		{name: "needs an absolute URL", url: "tracker.example.com/hooks", secret: secret, fails: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("SLASHDOCS_APPROVAL_WEBHOOK_URL", tc.url)
+			t.Setenv("SLASHDOCS_APPROVAL_WEBHOOK_SECRET", tc.secret)
+			endpoint, err := loadApprovalWebhook()
+			if (err != nil) != tc.fails || (endpoint != nil) != tc.on {
+				t.Fatalf("loadApprovalWebhook() = %+v, %v", endpoint, err)
+			}
+		})
 	}
 }
 

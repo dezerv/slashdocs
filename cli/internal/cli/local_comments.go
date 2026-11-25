@@ -49,6 +49,62 @@ type localAnchor struct {
 	DOMPath     string `json:"dom_path,omitzero"`
 	StartOffset int    `json:"start_offset,omitzero"`
 	EndOffset   int    `json:"end_offset,omitzero"`
+	// Point pins a comment to a spot in an element, as on the server.
+	Point *localPoint `json:"point,omitzero"`
+}
+
+type localPoint struct {
+	Target    string   `json:"target,omitzero"`
+	Path      string   `json:"path,omitzero"`
+	Label     string   `json:"label,omitzero"`
+	X         float64  `json:"x"`
+	Y         float64  `json:"y"`
+	PageX     *float64 `json:"page_x,omitzero"`
+	PageY     *float64 `json:"page_y,omitzero"`
+	ViewportW *float64 `json:"viewport_w,omitzero"`
+}
+
+// A point's spot may lie outside its element, up to this many times its
+// size, and its page spot this many pixels into the page, as on the server.
+const (
+	maxPointFraction = 1000
+	maxPagePixels    = 10_000_000
+)
+
+// valid reports whether a is a text anchor with a quote, or a point on an
+// element that its target or path names, or on the body by its page spot.
+func (a *localAnchor) valid() bool {
+	if a == nil || a.Point == nil {
+		return a != nil && a.Quote != ""
+	}
+	p := a.Point
+	fraction := func(v float64) bool { return v >= -maxPointFraction && v <= maxPointFraction }
+	return (p.Target != "" || p.Path != "" || p.ViewportW != nil) && fraction(p.X) && fraction(p.Y) && p.validPage()
+}
+
+// validPage accepts a point with no page spot, or with all of page_x, page_y
+// and viewport_w, inside the page.
+func (p *localPoint) validPage() bool {
+	if p.PageX == nil && p.PageY == nil && p.ViewportW == nil {
+		return true
+	}
+	within := func(v *float64) bool { return v != nil && *v >= 0 && *v <= maxPagePixels }
+	return within(p.PageX) && within(p.PageY) && within(p.ViewportW) && *p.ViewportW > 0
+}
+
+// move puts a point thread on a new spot. A nil anchor moves nothing. Text
+// threads keep their anchor.
+func (c *localComment) move(a *localAnchor) error {
+	switch {
+	case a == nil:
+		return nil
+	case a.Point == nil || !a.valid():
+		return localError{http.StatusBadRequest, "invalid comment anchor"}
+	case c.Anchor == nil || c.Anchor.Point == nil:
+		return localError{http.StatusBadRequest, "only a point comment can move"}
+	}
+	c.Anchor = a
+	return nil
 }
 
 // localReaction keeps who reacted. Count and Reacted change with the viewer,
@@ -182,8 +238,12 @@ func (s *localDocs) list(r *http.Request, doc string) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	if status := r.URL.Query().Get("status"); status != "" {
+	switch status := r.URL.Query().Get("status"); status {
+	case "", "all":
+	case "open", "resolved":
 		t.Comments = slices.DeleteFunc(t.Comments, func(c *localComment) bool { return c.Status != status })
+	default:
+		return nil, localError{http.StatusBadRequest, "status must be open, resolved or all"}
 	}
 	return map[string][]*localComment{"items": s.view(t.Comments...)}, nil
 }
@@ -197,8 +257,8 @@ func (s *localDocs) create(r *http.Request, doc string) (any, error) {
 	if err := decodeLocal(r, &in); err != nil {
 		return nil, err
 	}
-	if in.Anchor == nil || in.Anchor.Quote == "" {
-		return nil, localError{http.StatusBadRequest, "comment anchor needs a quote"}
+	if !in.Anchor.valid() {
+		return nil, localError{http.StatusBadRequest, "comment anchor needs a quote or a point"}
 	}
 	c, err := s.newComment(in.Body)
 	if err != nil {
@@ -235,8 +295,9 @@ func (s *localDocs) reply(r *http.Request, doc string) (any, error) {
 
 func (s *localDocs) patch(r *http.Request, doc string) (any, error) {
 	var in struct {
-		Body   *string `json:"body"`
-		Status string  `json:"status"`
+		Body   *string      `json:"body"`
+		Status string       `json:"status"`
+		Anchor *localAnchor `json:"anchor"`
 	}
 	if err := decodeLocal(r, &in); err != nil {
 		return nil, err
@@ -251,6 +312,9 @@ func (s *localDocs) patch(r *http.Request, doc string) (any, error) {
 		}
 		if in.Body != nil && c.Body != *in.Body {
 			c.Body, c.Edited = *in.Body, true
+		}
+		if err := c.move(in.Anchor); err != nil {
+			return err
 		}
 		switch {
 		case in.Status == "":

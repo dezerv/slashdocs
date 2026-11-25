@@ -1,6 +1,12 @@
 @import "tailwindcss";
 
 @custom-variant dark (&:where(.dark, .dark *));
+/* A finger, or a phone-width screen: controls grow to 40px touch targets. */
+@custom-variant touch {
+  @media (pointer: coarse), (width < 40rem) {
+    @slot;
+  }
+}
 
 /* Blade fonts (OFL 1.1, see src/assets/fonts): TASA Orbiter for headings,
    Inter for text. The fallbacks match their metrics to stop layout shift. */
@@ -47,6 +53,8 @@
   --color-chrome: #f7f7f7;
   --color-surface: #ffffff;
   --color-surface-muted: #f7f7f7;
+  /* The option that a key or the pointer picks in a menu or list. */
+  --color-highlight: #eef0f2;
   --color-border: #dee1e3;
   --color-border-strong: #c8cdd0;
   --color-fg: #050505;
@@ -62,10 +70,13 @@
 }
 
 .dark {
+  /* Scrollbars and form controls follow the dark theme too. */
+  color-scheme: dark;
   --color-bg: #131415;
   --color-chrome: #131415;
   --color-surface: #1f2124;
   --color-surface-muted: #1b1c1d;
+  --color-highlight: #2e3135;
   --color-border: #3b3d40;
   --color-border-strong: #585c5f;
   --color-fg: #ffffff;
@@ -113,6 +124,11 @@
   }
   ::selection {
     background: color-mix(in srgb, var(--color-accent) 24%, transparent);
+  }
+  /* One focus ring for every control. Fields glow instead (.input-glow). */
+  :focus-visible {
+    outline: 2px solid var(--color-accent);
+    outline-offset: 2px;
   }
 }
 
@@ -266,6 +282,13 @@
 .dark .input-glow:focus-visible {
   box-shadow: 0 0 0 3px rgba(129, 140, 255, 0.16);
 }
+/* A field with an error keeps a red border, also with the focus. */
+.input-glow[aria-invalid="true"] {
+  border-color: var(--color-danger);
+}
+.input-glow[aria-invalid="true"]:focus-visible {
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--color-danger) 16%, transparent);
+}
 
 /* ── Skeleton shimmer ───────────────────────────────────── */
 @keyframes shimmer {
@@ -363,6 +386,26 @@
 }
 .sheet-left[data-state="closed"] {
   animation: sheet-out-left 200ms cubic-bezier(0.32, 0.72, 0, 1) forwards;
+}
+/* A top-anchored dialog is a sheet on a narrow screen. It rises from the
+   bottom edge. */
+@keyframes sheet-in-bottom {
+  from {
+    transform: translateY(100%);
+  }
+}
+@keyframes sheet-out-bottom {
+  to {
+    transform: translateY(100%);
+  }
+}
+@media (max-width: 767px) {
+  .dialog-sheet[data-state="open"] {
+    animation: sheet-in-bottom 300ms cubic-bezier(0.32, 0.72, 0, 1);
+  }
+  .dialog-sheet[data-state="closed"] {
+    animation: sheet-out-bottom 200ms cubic-bezier(0.32, 0.72, 0, 1) forwards;
+  }
 }
 
 /* ── Grid card entrance stagger ─────────────────────────── */
@@ -486,6 +529,65 @@
 /* Rows past 12 share a bounded delay so they still animate in. */
 .stagger-rows > tr:nth-child(n + 13) {
   animation-delay: 420ms;
+}
+
+/* ── Toast actions ──────────────────────────────────────── */
+/* The action of a toast is a primary button, and its cancel is a secondary
+   button, as the app's Button draws them in both themes. Sonner's rules name
+   the toaster and its theme, so these name them too. */
+[data-sonner-toaster][data-sonner-theme]
+  [data-sonner-toast][data-styled="true"]
+  [data-button] {
+  height: 2rem;
+  padding: 0 0.75rem;
+  border-radius: var(--radius-sm);
+  font-size: 0.8125rem;
+  background: var(--color-accent);
+  color: var(--color-accent-fg);
+  box-shadow: var(--shadow-button-primary);
+  transition: background-color 150ms ease-out;
+}
+[data-sonner-toaster][data-sonner-theme]
+  [data-sonner-toast][data-styled="true"]
+  [data-button]:hover {
+  background: var(--color-accent-strong);
+}
+[data-sonner-toaster][data-sonner-theme]
+  [data-sonner-toast][data-styled="true"]
+  [data-button]:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+}
+[data-sonner-toaster][data-sonner-theme]
+  [data-sonner-toast][data-styled="true"]
+  [data-button][data-cancel] {
+  background: var(--color-surface-muted);
+  color: var(--color-fg);
+  box-shadow: none;
+}
+[data-sonner-toaster][data-sonner-theme]
+  [data-sonner-toast][data-styled="true"]
+  [data-button][data-cancel]:hover {
+  background: var(--color-border);
+}
+/* A toast with two actions puts its message on the full width, and the two
+   buttons together at the end of a row below it, so that a long message does
+   not wrap into a narrow column. The message leaves room only for the icon. */
+[data-sonner-toast][data-styled="true"]:has([data-cancel]):has([data-action]) {
+  flex-wrap: wrap;
+  row-gap: 0.75rem;
+}
+[data-sonner-toast][data-styled="true"]:has([data-cancel]):has([data-action])
+  [data-content] {
+  flex-basis: calc(100% - 1.5rem);
+}
+[data-sonner-toast][data-styled="true"]:has([data-cancel]):has([data-action])
+  [data-button] {
+  margin: 0;
+}
+[data-sonner-toast][data-styled="true"]:has([data-cancel]):has([data-action])
+  [data-cancel] {
+  margin-inline-start: auto;
 }
 
 /* ── Mobile delights & touch polish ─────────────────────── */
@@ -631,47 +733,97 @@
   }
 }
 
+/* A theme change repaints every color at once, so no part fades on its own. */
+.theme-switching *,
+.theme-switching *::before,
+.theme-switching *::after {
+  transition: none !important;
+}
+
+/* The check of a thread that the reader resolves draws itself. */
+.check-draw path:last-child {
+  stroke-dasharray: 9;
+  stroke-dashoffset: 9;
+  animation: check-draw 200ms cubic-bezier(0.23, 1, 0.32, 1) forwards;
+}
+@keyframes check-draw {
+  to {
+    stroke-dashoffset: 0;
+  }
+}
+
+/* A reply that a link names shows tinted, and the tint fades as it goes. */
+.linked-tint {
+  position: relative;
+  isolation: isolate;
+}
+.linked-tint::before {
+  content: "";
+  position: absolute;
+  inset: -4px -6px;
+  z-index: -1;
+  border-radius: 8px;
+  background: var(--color-accent-muted);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 400ms ease-out;
+}
+.linked-tint[data-linked]::before {
+  opacity: 1;
+  transition-duration: 150ms;
+}
+
 /* Respect reduced-motion preferences everywhere */
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,
   *::after {
     animation-duration: 0.01ms !important;
+    animation-delay: 0s !important;
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
     scroll-behavior: auto !important;
   }
 }
 
-/* A short, anchored entrance; Radix keeps the menu mounted for its softer exit. */
-@keyframes reaction-picker-in {
+/* A busy button keeps its width. After 300 ms, so that a quick action does
+   not flash, its label fades out and a spinner fades in at its center. */
+.busy-label {
+  animation: busy-fade 150ms ease-out 300ms both reverse;
+}
+.busy-spinner {
+  animation:
+    busy-fade 150ms ease-out 300ms both,
+    spin 1s linear infinite;
+}
+@keyframes busy-fade {
   from {
     opacity: 0;
-    transform: translateY(3px) scale(0.98);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0) scale(1);
   }
 }
-@keyframes reaction-picker-out {
+
+/* Menus grow from their trigger. Radix keeps a menu mounted until its
+   faster, softer exit ends. */
+@keyframes pop-in {
   from {
-    opacity: 1;
-    transform: translateY(0);
+    opacity: 0;
+    transform: scale(0.97);
   }
+}
+@keyframes pop-out {
   to {
     opacity: 0;
-    transform: translateY(2px);
+    transform: scale(0.98);
   }
 }
-.comment-reaction-picker {
+.pop {
   transform-origin: var(--radix-dropdown-menu-content-transform-origin);
 }
-.comment-reaction-picker[data-state="open"] {
-  animation: reaction-picker-in 140ms ease-out;
+.pop[data-state="open"] {
+  animation: pop-in 150ms ease-out;
 }
-.comment-reaction-picker[data-state="closed"] {
-  animation: reaction-picker-out 90ms ease-in;
+.pop[data-state="closed"] {
+  animation: pop-out 100ms ease-in forwards;
 }
 
 /* Tooltips wait for deliberate hover, then settle gently beside their trigger. */

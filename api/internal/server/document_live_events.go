@@ -7,7 +7,11 @@ import (
 	"log/slog"
 	"net/http"
 	"regexp"
+	"slices"
+	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
 
@@ -16,9 +20,12 @@ import (
 )
 
 // Live document events ride the document KV event stream. Writes announce
-// "document" and "comments" events, viewers publish "presence" events, and
-// pointers relay "cursor" events, so every open viewer on every server replica
-// sees them without polling.
+// "document", "comments" and "approvals" events, viewers publish "presence"
+// events, and pointers relay "cursor" events, so every open viewer on every
+// server replica sees them without polling. A "document" event has the seq
+// of the live document and its current version. It is stored for a version
+// that opens or is sealed, and relayed for the other operations of the
+// browser editor.
 
 const (
 	maxPresenceBytes       = 4 * 1024
@@ -27,7 +34,14 @@ const (
 	maxPresenceVersionSize = 64
 	maxCursorBytes         = 4 * 1024
 	maxCursorPoints        = 16
-	liveEventWriteTimeout  = 5 * time.Second
+	maxCursorZoom          = 100
+	// A cursor chat message holds at most this many characters.
+	maxCursorMessage = 100
+	// A caret is at most this many characters into its block.
+	maxCursorCaret = 1_000_000
+	// A view's place may lie outside its element, up to this many times its size.
+	maxViewFraction       = 1000
+	liveEventWriteTimeout = 5 * time.Second
 )
 
 var (
@@ -61,7 +75,14 @@ func (p presence) valid() bool {
 // names an element by its child indexes under the document body, and a place
 // in that element as fractions of its width and height. A hidden point means
 // that the pointer left the document. T is the time of the point in
-// milliseconds on the clock of the session.
+// milliseconds on the clock of the session. Z, when set, is how much larger
+// the element shows than its layout size, as in a document that zooms itself.
+// V, when set, is the place at the center of the viewer's view, which
+// followers show. M, when set, is the viewer's cursor chat message. E, when
+// set, names the block that holds the viewer's caret while they edit it, and
+// C, when set, is the offset of the caret in the characters of that block.
+// A, when set with C, is the offset of the other end of the viewer's
+// selection in that block.
 type cursor struct {
 	Session string        `json:"session"`
 	Version string        `json:"version"`
@@ -69,11 +90,38 @@ type cursor struct {
 }
 
 type cursorPoint struct {
-	T      int64   `json:"t"`
-	Path   string  `json:"path"`
-	X      float64 `json:"x"`
-	Y      float64 `json:"y"`
-	Hidden bool    `json:"hidden,omitempty"`
+	T      int64        `json:"t"`
+	Path   string       `json:"path"`
+	X      float64      `json:"x"`
+	Y      float64      `json:"y"`
+	Z      float64      `json:"z,omitempty"`
+	V      *cursorPlace `json:"v,omitempty"`
+	M      string       `json:"m,omitempty"`
+	E      string       `json:"e,omitempty"`
+	C      *int         `json:"c,omitempty"`
+	A      *int         `json:"a,omitempty"`
+	Hidden bool         `json:"hidden,omitempty"`
+}
+
+// cursorPlace is a place in the document, named like a cursor point.
+type cursorPlace struct {
+	Path string  `json:"path"`
+	X    float64 `json:"x"`
+	Y    float64 `json:"y"`
+	Z    float64 `json:"z,omitempty"`
+}
+
+// valid checks a place whose fractions lie between lo and hi.
+func (p cursorPlace) valid(lo, hi float64) bool {
+	return p.X >= lo && p.X <= hi && p.Y >= lo && p.Y <= hi && p.Z >= 0 && p.Z <= maxCursorZoom &&
+		cursorPathPattern.MatchString(p.Path)
+}
+
+// plainText accepts a short text of at most limit characters without control
+// characters, such as a cursor chat message. Viewers render it as text.
+func plainText(s string, limit int) bool {
+	return utf8.ValidString(s) && utf8.RuneCountInString(s) <= limit &&
+		!strings.ContainsFunc(s, unicode.IsControl)
 }
 
 func (c cursor) valid() bool {
@@ -81,13 +129,24 @@ func (c cursor) valid() bool {
 		len(c.Points) == 0 || len(c.Points) > maxCursorPoints {
 		return false
 	}
-	for _, p := range c.Points {
-		if p.T < 0 || p.X < 0 || p.X > 1 || p.Y < 0 || p.Y > 1 || !cursorPathPattern.MatchString(p.Path) {
-			return false
-		}
-	}
-	return true
+	return !slices.ContainsFunc(c.Points, func(p cursorPoint) bool { return !p.valid() })
 }
+
+func (p cursorPoint) valid() bool {
+	place := cursorPlace{Path: p.Path, X: p.X, Y: p.Y, Z: p.Z}
+	return p.T >= 0 && place.valid(0, 1) &&
+		(p.V == nil || p.V.valid(-maxViewFraction, maxViewFraction)) &&
+		plainText(p.M, maxCursorMessage) && cursorPathPattern.MatchString(p.E) &&
+		caretOffset(p.C) && caretOffset(p.A) && (p.A == nil || p.C != nil)
+}
+
+// caretOffset reports whether an offset in a block, when set, is one that a
+// caret can have.
+func caretOffset(at *int) bool { return at == nil || *at >= 0 && *at <= maxCursorCaret }
+
+// errInvalidReport tells that a viewer's report of presence or of a cursor
+// did not pass validation.
+var errInvalidReport = errors.New("invalid report")
 
 // postDocumentCursor relays pointer positions to the other viewers. The
 // positions are never stored: a viewer who is not connected misses them.
@@ -98,21 +157,29 @@ func (h handlers) postDocumentCursor(c *gin.Context) {
 	}
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxCursorBytes)
 	var in cursor
-	if err := c.ShouldBindJSON(&in); err != nil || !in.valid() {
+	if err := c.ShouldBindJSON(&in); err != nil {
 		badRequest(c, "invalid cursor")
 		return
 	}
+	switch err := h.relayCursor(c.Request.Context(), docID, in, *current(c)); {
+	case errors.Is(err, errInvalidReport):
+		badRequest(c, "invalid cursor")
+	case err != nil:
+		internalErr(c, err)
+	default:
+		c.Status(http.StatusNoContent)
+	}
+}
+
+func (h handlers) relayCursor(ctx context.Context, docID string, in cursor, actor auth.Principal) error {
+	if !in.valid() {
+		return errInvalidReport
+	}
 	data, err := json.Marshal(in)
 	if err != nil {
-		internalErr(c, err)
-		return
+		return err
 	}
-	event := repo.DocumentKVEvent{DocumentID: docID, Kind: repo.DocumentEventCursor, Data: data, UpdatedBy: current(c)}
-	if err := h.deps.documentKVEvents.Relay(c.Request.Context(), event); err != nil {
-		internalErr(c, err)
-		return
-	}
-	c.Status(http.StatusNoContent)
+	return h.deps.documentKVEvents.Relay(ctx, repo.DocumentKVEvent{DocumentID: docID, Kind: repo.DocumentEventCursor, Data: data, UpdatedBy: &actor})
 }
 
 func (h handlers) postDocumentPresence(c *gin.Context) {
@@ -122,25 +189,35 @@ func (h handlers) postDocumentPresence(c *gin.Context) {
 	}
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxPresenceBytes)
 	var in presence
-	if err := c.ShouldBindJSON(&in); err != nil || !in.valid() {
+	if err := c.ShouldBindJSON(&in); err != nil {
 		badRequest(c, "invalid presence")
 		return
 	}
-	p := current(c)
+	switch err := h.reportPresence(c.Request.Context(), docID, in, *current(c)); {
+	case errors.Is(err, errInvalidReport):
+		badRequest(c, "invalid presence")
+	case errors.Is(err, repo.ErrNotFound):
+		notFound(c)
+	case err != nil:
+		internalErr(c, err)
+	default:
+		c.Status(http.StatusNoContent)
+	}
+}
+
+// reportPresence stores where a viewer is. The server sets their picture,
+// and the place of the anchor in the page of the viewer is not stored.
+func (h handlers) reportPresence(ctx context.Context, docID string, in presence, actor auth.Principal) error {
+	if !in.valid() {
+		return errInvalidReport
+	}
 	in.Left = false
-	in.PictureURL = p.PictureURL
+	in.PictureURL = actor.PictureURL
 	if in.Anchor != nil {
 		in.Anchor.DOMPath = ""
+		in.Anchor.Point = nil
 	}
-	if err := h.appendPresence(c.Request.Context(), docID, in, *p); err != nil {
-		if errors.Is(err, repo.ErrNotFound) {
-			notFound(c)
-			return
-		}
-		internalErr(c, err)
-		return
-	}
-	c.Status(http.StatusNoContent)
+	return h.appendPresence(ctx, docID, in, actor)
 }
 
 func (h handlers) appendPresence(ctx context.Context, docID string, state presence, actor auth.Principal) error {
@@ -164,8 +241,10 @@ func (h handlers) leavePresence(c *gin.Context, docID, session string) {
 	}
 }
 
-// announce tells open viewers that a write changed the document or its
-// comments. The write already succeeded, so a failure here is only logged.
+// announce tells open viewers that a write changed the title or the
+// approvals of the document. The write already succeeded, so a failure
+// here is only logged. The repository stores the events of versions itself,
+// in the transactions that open and seal them.
 func (h handlers) announce(c *gin.Context, kind string) {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), liveEventWriteTimeout)
 	defer cancel()
@@ -174,6 +253,51 @@ func (h handlers) announce(c *gin.Context, kind string) {
 		slog.WarnContext(ctx, "document event announcement failed",
 			slog.String("document_id", docID),
 			slog.String("kind", kind),
+			slog.Any("error", err))
+	}
+}
+
+// commentEvent is the data of a comments event: the thread that changed, as
+// it is at the revision of the event, placed on the current version. It has
+// no read state, which is the reader's own. A thread that is gone has none.
+type commentEvent struct {
+	ID     string           `json:"id"`
+	Thread *commentResponse `json:"thread,omitempty"`
+}
+
+// announceThread tells open viewers that a write changed a comment thread,
+// and gives them the thread, so that they do not read the comments again.
+func (h handlers) announceThread(c *gin.Context, threadID string) {
+	h.announceThreadOf(c.Request.Context(), c.Param("id"), threadID, *current(c))
+}
+
+// announceThreadOf is announceThread off a request. The write already
+// succeeded, so a failure here is only logged.
+func (h handlers) announceThreadOf(ctx context.Context, docID, threadID string, actor auth.Principal) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), liveEventWriteTimeout)
+	defer cancel()
+	var versionID string
+	if d, err := h.deps.repository.GetDocument(ctx, docID); err == nil {
+		versionID = d.CurrentVersionID
+	}
+	// The parse that the placement of the thread needs runs before the lock
+	// that the event takes, so that a large document does not hold up its
+	// other events. A thread on the current version needs none.
+	doc := h.placementOf(ctx, versionID)
+	if root, err := h.deps.repository.GetComment(ctx, threadID); err == nil {
+		commentPlacement(root, versionID, doc)
+	}
+	err := h.deps.repository.AppendCommentThreadEvent(ctx, docID, threadID, func(thread []repo.Comment) (json.RawMessage, error) {
+		event := commentEvent{ID: threadID}
+		if threads := commentsJSON(thread, versionID, doc, auth.Principal{}); len(threads) > 0 {
+			event.Thread = &threads[0]
+		}
+		return json.Marshal(event)
+	}, actor)
+	if err != nil {
+		slog.WarnContext(ctx, "comment thread announcement failed",
+			slog.String("document_id", docID),
+			slog.String("thread_id", threadID),
 			slog.Any("error", err))
 	}
 }

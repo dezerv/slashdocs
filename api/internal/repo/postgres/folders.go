@@ -145,20 +145,30 @@ func (s *Store) getFolder(ctx context.Context, q *dbsqlc.Queries, id string) (re
 		ParentFolderID: r.ParentFolderID,
 		Owner:          auth.Principal{Type: auth.PrincipalType(r.OwnerType), ID: r.OwnerID, Name: r.OwnerName, Email: r.OwnerEmail},
 	}
-	if f.ParentFolderID != "" {
-		anc, err := q.ListFolderAncestors(ctx, dbsqlc.ListFolderAncestorsParams{
-			FolderID: f.ParentFolderID,
-			MaxDepth: folderMaxDepth,
-		})
-		if err != nil {
-			return repo.Folder{}, err
-		}
-		f.Ancestors = make([]repo.FolderBreadcrumb, 0, len(anc))
-		for _, a := range anc {
-			f.Ancestors = append(f.Ancestors, repo.FolderBreadcrumb{ID: a.ID, Title: a.Title})
-		}
+	if f.Ancestors, err = ancestors(ctx, q, f.ParentFolderID); err != nil {
+		return repo.Folder{}, err
 	}
 	return f, nil
+}
+
+// ancestors gives the breadcrumbs of a folder in the folder parent, root
+// first. A folder at the top level has none.
+func ancestors(ctx context.Context, q *dbsqlc.Queries, parent string) ([]repo.FolderBreadcrumb, error) {
+	if parent == "" {
+		return nil, nil
+	}
+	anc, err := q.ListFolderAncestors(ctx, dbsqlc.ListFolderAncestorsParams{
+		FolderID: parent,
+		MaxDepth: folderMaxDepth,
+	})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]repo.FolderBreadcrumb, 0, len(anc))
+	for _, a := range anc {
+		out = append(out, repo.FolderBreadcrumb{ID: a.ID, Title: a.Title})
+	}
+	return out, nil
 }
 
 func (s *Store) UpdateFolder(ctx context.Context, id, title string, parent *string) (repo.Folder, error) {
@@ -329,7 +339,7 @@ func (s *Store) ListFolder(ctx context.Context, p auth.Principal, folderID, path
 				break
 			}
 			f := repo.Folder{ID: r.ID, Title: r.Title, ParentFolderID: r.ParentFolderID, Owner: auth.Principal{Type: auth.PrincipalType(r.OwnerType), ID: r.OwnerID, Name: r.OwnerName, Email: r.OwnerEmail}}
-			out = append(out, repo.FolderEntry{Type: "folder", Folder: &f})
+			out = append(out, repo.FolderEntry{Type: "folder", Folder: &f, LastActive: r.UpdatedAt.Time.Format(time.RFC3339)})
 		}
 	}
 	hasMore := len(out) == 50
@@ -342,7 +352,7 @@ func (s *Store) ListFolder(ctx context.Context, p auth.Principal, folderID, path
 		}
 		for _, r := range docs {
 			d := docFromFolderListing(r)
-			out = append(out, repo.FolderEntry{Type: "document", Document: &d})
+			out = append(out, repo.FolderEntry{Type: "document", Document: &d, LastActive: d.UpdatedAt})
 		}
 		f, err := s.GetFolder(ctx, parent)
 		if err != nil {
@@ -391,27 +401,38 @@ func (s *Store) resolveFolderPath(ctx context.Context, p auth.Principal, folderI
 	return parent, nil
 }
 
-func (s *Store) SearchFoldersByTitle(ctx context.Context, p auth.Principal, query string, includeOrgWide bool, limit int32) ([]repo.Folder, error) {
+func (s *Store) SearchFoldersByTitle(ctx context.Context, p auth.Principal, query string, includeOrgWide bool, minRole repo.Role, limit int32) ([]repo.Folder, error) {
 	rows, err := s.q.SearchFoldersByTitle(ctx, dbsqlc.SearchFoldersByTitleParams{
 		PrincipalType:  string(p.Type),
 		PrincipalID:    p.ID,
 		GoogleGroupIds: p.GoogleGroupIDs,
 		IncludeOrgWide: includeOrgWide,
 		Query:          query,
+		MinRole:        string(minRole),
 		RowLimit:       limit,
 	})
 	if err != nil {
 		return nil, err
 	}
+	// Each result has the breadcrumbs that the principal can see, which tell
+	// apart folders with the same title.
 	var out []repo.Folder
 	for _, r := range rows {
-		out = append(out, repo.Folder{ID: r.ID, Title: r.Title, ParentFolderID: r.ParentFolderID, Owner: auth.Principal{Type: auth.PrincipalType(r.OwnerType), ID: r.OwnerID, Name: r.OwnerName, Email: r.OwnerEmail}})
+		chain, err := s.FolderAccessChain(ctx, p, r.ID)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, repo.Folder{
+			ID: r.ID, Title: r.Title, ParentFolderID: r.ParentFolderID,
+			Owner:     auth.Principal{Type: auth.PrincipalType(r.OwnerType), ID: r.OwnerID, Name: r.OwnerName, Email: r.OwnerEmail},
+			Ancestors: repo.VisibleAncestors(chain),
+		})
 	}
 	return out, nil
 }
 
-func (s *Store) FolderHasGrants(ctx context.Context, folderID string) (bool, error) {
-	return s.q.FolderOrAncestorsHaveGrants(ctx, folderID)
+func (s *Store) FolderMayBroadenAccess(ctx context.Context, folderID string, owner auth.Principal) (bool, error) {
+	return s.q.FolderMayBroadenAccess(ctx, dbsqlc.FolderMayBroadenAccessParams{FolderID: folderID, OwnerType: string(owner.Type), OwnerID: owner.ID})
 }
 
 func (s *Store) RecordFolderOpened(ctx context.Context, folderID string, p auth.Principal) error {
@@ -431,22 +452,19 @@ func (s *Store) MoveDocumentToFolder(ctx context.Context, _ auth.Principal, fold
 	if err := q.AcquireFolderTreeLock(ctx, folderTreeLockID); err != nil {
 		return false, err
 	}
-	moved, err := q.MoveDocumentToFolder(ctx, dbsqlc.MoveDocumentToFolderParams{FolderID: folderID, DocumentID: docID})
+	doc, err := q.MoveDocumentToFolder(ctx, dbsqlc.MoveDocumentToFolderParams{FolderID: folderID, DocumentID: docID})
 	if err != nil {
 		var pgErr *pgconn.PgError
-		if errors.As(err, &pgErr) && pgErr.Code == "23503" { // destination folder does not exist
+		if errors.Is(err, pgx.ErrNoRows) || errors.As(err, &pgErr) && pgErr.Code == "23503" { // document or destination folder does not exist
 			return false, repo.ErrNotFound
 		}
 		return false, err
 	}
-	if moved == 0 {
-		return false, repo.ErrNotFound
-	}
-	hasGrants, err := q.FolderOrAncestorsHaveGrants(ctx, folderID)
+	mayBroaden, err := q.FolderMayBroadenAccess(ctx, dbsqlc.FolderMayBroadenAccessParams{FolderID: folderID, OwnerType: doc.OwnerType, OwnerID: doc.OwnerID})
 	if err != nil {
 		return false, err
 	}
-	return hasGrants, tx.Commit(ctx)
+	return mayBroaden, tx.Commit(ctx)
 }
 
 func (s *Store) MoveDocumentToRoot(ctx context.Context, folderID, docID string) error {
@@ -472,5 +490,6 @@ func docFromFolderListing(r dbsqlc.ListFolderDocumentsRow) repo.Document {
 		CurrentVersionID: r.CurrentVersionID,
 		ParentFolderID:   r.ParentFolderID,
 		Owner:            auth.Principal{Type: auth.PrincipalType(r.OwnerType), ID: r.OwnerID, Name: r.OwnerName, Email: r.OwnerEmail},
+		UpdatedAt:        r.UpdatedAt.Time.Format(time.RFC3339),
 	}
 }

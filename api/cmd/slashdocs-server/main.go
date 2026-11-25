@@ -118,12 +118,14 @@ func run() error {
 	workerCtx, cancelWorkers := context.WithCancel(ctx)
 	var workers sync.WaitGroup
 	workers.Go(func() { srv.RunCommentNotifications(workerCtx) })
+	workers.Go(func() { srv.RunApprovalWebhooks(workerCtx) })
 	workers.Go(func() {
 		indexSearch(workerCtx, "versions", store.IndexVersions)
 		indexSearch(workerCtx, "documents", store.IndexDocuments)
 	})
+	workers.Go(func() { tendVersions(workerCtx, store) })
 	defer func() { cancelWorkers(); workers.Wait() }()
-	return serve(ctx, srv.Handler(), ":"+envOrDefault("SLASHDOCS_PORT", "8080"), ":"+envOrDefault("SLASHDOCS_METRICS_PORT", "9090"))
+	return serve(ctx, srv.Handler(), srv.CloseStreams, ":"+envOrDefault("SLASHDOCS_PORT", "8080"), ":"+envOrDefault("SLASHDOCS_METRICS_PORT", "9090"))
 }
 
 // indexSearch gives search data to the versions or documents that were
@@ -134,6 +136,31 @@ func indexSearch(ctx context.Context, items string, index func(context.Context) 
 		slog.ErrorContext(ctx, "search indexing stopped", slog.String("items", items), slog.Int("indexed", indexed), slog.Any("error", err))
 	} else if indexed > 0 {
 		slog.InfoContext(ctx, "indexed for search", slog.String("items", items), slog.Int("indexed", indexed))
+	}
+}
+
+// tendInterval is how often a server looks for open versions to seal and
+// for old operations to take out of the log.
+const tendInterval = 30 * time.Second
+
+// tendVersions seals, until ctx ends, the open versions in which the typing
+// stopped some time ago, and takes the old operations out of the log. Every
+// server runs it: the store locks each document that it seals.
+func tendVersions(ctx context.Context, store *pgrepo.Store) {
+	ticker := time.NewTicker(tendInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if sealed, err := store.SealIdleVersions(ctx); err != nil && ctx.Err() == nil {
+				slog.ErrorContext(ctx, "sealing versions failed", slog.Int("sealed", sealed), slog.Any("error", err))
+			}
+			if _, _, err := store.DeleteOldOperations(ctx); err != nil && ctx.Err() == nil {
+				slog.ErrorContext(ctx, "deleting old operations failed", slog.Any("error", err))
+			}
+		}
 	}
 }
 
@@ -296,10 +323,17 @@ func newApplicationServer(ctx context.Context, store *pgrepo.Store, blobs blob.S
 	if err != nil {
 		return nil, err
 	}
-	sender := loadSlackSender(os.Getenv("SLASHDOCS_SLACK_BOT_TOKEN"))
-	store.SetNotificationsEnabled(sender != nil)
+	approvalWebhook, err := loadApprovalWebhook()
+	if err != nil {
+		return nil, err
+	}
+	senders, err := loadNotificationSenders(os.Getenv)
+	if err != nil {
+		return nil, err
+	}
+	store.SetNotificationsEnabled(len(senders) > 0)
 	options := []server.Option{
-		server.WithCommentNotificationSender(sender),
+		server.WithNotificationSenders(senders),
 		server.WithRepository(store),
 		server.WithDocumentKVEvents(kvEvents),
 		server.WithAuthenticator(auth.DBAuthenticator{Resolver: store, SessionSecret: origins.sessionSecret}),
@@ -312,12 +346,24 @@ func newApplicationServer(ctx context.Context, store *pgrepo.Store, blobs blob.S
 	if googleGroups.directory != nil {
 		options = append(options, server.WithGoogleGroupDirectory(googleGroups.directory))
 	}
+	slackLinkPreviews, err := loadSlackLinkPreviews()
+	if err != nil {
+		return nil, err
+	}
+	if slackLinkPreviews != nil {
+		options = append(options, slackLinkPreviews)
+	}
+	if approvalWebhook != nil {
+		store.EnableApprovalEvents(origins.appOrigin)
+		options = append(options, server.WithApprovalWebhook(*approvalWebhook))
+	}
 	return server.New(server.Config{
 		Environment:               server.EnvProduction,
 		AppOrigin:                 origins.appOrigin,
 		RenderOrigin:              origins.renderOrigin,
 		PreviousOrigins:           splitCSV(os.Getenv("SLASHDOCS_PREVIOUS_ORIGINS")),
 		OIDC:                      oidcProvider,
+		PreviousOIDCIssuers:       splitCSV(os.Getenv("SLASHDOCS_OIDC_PREVIOUS_ISSUER_URLS")),
 		OIDCProviderName:          providerName,
 		SessionSecret:             origins.sessionSecret,
 		AllowedOAuthDomains:       deployment.allowedOAuthDomains,
@@ -333,7 +379,10 @@ func newApplicationServer(ctx context.Context, store *pgrepo.Store, blobs blob.S
 	}, options...), nil
 }
 
-func serve(ctx context.Context, handler http.Handler, addr, metricsAddr string) error {
+// serve runs the app until ctx ends. closeStreams ends the open event
+// streams when the app shuts down: Shutdown does not wait for a WebSocket,
+// and an SSE stream would hold the drain until shutdownTimeout.
+func serve(ctx context.Context, handler http.Handler, closeStreams func(), addr, metricsAddr string) error {
 	appServer := &http.Server{
 		Addr:              addr,
 		Handler:           handler,
@@ -341,6 +390,7 @@ func serve(ctx context.Context, handler http.Handler, addr, metricsAddr string) 
 		ReadTimeout:       readTimeout,
 		IdleTimeout:       idleTimeout,
 	}
+	appServer.RegisterOnShutdown(closeStreams)
 	// Prometheus metrics get a separate listener so /metrics stays off the
 	// public app port (expose only addr publicly; scrape metricsAddr over
 	// private networking).
@@ -376,8 +426,8 @@ func serve(ctx context.Context, handler http.Handler, addr, metricsAddr string) 
 	case <-ctx.Done():
 	}
 
-	// Graceful shutdown: stop accepting connections, then drain in-flight
-	// requests (SSE streams included) for up to shutdownTimeout.
+	// Graceful shutdown: stop accepting connections, end the event streams,
+	// then drain in-flight requests for up to shutdownTimeout.
 	slog.Info("shutting down", slog.Duration("timeout", shutdownTimeout))
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()

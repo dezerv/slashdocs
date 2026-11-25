@@ -1,23 +1,49 @@
 # Comment notifications and links
 
-Comments stay beside their highlighted text. The sidebar shows the total thread
-count, including threads whose text is currently hidden or missing, with All,
-Open, and Resolved filters. Opening a comment link selects its thread even if it
-is resolved. Each comment and reply has a **Copy comment link** action.
+A comment is on selected text, or on a spot in the document: press C with
+nothing selected, or use **Comment on a spot** in the comments list, and click
+the spot. A pin stays exactly where you click. It goes on the innermost
+element under the click, such as a chart, a card, a section, or the page
+itself in a margin, and moves with that element. If a later version no longer
+has the element, the pin shows at the same spot in the page, marked as
+moved. If the document uses C itself, or the caret is in
+text that you can edit, C types and places no pin. A thread opens in a
+popover next to its highlight or its pin. On a
+narrow screen, the popover is a sheet at the bottom of the screen.
+
+Open threads always show their highlight or pin. Pins that are near each other
+merge into a cluster, and a click on the cluster lists its threads. The author
+of a pin, or an editor, can drag it to a new spot. Resolved threads leave the
+document.
+
+The **Comments** button in the document bar opens the comments list: every
+thread, with All, Open, Resolved, and For you filters. For you shows the threads
+that mention you. The list also shows the threads whose text or element is not
+in the version on screen. A click on a thread opens it in place, also when it is
+resolved, so that you can read it or reopen it. Opening a comment link opens its
+thread in the same way. Each comment and reply has a **Copy comment link**
+action.
 
 ## Personal notification controls
 
-Use the bell beside the comment count to mute or enable notifications from that
-document. In **Profile → Slack notifications**, switch notifications off globally.
+Use the bell in the comments list to mute or enable notifications from that
+document. In **Profile → Chat notifications**, switch notifications off globally.
 The global switch overrides document settings. Muting affects only your account;
 it does not change document access or anyone else's preferences. Re-enabling
 starts with future activity, without replaying the muted backlog.
 
-With Slack configured, each new comment or reply notifies the document's human
+With Slack or Google Chat configured, each new comment or reply notifies the document's human
 owner and explicitly mentioned human users. The author is excluded and recipients
 are deduplicated; an owner who is also mentioned receives one mention notification.
 Edits, reactions, resolving, and reopening do not notify. Service accounts can
-write comments and receive structured mentions, but have no Slack inbox.
+write comments and receive structured mentions, but have no chat inbox.
+
+Approvals notify too. When the owner asks someone to approve a document, that
+human approver gets a message with a **Review document** button. When an
+approver approves or rejects, the document's human owner gets a message with the
+reason, if any. Revoking a decision does not notify. Before it sends, the worker
+makes sure that the request or the decision is still current, so a removed
+approver or a revoked decision sends nothing.
 
 Choose a person from the `@` suggestions to create a mention. The composer shows
 accepted mentions below the text field. Pasting or typing around a tag preserves
@@ -41,6 +67,13 @@ slashdocs docs notifications enable doc_123
 slashdocs docs comments create doc_123 --version ver_123 \
   --quote 'Launch checklist' --body 'Please review' \
   --mention reviewer@example.com --mention owner@example.com
+
+# A point comment pins to a spot in an element: its id or
+# data-slashdocs-target value, and x and y as fractions of its box. A value
+# below 0 or above 1 is a spot beside the box.
+slashdocs docs comments create doc_123 --version ver_123 \
+  --target revenue-chart --x 0.4 --y 0.2 --label 'Revenue chart' \
+  --body 'Label this axis'
 
 # File and stdin input avoid shell escaping for longer comments.
 slashdocs docs comments reply doc_123 cmt_123 --body-file - \
@@ -85,6 +118,36 @@ in the viewer when created. Agents can link to a known runtime ID with
 other custom interactions remain controlled by the document. Source HTML is not
 rewritten by these viewer conveniences.
 
+## Google Chat setup
+
+Configure `SLASHDOCS_SLACK_BOT_TOKEN`, `SLASHDOCS_GOOGLE_CHAT_WEBHOOK_URL`, or
+both. Each configured provider delivers every notification. A retry only
+repeats the providers that failed temporarily, so one provider's outage does
+not post duplicates through the other. Recipients, mutes, retries, and content
+redaction are the same for every provider.
+
+Google Chat notifications go to one space through an incoming webhook, as a
+card that names its recipient ("For: alice@example.com"). The space sees all
+notifications, and a comment with several recipients posts once per recipient.
+
+1. In Google Chat, open the space, then **Apps & integrations → Webhooks →
+   Add webhook**, and copy the URL.
+2. Set it as a secret; the URL itself grants posting rights:
+
+   ```bash
+   SLASHDOCS_GOOGLE_CHAT_WEBHOOK_URL='https://chat.googleapis.com/v1/spaces/…/messages?key=…&token=…'
+   ```
+
+Only `https://chat.googleapis.com/v1/spaces/…/messages` URLs are accepted.
+
+### Content
+
+Messages are cards: the activity (naming the comment's author, as in Slack) as
+the header, the document title as the
+subtitle, the highlighted text and comment as HTML-escaped paragraphs, and a
+button to the comment. User content never appears in the message's top-level
+text, where Google Chat would turn `<users/all>` into a real mention.
+
 ## Slack setup
 
 Each deployment uses one Slack app. Platform and Slack email addresses must
@@ -93,7 +156,8 @@ match. Install the app with bot scopes
 [`users:read.email`](https://docs.slack.dev/reference/methods/users.lookupByEmail/),
 [`im:write`](https://docs.slack.dev/reference/methods/conversations.open/), and
 [`chat:write`](https://docs.slack.dev/reference/methods/chat.postMessage/).
-No event subscriptions or inbound Slack webhook are required.
+Notifications need no event subscriptions or inbound Slack webhook; only
+[link previews](#slack-link-previews) do.
 Enable **App Home → Messages Tab** so the bot can send DMs. It can be read-only;
 this integration does not handle messages sent back to the bot. In an app
 manifest, set `features.app_home.messages_tab_enabled` and
@@ -123,13 +187,41 @@ Rotate by updating the Secret and restarting the workload, then revoke the old
 token after rollout. To offboard, remove the environment injection, revoke the
 Slack token, and delete the Secret key.
 
+## Slack link previews
+
+The same Slack app can preview pasted document links with
+[`chat.unfurl`](https://docs.slack.dev/messaging/unfurling-links-in-messages/).
+A link gets a card with the title, a summary (the same one as the
+[document page description](self-hosting.md#document-titles-and-link-previews)), `vN · N open threads · owner` and
+an **Open doc** button only when:
+
+1. `SLASHDOCS_DEPLOYMENT=org`;
+2. anyone in the organization can open the document, directly or through a folder;
+3. nobody from another organization is in the conversation. The bot cannot
+   read a direct message between people, so for a direct message the server
+   uses the `is_ext_shared_channel` field of the Slack event.
+
+Every other link, including one being typed or one in a group message or private
+channel the bot has not joined, gets "slashdocs document · Sign in to see if you have access".
+Slack keeps a card once posted, and does not preview links posted by apps.
+
+In the Slack app, subscribe to the bot event `link_shared` at
+`<SLASHDOCS_APP_ORIGIN>/v1/slack/events`, add the app and previous origins as
+**App unfurl domains**, add the bot scopes `links:read`, `links:write`,
+`channels:read`, `groups:read`, `im:read` and `mpim:read`, and reinstall. Slack
+checks the URL when it is saved, so first deploy with
+`SLASHDOCS_SLACK_LINK_PREVIEWS` and `SLASHDOCS_SLACK_SIGNING_SECRET` set (see
+[environment variables](self-hosting.md#optional)). Rotate the signing secret
+like the bot token.
+
 ## Delivery behavior
 
 The comment and outbox recipients are saved in one database transaction. A worker
 rechecks the recipient's current document access and notification settings before
 sending a DM. Slack receives the document title, highlighted text, comment or
 reply content, and a button linking to that exact comment. Replies include the
-root thread's highlight. The activity leads the message, followed by
+root thread's highlight. The activity leads the message and names the comment's
+author by name (or email when no name is known), followed by
 `Document: <title>` as a link, an italic Slack
 blockquote, the comment, and a prominent **View comment** button. Regular Block
 Kit blocks avoid the extra attribution footer Slack adds to attachments.
@@ -155,7 +247,6 @@ Local Compose accepts `SLASHDOCS_SLACK_BOT_TOKEN` from the launching process's
 environment; when absent, it does not send Slack messages. The RAW workspace
 integration check uses this same environment-variable contract and real Slack
 delivery.
-
 
 ### Links to selected text
 

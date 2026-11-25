@@ -8,6 +8,50 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+type Approval struct {
+	ID           string
+	DocumentID   string
+	VersionID    string
+	Sha256       string
+	ApproverType string
+	ApproverID   string
+	Decision     string
+	Note         string
+	DecidedAt    pgtype.Timestamptz
+	RevokedAt    pgtype.Timestamptz
+}
+
+type ApprovalEventOutbox struct {
+	ID          string
+	Payload     []byte
+	Attempts    int32
+	AvailableAt pgtype.Timestamptz
+	CreatedAt   pgtype.Timestamptz
+}
+
+type ApprovalNotificationOutbox struct {
+	DocumentID        string
+	ApproverType      string
+	ApproverID        string
+	Reason            string
+	RecipientID       string
+	Attempts          int32
+	AvailableAt       pgtype.Timestamptz
+	CreatedAt         pgtype.Timestamptz
+	FinishedProviders []string
+}
+
+type ApprovalRequest struct {
+	ID              string
+	DocumentID      string
+	ApproverType    string
+	ApproverID      string
+	RequestedByType string
+	RequestedByID   string
+	CreatedAt       pgtype.Timestamptz
+	RevokedAt       pgtype.Timestamptz
+}
+
 type CliCredential struct {
 	ID         string
 	UserID     string
@@ -35,6 +79,7 @@ type Comment struct {
 	ParentCommentID    pgtype.Text
 	RootCommentID      string
 	Edited             bool
+	AnchorSeq          pgtype.Int8
 }
 
 // Structured principals mentioned in comment bodies. Mention metadata grants no access; future notification delivery must re-check effective document access and apply rate limits.
@@ -51,12 +96,13 @@ type CommentMention struct {
 }
 
 type CommentNotificationOutbox struct {
-	CommentID   string
-	RecipientID string
-	Reason      string
-	Attempts    int32
-	AvailableAt pgtype.Timestamptz
-	CreatedAt   pgtype.Timestamptz
+	CommentID         string
+	RecipientID       string
+	Reason            string
+	Attempts          int32
+	AvailableAt       pgtype.Timestamptz
+	CreatedAt         pgtype.Timestamptz
+	FinishedProviders []string
 }
 
 type CommentPlacement struct {
@@ -80,6 +126,14 @@ type CommentReaction struct {
 	CreatedAt pgtype.Timestamptz
 }
 
+// One row per (thread, reader): the last time the reader read the thread. Only the root comment of a thread has rows. Readers who never opened a thread have no row, and every message by someone else in it is unread for them.
+type CommentRead struct {
+	ThreadID      string
+	PrincipalType string
+	PrincipalID   string
+	ReadAt        pgtype.Timestamptz
+}
+
 type Document struct {
 	ID               string
 	Title            string
@@ -90,18 +144,20 @@ type Document struct {
 	OwnerType        string
 	ParentFolderID   pgtype.Text
 	SearchVector     interface{}
+	Seq              int64
 }
 
 type DocumentAccessNotificationOutbox struct {
-	DocumentID   string
-	RecipientID  string
-	Source       string
-	Reason       string
-	PreviousRole string
-	Role         string
-	Attempts     int32
-	AvailableAt  pgtype.Timestamptz
-	CreatedAt    pgtype.Timestamptz
+	DocumentID        string
+	RecipientID       string
+	Source            string
+	Reason            string
+	PreviousRole      string
+	Role              string
+	Attempts          int32
+	AvailableAt       pgtype.Timestamptz
+	CreatedAt         pgtype.Timestamptz
+	FinishedProviders []string
 }
 
 type DocumentAccessRequest struct {
@@ -112,14 +168,15 @@ type DocumentAccessRequest struct {
 }
 
 type DocumentAccessRequestNotificationOutbox struct {
-	DocumentID     string
-	RequesterType  string
-	RequesterID    string
-	RequesterLabel string
-	RecipientID    string
-	Attempts       int32
-	AvailableAt    pgtype.Timestamptz
-	CreatedAt      pgtype.Timestamptz
+	DocumentID        string
+	RequesterType     string
+	RequesterID       string
+	RequesterLabel    string
+	RecipientID       string
+	Attempts          int32
+	AvailableAt       pgtype.Timestamptz
+	CreatedAt         pgtype.Timestamptz
+	FinishedProviders []string
 }
 
 type DocumentKv struct {
@@ -160,6 +217,20 @@ type DocumentNotificationMute struct {
 	PrincipalType string
 	PrincipalID   string
 	DocumentID    string
+}
+
+type DocumentOp struct {
+	DocumentID   string
+	Seq          int64
+	VersionID    string
+	AuthorType   string
+	AuthorID     string
+	ClientOpID   pgtype.Text
+	Typed        bool
+	Summary      string
+	Replacements []byte
+	Sum          uint32
+	CreatedAt    pgtype.Timestamptz
 }
 
 type DocumentWorkspaceEntry struct {
@@ -322,4 +393,15 @@ type Version struct {
 	CreatedAt       pgtype.Timestamptz
 	SearchText      pgtype.Text
 	SearchVector    interface{}
+	ClientChangeID  pgtype.Text
+	Seq             int64
+	SealedAt        pgtype.Timestamptz
+	SittingID       pgtype.Text
+}
+
+type VersionAuthor struct {
+	VersionID  string
+	AuthorType string
+	AuthorID   string
+	CreatedAt  pgtype.Timestamptz
 }

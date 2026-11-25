@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"testing/fstest"
 )
 
 const (
@@ -46,7 +47,8 @@ func newTestLocal(t *testing.T) testLocal {
 	}
 	t.Cleanup(func() { _ = root.Close() })
 	me := localPrincipal{Type: "user", ID: "ada", Name: "Ada"}
-	return testLocal{dir, localHandler(root, localInfo{URL: localURL(7070), Port: 7070, Dir: "/docs"}, me)}
+	app := fstest.MapFS{"local.html": {Data: []byte(`<div id="root"></div>`)}}
+	return testLocal{dir, localHandler(root, app, localInfo{URL: localURL(7070), Port: 7070, Dir: "/docs"}, me)}
 }
 
 // do sends a request from the app page.
@@ -182,6 +184,7 @@ func TestLocalComments(t *testing.T) {
 		{http.MethodPost, base, `{"body":"no anchor"}`, http.StatusBadRequest},
 		{http.MethodDelete, base + "/missing", "", http.StatusNotFound},
 		{http.MethodGet, "/v1/documents/chart.png/comments", "", http.StatusNotFound},
+		{http.MethodGet, base + "?status=stale", "", http.StatusBadRequest},
 	} {
 		if w := l.do(tt.method, testApp, tt.target, tt.body); w.Code != tt.status {
 			t.Errorf("%s %s = %d %s, want %d", tt.method, tt.target, w.Code, w.Body, tt.status)
@@ -205,6 +208,9 @@ func TestLocalComments(t *testing.T) {
 	if len(open) != 0 {
 		t.Errorf("open comments = %+v, want none", open)
 	}
+	if all := decodeTest[struct{ Items []localComment }](t, l.do(http.MethodGet, testApp, base+"?status=all", "")).Items; len(all) != 1 {
+		t.Errorf("all comments = %+v, want the resolved thread", all)
+	}
 	got := list()
 	if len(got) != 1 || got[0].Status != "resolved" || got[0].ResolvedAt.IsZero() || len(got[0].Replies) != 1 {
 		t.Fatalf("comments = %+v", got)
@@ -221,6 +227,45 @@ func TestLocalComments(t *testing.T) {
 	l.do(http.MethodPatch, testApp, base+"/"+c.ID, `{"status":"open"}`)
 	if got := list(); len(got[0].Replies) != 0 || got[0].Status != "open" || !got[0].ResolvedAt.IsZero() {
 		t.Errorf("after delete and reopen = %+v", got[0])
+	}
+}
+
+func TestLocalPointComments(t *testing.T) {
+	l := newTestLocal(t)
+	base := "/v1/documents/" + url.PathEscape("specs/release #2.html") + "/comments"
+	pin := decodeTest[localComment](t, l.do(http.MethodPost, testApp, base, `{"version_id":"v1","body":"Here","anchor":{"quote":"","point":{"path":"0.1","x":0,"y":0.5}}}`))
+	if p := pin.Anchor.Point; p == nil || p.Path != "0.1" || p.X != 0 || p.Y != 0.5 {
+		t.Fatalf("created point = %+v", pin.Anchor)
+	}
+	text := decodeTest[localComment](t, l.do(http.MethodPost, testApp, base, `{"version_id":"v1","body":"Why?","anchor":{"quote":"Release"}}`))
+	for _, tt := range []struct {
+		target, body string
+		status       int
+	}{
+		{base, `{"version_id":"v1","body":"Beside","anchor":{"point":{"target":"chart","x":1.5,"y":-0.2}}}`, http.StatusOK},
+		{base, `{"version_id":"v1","body":"Off","anchor":{"point":{"target":"chart","x":1001,"y":0}}}`, http.StatusBadRequest},
+		{base, `{"version_id":"v1","body":"Nowhere","anchor":{"point":{"x":0.5,"y":0}}}`, http.StatusBadRequest},
+		{base, `{"version_id":"v1","body":"Margin","anchor":{"point":{"x":-0.1,"y":0.5,"page_x":40,"page_y":300,"viewport_w":1280}}}`, http.StatusOK},
+		{base, `{"version_id":"v1","body":"Half","anchor":{"point":{"target":"chart","x":0.5,"y":0,"page_x":40,"page_y":300}}}`, http.StatusBadRequest},
+		{base, `{"version_id":"v1","body":"Narrow","anchor":{"point":{"target":"chart","x":0.5,"y":0,"page_x":40,"page_y":300,"viewport_w":0}}}`, http.StatusBadRequest},
+		{base + "/" + pin.ID, `{"anchor":{"point":{"target":"chart","x":0.25,"y":1}}}`, http.StatusOK},
+		{base + "/" + pin.ID, `{"anchor":{"quote":"Release"}}`, http.StatusBadRequest},
+		{base + "/" + text.ID, `{"anchor":{"point":{"target":"chart","x":0.25,"y":1}}}`, http.StatusBadRequest},
+	} {
+		method := http.MethodPatch
+		if tt.target == base {
+			method = http.MethodPost
+		}
+		if w := l.do(method, testApp, tt.target, tt.body); w.Code != tt.status {
+			t.Errorf("%s %s = %d %s, want %d", method, tt.target, w.Code, w.Body, tt.status)
+		}
+	}
+	got := decodeTest[struct{ Items []localComment }](t, l.do(http.MethodGet, testApp, base, "")).Items
+	if p := got[0].Anchor.Point; p == nil || p.Target != "chart" || p.X != 0.25 || got[1].Anchor.Point != nil {
+		t.Fatalf("comments after the move = %+v, %+v", got[0].Anchor, got[1].Anchor)
+	}
+	if p := got[3].Anchor.Point; p == nil || p.Path != "" || p.X != -0.1 || *p.PageX != 40 || *p.PageY != 300 || *p.ViewportW != 1280 {
+		t.Fatalf("body point = %+v, want its page spot", got[3].Anchor.Point)
 	}
 }
 

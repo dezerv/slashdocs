@@ -7,11 +7,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"mime/multipart"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
+	"slices"
 	"strings"
 	"time"
 )
@@ -123,25 +125,52 @@ func client(g *globals) (*Client, error) {
 	return &Client{Base: normalizeServer(srv), Token: tok, HTTP: apiHTTPClient, saved: saved}, nil
 }
 
-// APIError represents a non-2xx response from the API.
+// APIError represents a non-2xx response from the API. Details are the
+// "details" of the error response, such as current_version_id on a
+// version_conflict.
 type APIError struct {
 	Status  int
 	Code    string
 	Message string
+	Details map[string]any
 	Body    string
 }
 
 func (e *APIError) Error() string {
+	text := fmt.Sprintf("api %d", e.Status)
 	if e.Code != "" {
-		return fmt.Sprintf("api %d %s: %s", e.Status, e.Code, e.Message)
+		text += " " + e.Code
 	}
-	return fmt.Sprintf("api %d: %s", e.Status, e.Message)
+	text += ": " + e.Message
+	if details := scalarDetails(e.Details); details != "" {
+		text += " (" + details + ")"
+	}
+	return text
+}
+
+// scalarDetails writes the scalar values of details as key=value pairs, in key
+// order, so the human error text names what a caller needs to recover.
+func scalarDetails(details map[string]any) string {
+	var parts []string
+	for _, k := range slices.Sorted(maps.Keys(details)) {
+		switch v := details[k].(type) {
+		case string, float64, bool:
+			parts = append(parts, fmt.Sprintf("%s=%v", k, v))
+		}
+	}
+	return strings.Join(parts, " ")
 }
 
 func (c *Client) do(method, path string, body io.Reader, ct string) ([]byte, error) {
+	b, _, err := c.doResponse(method, path, body, ct)
+	return b, err
+}
+
+// doResponse is do for a caller that also reads the response headers.
+func (c *Client) doResponse(method, path string, body io.Reader, ct string) ([]byte, http.Header, error) {
 	req, err := http.NewRequest(method, c.Base+path, body)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if c.Token != "" {
 		req.Header.Set("Authorization", "Bearer "+c.Token)
@@ -151,14 +180,14 @@ func (c *Client) do(method, path string, body io.Reader, ct string) ([]byte, err
 	}
 	res, err := c.HTTP.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer func() {
 		_ = res.Body.Close()
 	}()
 	b, err := io.ReadAll(res.Body)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if res.StatusCode < 400 {
 		c.followMove(res.Request)
@@ -167,17 +196,19 @@ func (c *Client) do(method, path string, body io.Reader, ct string) ([]byte, err
 		ae := &APIError{Status: res.StatusCode, Message: strings.TrimSpace(string(b)), Body: string(b)}
 		var payload struct {
 			Error struct {
-				Code    string `json:"code"`
-				Message string `json:"message"`
+				Code    string         `json:"code"`
+				Message string         `json:"message"`
+				Details map[string]any `json:"details"`
 			} `json:"error"`
 		}
 		if json.Unmarshal(b, &payload) == nil && payload.Error.Message != "" {
 			ae.Code = payload.Error.Code
 			ae.Message = payload.Error.Message
+			ae.Details = payload.Error.Details
 		}
-		return nil, ae
+		return nil, nil, ae
 	}
-	return b, nil
+	return b, res.Header, nil
 }
 
 // followMove saves the new server origin after the saved server answered with

@@ -1,5 +1,12 @@
-import { type FrameLocator, type Locator, type Page } from "@playwright/test";
-import { APP_ORIGIN, RENDER_ORIGIN, expect, test, uniqueName } from "./fixtures";
+import { type Locator, type Page } from "@playwright/test";
+import {
+  APP_ORIGIN,
+  RENDER_ORIGIN,
+  expect,
+  renderedDocument,
+  test,
+  uniqueName,
+} from "./fixtures";
 
 function documentHTML(heading: string, body = "Select this sentence for review.") {
   return `<!doctype html>
@@ -12,12 +19,6 @@ function documentHTML(heading: string, body = "Select this sentence for review."
     </main>
   </body>
 </html>`;
-}
-
-function renderedDocument(page: Page): FrameLocator {
-  return page
-    .frameLocator('iframe[title="Rendered document"]')
-    .frameLocator("iframe#slashdocs-doc");
 }
 
 function entryRow(page: Page, title: string): Locator {
@@ -70,9 +71,9 @@ test("uploads HTML in the UI and renders it only on the render origin", async ({
   const title = uniqueName("Browser upload");
   await page.goto("/app/documents");
   await page.getByRole("button", { name: "More", exact: true }).click();
-  await page.getByRole("menuitem", { name: "Upload HTML (backup)" }).click();
+  await page.getByRole("menuitem", { name: "Upload an HTML file" }).click();
 
-  const dialog = page.getByRole("dialog", { name: "Upload HTML (backup)" });
+  const dialog = page.getByRole("dialog", { name: "Upload an HTML file" });
   await expect(dialog).toBeVisible();
   // The menu must be gone and the dialog must survive the window losing focus,
   // which is what opening the OS file picker does. A dialog rendered inside
@@ -80,7 +81,7 @@ test("uploads HTML in the UI and renders it only on the render origin", async ({
   await expect(page.getByRole("menu")).toHaveCount(0);
   await page.evaluate(() => window.dispatchEvent(new Event("blur")));
   await expect(dialog).toBeVisible();
-  await dialog.getByPlaceholder("Title").fill(title);
+  await dialog.getByLabel("Title").fill(title);
   await expect(dialog.getByRole("button", { name: "Choose HTML file" })).toBeVisible();
   await dialog.locator('input[type="file"]').setInputFiles({
     name: "browser-upload.html",
@@ -163,13 +164,32 @@ test("creates a structured mention with a clean API body", async ({
     ),
   ).toBe("@admin");
 
+  // The posted thread opens in its popover.
   const commentCard = page
-    .getByRole("button")
-    .filter({ hasText: "Please review" })
-    .filter({ hasText: "@admin" });
+    .getByRole("dialog", { name: "Comment thread" })
+    .filter({ hasText: "Please review" });
   const renderedMention = commentCard.getByText("@admin", { exact: true });
   await expect(renderedMention).toBeVisible();
   await expect(renderedMention).toHaveClass(/bg-\[var\(--color-accent-muted\)\]/);
+});
+
+test("shows more documents after the first page", async ({ page, slashdocs }) => {
+  // The server sends 25 documents a page. One word finds only these ones.
+  const word = uniqueName("paged").split(" ").at(-1)!;
+  for (let i = 0; i < 26; i++) {
+    const title = `Paged ${word} ${i}`;
+    await slashdocs.createDocument(title, documentHTML(title));
+  }
+
+  await page.goto("/app/documents");
+  await page.getByRole("combobox", { name: "Search documents" }).fill(word);
+  await expect(page.getByRole("heading", { name: "Results" })).toBeVisible();
+  const rows = page.locator("tbody tr");
+  const more = page.getByRole("button", { name: "Show more documents" });
+  await expect(rows).toHaveCount(25);
+  await more.click();
+  await expect(rows).toHaveCount(26);
+  await expect(more).toHaveCount(0);
 });
 
 test("shares a document through its general access role", async ({
@@ -182,9 +202,12 @@ test("shares a document through its general access role", async ({
   await page.goto(`/app/d/${document.id}`);
   await page.getByRole("button", { name: "Share", exact: true }).click();
   const shareSheet = page.getByRole("dialog", { name: "Share document" });
-  const generalAccess = shareSheet.getByLabel("General access role");
-  await generalAccess.selectOption("viewer");
-  await expect(generalAccess).toHaveValue("viewer");
+  const generalAccess = shareSheet.getByRole("button", {
+    name: /^General access role/,
+  });
+  await generalAccess.click();
+  await page.getByRole("menuitem", { name: "Viewer" }).click();
+  await expect(generalAccess).toHaveAccessibleName("General access role: Viewer");
   const access = await slashdocs.documentAccess(document.id);
   expect(
     access.some(
@@ -204,6 +227,9 @@ test("moves a document into a folder and returns it to root when deleting the fo
     documentHTML(documentTitle),
   );
 
+  // A drag does not scroll the page, so the document row and the new folder
+  // must be on screen together, below every folder that the stack holds.
+  await page.setViewportSize({ width: 1280, height: 2000 });
   await page.goto("/app/documents");
   await page.getByRole("button", { name: "New folder" }).click();
   const newFolderDialog = page.getByRole("dialog", { name: "New folder" });
@@ -254,7 +280,7 @@ test("moves a document into a folder and returns it to root when deleting the fo
   expect(movedDocument.parent_folder_id).toBeFalsy();
 });
 
-test("delivers a KV patch to a second open page through the browser SSE stream", async ({
+test("delivers a KV patch to a second open page through the live connection", async ({
   page,
   context,
   slashdocs,
@@ -281,13 +307,14 @@ test("delivers a KV patch to a second open page through the browser SSE stream",
 </html>`;
   const document = await slashdocs.createDocument(title, html);
   const secondPage = await context.newPage();
-  const secondPageStream = secondPage.waitForResponse((response) => {
-    const url = new URL(response.url());
-    return (
-      response.status() === 200 &&
-      url.pathname === `/v1/documents/${document.id}/kv/events`
-    );
-  });
+  // The server sends the first message after it subscribes to the events.
+  const secondPageStream = secondPage
+    .waitForEvent(
+      "websocket",
+      (socket) =>
+        new URL(socket.url()).pathname === `/v1/documents/${document.id}/live`,
+    )
+    .then((socket) => socket.waitForEvent("framereceived"));
 
   await page.goto(`/app/d/${document.id}`);
   await secondPage.goto(`/app/d/${document.id}`);

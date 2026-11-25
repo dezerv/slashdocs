@@ -3,7 +3,13 @@ package server
 import (
 	"context"
 	"errors"
+	"fmt"
+	"math"
 	"net/http"
+	"regexp"
+	"slices"
+	"strings"
+	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
 
@@ -44,10 +50,23 @@ type commentMentionRequest struct {
 }
 
 type createCommentRequest struct {
-	VersionID string                  `json:"version_id"`
-	Body      string                  `json:"body"`
-	Anchor    repo.Anchor             `json:"anchor"`
-	Mentions  []commentMentionRequest `json:"mentions"`
+	VersionID string `json:"version_id"`
+	// Seq is the seq of the document that a text anchor is on: the page
+	// shows the document at that seq. The anchor then follows the changes
+	// after it. With no seq, the anchor is on the live document.
+	Seq      *int64                  `json:"seq"`
+	Body     string                  `json:"body"`
+	Anchor   repo.Anchor             `json:"anchor"`
+	Mentions []commentMentionRequest `json:"mentions"`
+}
+
+// anchorSeq gives the seq that the anchor is on. A seq that is not in the
+// range of the live document gives the live seq.
+func (in createCommentRequest) anchorSeq(live int64) int64 {
+	if in.Seq != nil && *in.Seq >= 0 && *in.Seq < live {
+		return *in.Seq
+	}
+	return live
 }
 
 type createCommentReplyRequest struct {
@@ -59,11 +78,72 @@ type patchCommentRequest struct {
 	Body     *string                  `json:"body"`
 	Status   string                   `json:"status"`
 	Mentions *[]commentMentionRequest `json:"mentions"`
+	// Anchor moves a point comment to a new spot.
+	Anchor *repo.Anchor `json:"anchor"`
+	// BaseBody is the body that an edit started from. When set, and another
+	// edit changed the body since, the patch fails with 409 comment_changed.
+	BaseBody *string `json:"base_body"`
+}
+
+// maxCommentBodyRunes bounds a comment or reply body. Longer ones are pastes
+// by mistake, and they stretch a thread without end.
+const maxCommentBodyRunes = 20000
+
+// pointTargetPattern is the allowed value of a point's target, a
+// data-slashdocs-target value or an element id. The limits keep targets safe
+// to match against stored HTML and to use in a selector.
+var pointTargetPattern = regexp.MustCompile(`^[A-Za-z0-9_.:-]{1,128}$`)
+
+// maxPointLabel bounds the name of a point's element.
+const maxPointLabel = 128
+
+// maxPagePixels bounds the page spot and the viewport width of a point.
+const maxPagePixels = 10_000_000
+
+// validCommentAnchor checks the anchor of a new thread: a text anchor needs a
+// quote, and a point needs an element, by target or path, or else a page spot,
+// which puts it on the body. Its fractions may lie outside the element's box,
+// as far as live cursor views do. It rounds the fractions of a point to four
+// decimals in place.
+func validCommentAnchor(a *repo.Anchor) bool {
+	p := a.Point
+	if p == nil {
+		return a.Quote != ""
+	}
+	if (p.Target == "" && p.Path == "" && p.ViewportW == nil) || (p.Target != "" && !pointTargetPattern.MatchString(p.Target)) ||
+		!cursorPathPattern.MatchString(p.Path) || !plainText(p.Label, maxPointLabel) ||
+		!viewFraction(p.X) || !viewFraction(p.Y) || !validPageSpot(p) {
+		return false
+	}
+	p.X = math.Round(p.X*1e4) / 1e4
+	p.Y = math.Round(p.Y*1e4) / 1e4
+	return true
+}
+
+func viewFraction(v float64) bool {
+	return v >= -maxViewFraction && v <= maxViewFraction
+}
+
+// validPageSpot accepts a point with no page spot, or with all of page_x,
+// page_y and viewport_w, inside the page.
+func validPageSpot(p *repo.AnchorPoint) bool {
+	if p.PageX == nil && p.PageY == nil && p.ViewportW == nil {
+		return true
+	}
+	within := func(v *float64) bool { return v != nil && *v >= 0 && *v <= maxPagePixels }
+	return within(p.PageX) && within(p.PageY) && within(p.ViewportW) && *p.ViewportW > 0
+}
+
+// blankCommentBody reports whether body has nothing but white space, which
+// shows as an empty comment.
+func blankCommentBody(body string) bool {
+	return strings.TrimSpace(body) == ""
 }
 
 // CreateComment godoc
 // @Summary Create comment
 // @Description Requests with non-empty mentions must use Content-Type application/vnd.slashdocs.comment-mentions+json so mixed-version deployments fail closed instead of dropping metadata.
+// @Description The anchor is a text anchor with a non-empty quote, or a point: anchor.point names an element by target (its data-slashdocs-target value or id), path (its child-index path under the body), or both, and x and y are fractions of its box, from 0 to 1 inside it and from -1000 to 1000 in all. A point may also give page_x and page_y, the spot in CSS pixels from the top left of the page, with viewport_w, the viewport width: they place the pin when a later version no longer has the element, and they alone put a point on the body. The text fields of a point hold the start of the element's text, which finds the element again after the document changes.
 // @Tags comments
 // @Security bearerAuth
 // @Security cookieAuth
@@ -94,18 +174,27 @@ func (h handlers) createComment(c *gin.Context) {
 		return
 	}
 	in.Body = normalized
-	if in.VersionID == "" || in.Body == "" || in.Anchor.Quote == "" {
+	if in.VersionID == "" || blankCommentBody(in.Body) || !validCommentAnchor(&in.Anchor) {
 		badRequest(c, "invalid comment")
 		return
 	}
-	cm, err := h.deps.repository.CreateComment(c.Request.Context(), c.Param("id"), in.VersionID, in.Body, in.Anchor, *p, commentMentions(in.Mentions))
+	d, err := h.deps.repository.GetDocument(c.Request.Context(), c.Param("id"))
 	if err != nil {
 		commentWriteError(c, err)
 		return
 	}
+	seq := in.anchorSeq(d.Seq)
+	cm, err := h.deps.repository.CreateComment(c.Request.Context(), c.Param("id"), in.VersionID, in.Body, in.Anchor, seq, *p, commentMentions(in.Mentions))
+	if err != nil {
+		commentWriteError(c, err)
+		return
+	}
+	if seq < d.Seq {
+		h.follow(c, cm.DocumentID)
+	}
 	incComment("created", cm.Status, actorType(c))
-	h.announce(c, repo.DocumentEventComments)
-	c.JSON(http.StatusCreated, commentJSON(cm, cm.VersionID, "", *p))
+	h.announceThread(c, cm.ID)
+	c.JSON(http.StatusCreated, commentJSON(cm, cm.VersionID, nil, *p))
 }
 
 // ListComments godoc
@@ -114,7 +203,7 @@ func (h handlers) createComment(c *gin.Context) {
 // @Security bearerAuth
 // @Security cookieAuth
 // @Param id path string true "Document ID"
-// @Param status query string false "open|resolved|stale|orphaned|all"
+// @Param status query string false "Thread status: open or resolved. Empty or all lists every thread. Replies travel with their thread."
 // @Param version_id query string false "Version ID"
 // @Success 200 {object} listResponse[commentResponse]
 // @Router /v1/documents/{id}/comments [get]
@@ -122,8 +211,17 @@ func (h handlers) listComments(c *gin.Context) {
 	if !h.needDocRole(c, c.Param("id"), repo.RoleViewer) {
 		return
 	}
+	status := c.Query("status")
+	if status == "all" {
+		status = ""
+	}
+	if status != "" && status != commentStatusOpen && status != commentStatusResolved {
+		badRequest(c, "status must be open, resolved or all")
+		return
+	}
 	versionID := c.Query("version_id")
-	items, err := h.deps.repository.ListComments(c.Request.Context(), c.Param("id"), c.Query("status"), versionID)
+	h.follow(c, c.Param("id"))
+	items, err := h.deps.repository.ListComments(c.Request.Context(), c.Param("id"), status, versionID)
 	if err != nil {
 		internalErr(c, err)
 		return
@@ -135,11 +233,55 @@ func (h handlers) listComments(c *gin.Context) {
 			placementVersionID = d.CurrentVersionID
 		}
 	}
-	var placementHTML []byte
-	if placementVersionID != "" {
-		placementHTML, _ = h.deps.repository.GetVersionHTML(c.Request.Context(), placementVersionID)
+	threads := commentsJSON(items, placementVersionID, h.placementOf(c.Request.Context(), placementVersionID), *current(c))
+	if !h.markUnread(c, threads) {
+		return
 	}
-	c.JSON(http.StatusOK, listResponse[commentResponse]{Items: commentsJSON(items, placementVersionID, placementHTML, *current(c))})
+	c.JSON(http.StatusOK, listResponse[commentResponse]{Items: threads})
+}
+
+// markUnread sets Unread on the threads that the signed-in reader did not
+// read. It answers the client when it fails.
+func (h handlers) markUnread(c *gin.Context, threads []commentResponse) bool {
+	reader := current(c)
+	if reader.Type == auth.PrincipalAnonymous {
+		return true
+	}
+	unread, err := h.deps.repository.UnreadCommentThreads(c.Request.Context(), c.Param("id"), *reader)
+	if err != nil {
+		internalErr(c, err)
+		return false
+	}
+	for i := range threads {
+		threads[i].Unread = slices.Contains(unread, threads[i].ID)
+	}
+	return true
+}
+
+// MarkCommentThreadRead godoc
+// @Summary Mark comment thread read
+// @Description Sets the caller's read time of a thread to now. The thread then shows as read to the caller until someone else adds a message to it. Only the thread's first comment takes a mark: a reply id answers 404.
+// @Tags comments
+// @Security bearerAuth
+// @Security cookieAuth
+// @Param id path string true "Document ID"
+// @Param comment_id path string true "Thread ID, the id of the thread's first comment"
+// @Success 204
+// @Failure 404 {object} errorEnvelope "not_found: no such thread in the document"
+// @Router /v1/documents/{id}/comments/{comment_id}/read [put]
+func (h handlers) markCommentThreadRead(c *gin.Context) {
+	if !h.needDocRole(c, c.Param("id"), repo.RoleViewer) {
+		return
+	}
+	err := h.deps.repository.MarkCommentThreadRead(c.Request.Context(), c.Param("id"), c.Param("comment_id"), *current(c))
+	switch {
+	case errors.Is(err, repo.ErrNotFound):
+		c.JSON(http.StatusNotFound, errorResponse("not_found", "comment not found in document", nil))
+	case err != nil:
+		internalErr(c, err)
+	default:
+		c.Status(http.StatusNoContent)
+	}
 }
 
 // CreateCommentReply godoc
@@ -175,7 +317,7 @@ func (h handlers) createCommentReply(c *gin.Context) {
 		return
 	}
 	in.Body = normalized
-	if in.Body == "" {
+	if blankCommentBody(in.Body) {
 		badRequest(c, "invalid reply")
 		return
 	}
@@ -185,13 +327,13 @@ func (h handlers) createCommentReply(c *gin.Context) {
 		return
 	}
 	incComment("created", cm.Status, actorType(c))
-	h.announce(c, repo.DocumentEventComments)
-	c.JSON(http.StatusCreated, commentJSON(cm, "", "", *current(c)))
+	h.announceThread(c, cm.RootCommentID)
+	c.JSON(http.StatusCreated, commentJSON(cm, "", nil, *current(c)))
 }
 
 // PatchComment godoc
 // @Summary Update comment
-// @Description Any request containing the mentions key, including an empty array, must use Content-Type application/vnd.slashdocs.comment-mentions+json so mixed-version deployments fail closed.
+// @Description Any request containing the mentions key, including an empty array, must use Content-Type application/vnd.slashdocs.comment-mentions+json so mixed-version deployments fail closed. An anchor with a point moves a point comment to a new spot. Text comments follow their text.
 // @Tags comments
 // @Security bearerAuth
 // @Security cookieAuth
@@ -200,6 +342,8 @@ func (h handlers) createCommentReply(c *gin.Context) {
 // @Param comment_id path string true "Comment ID"
 // @Param update body patchCommentRequest true "Fields to update; omitted mentions are preserved unless the body changes"
 // @Success 200 {object} commentResponse
+// @Failure 409 {object} errorEnvelope "comment_changed: the body is no longer base_body"
+// @Failure 429 {object} errorEnvelope
 // @Router /v1/documents/{id}/comments/{comment_id} [patch]
 func (h handlers) patchComment(c *gin.Context) {
 	if !h.canMutateComment(c, c.Param("id"), c.Param("comment_id")) {
@@ -220,17 +364,23 @@ func (h handlers) patchComment(c *gin.Context) {
 		badRequest(c, message)
 		return
 	}
+	if in.Anchor != nil && !h.validCommentMove(c, in.Anchor) {
+		return
+	}
 	var mentions *[]repo.CommentMention
 	if in.Mentions != nil {
 		converted := commentMentions(*in.Mentions)
 		mentions = &converted
 	}
-	cm, err := h.deps.repository.UpdateComment(c.Request.Context(), c.Param("comment_id"), repo.CommentUpdate{Body: in.Body, Status: in.Status, Mentions: mentions})
+	cm, err := h.deps.repository.UpdateComment(c.Request.Context(), c.Param("comment_id"), repo.CommentUpdate{Body: in.Body, BaseBody: in.BaseBody, Status: in.Status, Mentions: mentions, Anchor: in.Anchor})
 	if err != nil {
 		commentWriteError(c, err)
 		return
 	}
 	event := "updated"
+	if in.Anchor != nil {
+		event = "moved"
+	}
 	switch in.Status {
 	case commentStatusResolved:
 		event = "resolved"
@@ -238,8 +388,8 @@ func (h handlers) patchComment(c *gin.Context) {
 		event = "reopened"
 	}
 	incComment(event, cm.Status, actorType(c))
-	h.announce(c, repo.DocumentEventComments)
-	c.JSON(http.StatusOK, commentJSON(cm, cm.VersionID, "", *current(c)))
+	h.announceThread(c, cm.RootCommentID)
+	c.JSON(http.StatusOK, commentJSON(cm, cm.VersionID, nil, *current(c)))
 }
 
 func normalizePatchCommentRequest(in *patchCommentRequest) string {
@@ -256,11 +406,11 @@ func normalizePatchCommentRequest(in *patchCommentRequest) string {
 		in.Body = nil
 	}
 	switch {
-	case in.Body != nil && *in.Body == "":
+	case in.Body != nil && blankCommentBody(*in.Body):
 		return "comment body cannot be empty"
 	case in.Status != "" && in.Status != commentStatusOpen && in.Status != commentStatusResolved:
 		return "invalid comment status"
-	case in.Body == nil && in.Status == "" && in.Mentions == nil:
+	case patchIsEmpty(in):
 		return "nothing to update"
 	default:
 		return ""
@@ -272,7 +422,35 @@ func normalizeCommentBodyInput(body string) (string, string) {
 	if normalized != body {
 		return "", "legacy mention markers are not supported; reload the client and try again"
 	}
+	if utf8.RuneCountInString(normalized) > maxCommentBodyRunes {
+		return "", fmt.Sprintf("comment is too long (at most %d characters)", maxCommentBodyRunes)
+	}
 	return normalized, ""
+}
+
+// patchIsEmpty tells that a comment patch changes nothing.
+func patchIsEmpty(in *patchCommentRequest) bool {
+	return in.Body == nil && in.Status == "" && in.Mentions == nil && in.Anchor == nil
+}
+
+// validCommentMove checks a new spot for a comment: only a point thread
+// moves, and only to another valid point. A text comment follows its text
+// (see followAnchors).
+func (h handlers) validCommentMove(c *gin.Context, a *repo.Anchor) bool {
+	if a.Point == nil || !validCommentAnchor(a) {
+		badRequest(c, "invalid comment anchor")
+		return false
+	}
+	cm, err := h.deps.repository.GetComment(c.Request.Context(), c.Param("comment_id"))
+	if err != nil {
+		commentWriteError(c, err)
+		return false
+	}
+	if cm.Anchor.Point == nil || cm.ParentCommentID != "" {
+		badRequest(c, "only a point comment can move")
+		return false
+	}
+	return true
 }
 
 func commentMentions(items []commentMentionRequest) []repo.CommentMention {
@@ -295,6 +473,8 @@ func commentWriteError(c *gin.Context, err error) {
 		badRequest(c, "invalid comment mention")
 	case errors.Is(err, repo.ErrNotFound):
 		notFound(c)
+	case errors.Is(err, repo.ErrConflict):
+		c.JSON(http.StatusConflict, errorResponse("comment_changed", "the comment changed since base_body; load it and try again", nil))
 	default:
 		internalErr(c, err)
 	}
@@ -310,15 +490,16 @@ func commentWriteError(c *gin.Context, err error) {
 // @Success 204
 // @Router /v1/documents/{id}/comments/{comment_id} [delete]
 func (h handlers) deleteComment(c *gin.Context) {
-	if !h.canDeleteComment(c, c.Param("id"), c.Param("comment_id")) {
+	cm, ok := h.canDeleteComment(c, c.Param("id"), c.Param("comment_id"))
+	if !ok {
 		return
 	}
-	if err := h.deps.repository.DeleteComment(c.Request.Context(), c.Param("comment_id")); err != nil {
+	if err := h.deps.repository.DeleteComment(c.Request.Context(), cm.ID); err != nil {
 		internalErr(c, err)
 		return
 	}
 	incComment("deleted", labelUnknown, actorType(c))
-	h.announce(c, repo.DocumentEventComments)
+	h.announceThread(c, cm.RootCommentID)
 	c.Status(http.StatusNoContent)
 }
 
@@ -339,17 +520,17 @@ var allowedCommentReactions = map[string]bool{
 // must check the document role first; a missing comment and a comment in
 // another document deliberately share one 404 so the response cannot be used
 // to probe for comment IDs outside the document the caller named.
-func (h handlers) commentInDocument(c *gin.Context, docID, commentID string) bool {
+func (h handlers) commentInDocument(c *gin.Context, docID, commentID string) (repo.Comment, bool) {
 	cm, err := h.deps.repository.GetComment(c.Request.Context(), commentID)
 	if err != nil && !errors.Is(err, repo.ErrNotFound) {
 		internalErr(c, err)
-		return false
+		return repo.Comment{}, false
 	}
 	if err != nil || cm.DocumentID != docID {
 		c.JSON(http.StatusNotFound, errorResponse("not_found", "comment not found in document", nil))
-		return false
+		return repo.Comment{}, false
 	}
-	return true
+	return cm, true
 }
 
 // PutCommentReaction godoc
@@ -402,14 +583,15 @@ func (h handlers) writeCommentReaction(c *gin.Context, write reactionWrite) {
 	if !h.needDocRole(c, docID, repo.RoleCommenter) {
 		return
 	}
-	if !h.commentInDocument(c, docID, commentID) {
+	cm, ok := h.commentInDocument(c, docID, commentID)
+	if !ok {
 		return
 	}
 	if err := write(c.Request.Context(), commentID, *current(c), emoji); err != nil {
 		internalErr(c, err)
 		return
 	}
-	h.announce(c, repo.DocumentEventComments)
+	h.announceThread(c, cm.RootCommentID)
 	c.Status(http.StatusNoContent)
 }
 
@@ -444,16 +626,16 @@ func authoredBy(cm repo.Comment, p auth.Principal) bool {
 	return cm.Author.Type == p.Type && cm.Author.ID == p.ID
 }
 
-func (h handlers) canDeleteComment(c *gin.Context, docID, commentID string) bool {
+func (h handlers) canDeleteComment(c *gin.Context, docID, commentID string) (repo.Comment, bool) {
 	cm, ok := h.loadCommentInDocument(c, docID, commentID)
 	if !ok || !h.needDocRole(c, docID, repo.RoleCommenter) {
-		return false
+		return repo.Comment{}, false
 	}
 	if authoredBy(cm, *current(c)) {
-		return true
+		return cm, true
 	}
 	forbidden(c, "only the comment author can delete this comment")
-	return false
+	return repo.Comment{}, false
 }
 
 func (h handlers) canMutateComment(c *gin.Context, docID, commentID string) bool {

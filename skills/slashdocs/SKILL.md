@@ -48,15 +48,77 @@ format:
 3. Save it locally (for example `report.html`).
 4. Use `slashdocs docs --help` and `slashdocs docs create --help` to confirm current
    syntax.
-5. Publish with the CLI.
+5. Publish with the CLI. To put the document in a folder, add
+   `--folder-id fld_123`, so that it is never at the root.
 6. Return the printed slashdocs document URL.
+7. If the `ai-sessions` skill is installed, use it and follow its guidance to
+   link this session to the document.
 
 ### Updating an existing document
 
 If the user is iterating on an existing slashdocs document, push a new version
 instead of creating a duplicate. Use the CLI help to find the current push/update
 syntax and include a short summary of what changed. Write one change per line;
-the version history shows a multi-line summary as a list.
+the document's history shows a multi-line summary as a list. Pull the
+document with `slashdocs docs pull <id> --out <file>` before you edit it, and
+push that file: the CLI records which state of the document the file holds
+(its version and seq), and the push sends it. A push of a file with no
+recorded state is refused. People with the editor role also edit the document
+live in the browser (words, paragraphs, lists, bold, italic and links), several
+at once. When they changed other text after your pull, the server merges your
+push with their edits, and the CLI writes the merged version into your file.
+When they changed the same text, the push is refused and their text stays:
+pull again, and make your change again. A browser edit
+changes only the HTML of the element that the person edited. Text that a script
+shows can change in the browser only when it is exactly one string in an inline
+script or in a `<script type="application/json">` block. Thus, keep text that
+people may fix in the HTML or in such one-string values, not in strings that
+code builds.
+
+For changes to existing text, such as a fixed number, a reworded sentence, or
+a few addressed comments, use `slashdocs docs edit` (MCP: `edit_document`)
+instead of pushing the whole file. It sends only exact find-and-replace pairs,
+so it is fast, leaves the rest of the document byte-for-byte unchanged, and
+keeps comments elsewhere anchored. Each old string must occur exactly once in
+the current HTML; add surrounding text to make it unique, or pass `--all`
+(MCP: `replace_all`) when every occurrence should change, such as a renamed
+term. If one does not match, nothing is saved. Push the whole file
+only for restructuring or large rewrites.
+
+### Comments
+
+A comment is on exact text (`docs comments create --quote`, MCP:
+`create_comment`) or on a spot in an element, such as a chart, a diagram or an
+image (`docs comments create --target --x --y`, MCP: `create_point_comment`).
+The target is the element's id or `data-slashdocs-target` value, and x and y
+are fractions of its box: 0 to 1 inside it, and below 0 or above 1 beside it,
+from -1000 to 1000 in all. To keep a point comment when the target
+changes, pass the start of the element's text as `--quote`, and a short
+`--label` for comment lists. `docs comments list` names the element of each
+point comment with `pin=`. A point whose element is gone in a later version
+has the placement status `moved`, and viewers show it at its old spot in the
+page.
+
+### Waiting for a review
+
+Right after you publish for review, run `slashdocs docs wait <doc_id>`, in the
+background if your tool has a time limit. It returns the open threads with new
+messages when the reviewer stops writing for 2 minutes, and an approval or a
+rejection at once. Change the document or answer in each thread, reply in each
+thread with what you did, push, and run `wait` again. Each wait gives only
+feedback that is new to you, and never your own replies. Stop when the
+document is approved, or when the person tells you to stop.
+
+### Approvals
+
+For a formal sign-off, use the approval workflow, not state that the
+document keeps itself. Run `slashdocs guidelines review approvals` for the
+rules. The owner asks for approval with `slashdocs docs approvers add <doc_id>
+--to <email>`, and `slashdocs docs approvals list <doc_id>` shows the
+decisions. An approver decides with `slashdocs docs approve` or
+`slashdocs docs reject`. A version with changed content asks the approvers
+again. While other people type in the document, the server refuses a
+decision: decide when they are done.
 
 ### Searching and labels
 
@@ -67,17 +129,27 @@ slashdocs docs list 'incident from:alice@example.com label:api,review in:"Produc
 slashdocs docs list 'rollout -draft from:me after:last week' --json
 ```
 
-Every word must appear in the title or the text of the latest version, and
-the most relevant documents come first. A word also matches longer words that
-start with it. `"quoted text"` matches the words in order, and `-word`
-excludes documents that contain the word. `from:` (an email, the name
+Every word must appear in the title or the text of the latest version.
+Documents with the words in the title come first, then the latest. A word
+also matches longer words that start with it. `"quoted text"` matches the words in order, and `-word`
+excludes documents that contain the word. `title:word` (or
+`title:"a phrase"`) matches in the title only. `from:` (an email, the name
 before the @, or `me`), `in:` (a folder or any folder above the document),
 `label:`, `before:`, `after:`, `on:`, and `during:` narrow the results. Repeat
 `from:` or `in:` to match any of the values. A date is a day (`25-09-26`,
 `5 september`, `monday`, `today`, `3 days ago`), a week, a month, or a year
 (`last week`, `september`, `this year`, `2026`), or `last 7 days`, in UTC.
 
-Manage labels directly from the CLI:
+Search reads the first 256 KiB of the text of a document (about 40,000
+words), and a `"quoted text"` phrase matches in the first 16,383 words only.
+To make all of a longer document searchable, divide it into documents.
+
+A list shows 25 documents, and `--limit` shows up to 100. When the JSON has
+`"has_more": true`, more documents follow: `--offset` skips the documents that
+you have, for example `--offset 25` for the second page of 25.
+
+Manage labels directly from the CLI, or with the MCP `set_document_labels`
+tool:
 
 ```bash
 slashdocs docs labels list doc_123

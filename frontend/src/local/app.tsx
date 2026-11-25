@@ -1,5 +1,6 @@
 import { useState } from "react";
-import { Toaster, toast } from "sonner";
+import { toast } from "sonner";
+import { Toaster } from "@/components/ui/toaster";
 import { BrowserRouter, Link, useLocation } from "react-router-dom";
 import { QueryClient, QueryClientProvider, useQuery } from "@tanstack/react-query";
 import { ChevronRight, ExternalLink, FolderIcon, Search } from "lucide-react";
@@ -8,15 +9,20 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { Button } from "@/components/ui/button";
 import { Center, EmptyState, Skeleton } from "@/components/ui/misc";
 import { TopBar } from "@/components/layout/topbar";
-import { CommentsToggle, DocBarFrame } from "@/components/layout/doc-bar-frame";
+import { LoadError } from "@/components/error-state";
+import {
+  BarGroup,
+  CommentsToggle,
+  DocBarFrame,
+} from "@/components/layout/doc-bar-frame";
 import { DocWorkspace } from "@/pages/doc-workspace";
-import { api } from "@/api";
+import { api, APIError } from "@/api";
 import { errorMessage } from "@/lib/errors";
 import { queryKeys } from "@/lib/queryKeys";
 import { Page } from "@/components/layout/page";
 import { ENTRY_ROW, EntryName, EntryTable } from "@/components/browse/entry-table";
 import { beat } from "@/lib/enter";
-import { formatTimestamp } from "@/lib/format-date";
+import { RelativeTime } from "@/components/ui/relative-time";
 import { useTitle } from "@/lib/use-title";
 
 // slashdocs local: the documents app for a folder of HTML files that
@@ -35,7 +41,7 @@ type Doc = Entry & { type: "document"; raw: string; version: string };
 
 async function getEntry(pathname: string): Promise<Folder | Doc> {
   const res = await fetch(`/_/api/entry${pathname}`);
-  if (!res.ok) throw new Error(res.status === 404 ? "Not found." : res.statusText);
+  if (!res.ok) throw new APIError(res.status, "", res.statusText);
   return res.json();
 }
 
@@ -63,7 +69,13 @@ function EntryPage() {
           <Skeleton className="h-64 w-full" />
         </Page>
       ) : !data ? (
-        <Center>{entry.error?.message}</Center>
+        <Center>
+          <LoadError
+            title="Could not open this page"
+            error={entry.error}
+            query={entry}
+          />
+        </Center>
       ) : data.path ? (
         <FolderPage folder={data} />
       ) : (
@@ -189,7 +201,7 @@ function Entries({ entries }: { entries: Entry[] }) {
             <EntryName to={href(e.path)} folder={e.type === "folder"} title={e.title} />
           </td>
           <td className="px-4 py-3 text-[var(--color-fg-muted)]">
-            {formatTimestamp(e.modified)}
+            <RelativeTime iso={e.modified} />
           </td>
         </tr>
       ))}
@@ -210,29 +222,35 @@ function DocumentPage({ doc }: { doc: Doc }) {
       principal={me.data?.principal}
       home="/"
       notifications={false}
-      bar={({ commentsOpen, onToggleComments }) => (
+      bar={({ commentsOpen, onToggleComments, threads }) => (
         <DocBarFrame
           home="/"
           folder={folder ? { to: href(folder), title: base(folder) } : undefined}
           title={doc.title}
         >
-          <Button
-            asChild
-            variant="ghost"
-            size="icon"
-            className="shrink-0"
-            tooltip="Open raw HTML"
-          >
-            <a
-              href={doc.raw}
-              target="_blank"
-              rel="noreferrer"
-              aria-label="Open raw HTML"
+          <BarGroup>
+            <Button
+              asChild
+              variant="chrome"
+              size="icon-sm"
+              className="shrink-0"
+              tooltip="Open raw HTML"
             >
-              <ExternalLink className="h-4 w-4" />
-            </a>
-          </Button>
-          <CommentsToggle open={commentsOpen} onToggle={onToggleComments} />
+              <a
+                href={doc.raw}
+                target="_blank"
+                rel="noreferrer"
+                aria-label="Open raw HTML"
+              >
+                <ExternalLink className="size-4" />
+              </a>
+            </Button>
+            <CommentsToggle
+              open={commentsOpen}
+              onToggle={onToggleComments}
+              threads={threads}
+            />
+          </BarGroup>
         </DocBarFrame>
       )}
     />
@@ -258,7 +276,7 @@ export function LocalApp() {
             <main className="relative h-full overflow-auto">
               <EntryPage />
             </main>
-            <Toaster position="bottom-right" theme="system" richColors />
+            <Toaster />
           </BrowserRouter>
         </TooltipProvider>
       </QueryClientProvider>

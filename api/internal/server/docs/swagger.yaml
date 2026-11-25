@@ -27,12 +27,26 @@ definitions:
     - PrincipalGoogleGroup
     - PrincipalAnyone
     - PrincipalAnonymous
+  repo.AccessRequest:
+    properties:
+      requested_at:
+        type: string
+      requester:
+        $ref: '#/definitions/auth.Principal'
+    type: object
   repo.Anchor:
     properties:
       dom_path:
         type: string
       end_offset:
         type: integer
+      point:
+        allOf:
+        - $ref: '#/definitions/repo.AnchorPoint'
+        description: |-
+          Point pins the comment to a spot in an element instead of to the quoted
+          text. The text fields then hold the start of the element's own text,
+          which finds the element again after the document changes.
       prefix:
         type: string
       quote:
@@ -41,6 +55,36 @@ definitions:
         type: integer
       suffix:
         type: string
+    type: object
+  repo.AnchorPoint:
+    properties:
+      label:
+        type: string
+      page_x:
+        type: number
+      page_y:
+        type: number
+      path:
+        type: string
+      target:
+        type: string
+      viewport_w:
+        type: number
+      x:
+        type: number
+      "y":
+        type: number
+    type: object
+  repo.ApprovalSummary:
+    properties:
+      approved:
+        type: integer
+      pending:
+        type: integer
+      rejected:
+        type: integer
+      total:
+        type: integer
     type: object
   repo.CLICredential:
     properties:
@@ -51,6 +95,17 @@ definitions:
     type: object
   repo.Document:
     properties:
+      approval_status:
+        description: |-
+          ApprovalStatus and ApprovalSummary are handler-populated (like
+          ParentFolder) and only present when the document has assigned approvers.
+        type: string
+      approval_summary:
+        $ref: '#/definitions/repo.ApprovalSummary'
+      can_move:
+        description: 'CanMove is set by GET /v1/documents/{id}: the caller may move
+          it.'
+        type: boolean
       current_version_id:
         type: string
       id:
@@ -65,6 +120,10 @@ definitions:
         $ref: '#/definitions/repo.FolderBreadcrumb'
       parent_folder_id:
         type: string
+      seq:
+        description: Seq is the sequence number of the live document. Lists do not
+          set it.
+        type: integer
       snippet:
         description: |-
           Snippet is set in search results when the text matches. U+0002 and
@@ -75,11 +134,77 @@ definitions:
       updated_at:
         type: string
     type: object
+  repo.DocumentAccessRequest:
+    properties:
+      document_id:
+        type: string
+      document_title:
+        type: string
+      requested_at:
+        type: string
+      requester:
+        $ref: '#/definitions/auth.Principal'
+    type: object
+  repo.DocumentChanges:
+    properties:
+      authors:
+        description: Authors made those operations. The author of the newest comes
+          first.
+        items:
+          $ref: '#/definitions/auth.Principal'
+        type: array
+      ops:
+        description: |-
+          Ops are the operations after the earlier seq, in order. Each one is a
+          list of replacements on the source before it.
+        items:
+          items:
+            type: object
+          type: array
+        type: array
+      seq:
+        type: integer
+      sum:
+        description: Sum is the CRC-32 (IEEE) of the UTF-8 bytes of the source at
+          Seq.
+        type: integer
+      typed:
+        description: Typed is set when the browser editor made every one of them.
+        type: boolean
+      version_id:
+        type: string
+    type: object
+  repo.Folder:
+    properties:
+      ancestors:
+        items:
+          $ref: '#/definitions/repo.FolderBreadcrumb'
+        type: array
+      id:
+        type: string
+      owner:
+        $ref: '#/definitions/auth.Principal'
+      parent_folder_id:
+        type: string
+      title:
+        type: string
+    type: object
   repo.FolderBreadcrumb:
     properties:
       id:
         type: string
       title:
+        type: string
+    type: object
+  repo.FolderEntry:
+    properties:
+      document:
+        $ref: '#/definitions/repo.Document'
+      folder:
+        $ref: '#/definitions/repo.Folder'
+      last_active:
+        type: string
+      type:
         type: string
     type: object
   repo.Grant:
@@ -99,12 +224,56 @@ definitions:
       role:
         $ref: '#/definitions/repo.Role'
     type: object
+  repo.InboxItem:
+    properties:
+      at:
+        type: string
+      body:
+        type: string
+      comment_id:
+        type: string
+      document_id:
+        type: string
+      document_title:
+        type: string
+      from:
+        allOf:
+        - $ref: '#/definitions/auth.Principal'
+        description: From asked for the approval, or wrote the newest unread message,
+          Body.
+      kind:
+        description: |-
+          Kind is "approval" for a document to approve, or "thread" for a thread
+          with a message to read.
+        type: string
+    type: object
   repo.NotificationPreferences:
     properties:
       effective_enabled:
         type: boolean
       enabled:
         type: boolean
+    type: object
+  repo.OperationResult:
+    properties:
+      others:
+        description: |-
+          Others are the operations that the document had after the base seq,
+          as they apply to the source that the sender made: the state at the base seq with its replacements. The
+          sender applies them in order, and then has the source at Seq.
+        items:
+          items:
+            $ref: '#/definitions/textedit.Replacement'
+          type: array
+        type: array
+      seq:
+        type: integer
+      sum:
+        description: Sum is the CRC-32 (IEEE) of the UTF-8 bytes of the source at
+          Seq.
+        type: integer
+      version_id:
+        type: string
     type: object
   repo.OwnershipTransfer:
     properties:
@@ -153,6 +322,13 @@ definitions:
     type: object
   repo.Version:
     properties:
+      authors:
+        description: |-
+          Authors are the creator of the version and the people whose
+          operations it holds.
+        items:
+          $ref: '#/definitions/auth.Principal'
+        type: array
       change_summary:
         type: string
       created_at:
@@ -161,11 +337,114 @@ definitions:
         $ref: '#/definitions/auth.Principal'
       document_id:
         type: string
+      edited_at:
+        description: |-
+          EditedAt is the time of the last operation of the version, or
+          CreatedAt when the log holds none.
+        type: string
       id:
         type: string
       number:
         type: integer
+      open:
+        description: |-
+          Open is set while people type in the version. Its content is then the
+          live document, and it has no SHA256 until it is sealed.
+        type: boolean
       sha256:
+        type: string
+    type: object
+  server.ambiguousPathResponse:
+    properties:
+      candidates:
+        items:
+          $ref: '#/definitions/repo.Folder'
+        type: array
+      error:
+        $ref: '#/definitions/server.errorBody'
+    type: object
+  server.approvalListItem:
+    properties:
+      approver:
+        $ref: '#/definitions/server.principalResponse'
+      comments_open:
+        description: |-
+          CommentsOpen and CommentsTotal count the comment threads this approver
+          started on the document, so a rejection can say "2 open of 3".
+        type: integer
+      comments_total:
+        type: integer
+      decided_at:
+        type: string
+      decision:
+        type: string
+      earlier:
+        allOf:
+        - $ref: '#/definitions/server.earlierDecision'
+        description: |-
+          Earlier is set while the approver is pending on this content: their most
+          recent decision, made on other content of the document. On the current
+          version it lets the UI say "Approved before the latest edits".
+      id:
+        type: string
+      note:
+        type: string
+      version_id:
+        description: |-
+          VersionID and VersionNumber name the version the approver decided on.
+          It can be older than the listed version when the content is the same,
+          so the UI can say "Approved on v3".
+        type: string
+      version_number:
+        type: integer
+    type: object
+  server.approvalRequestResponse:
+    properties:
+      approver:
+        $ref: '#/definitions/server.principalResponse'
+      document_id:
+        type: string
+      id:
+        type: string
+      requested_by:
+        $ref: '#/definitions/server.requestedByJSON'
+    type: object
+  server.approvalResponse:
+    properties:
+      approver:
+        $ref: '#/definitions/server.principalResponse'
+      decided_at:
+        type: string
+      decision:
+        type: string
+      document_id:
+        type: string
+      id:
+        type: string
+      note:
+        type: string
+      version_id:
+        type: string
+      version_number:
+        type: integer
+      version_sha256:
+        type: string
+    type: object
+  server.approvalsListResponse:
+    properties:
+      items:
+        items:
+          $ref: '#/definitions/server.approvalListItem'
+        type: array
+      status:
+        type: string
+      summary:
+        $ref: '#/definitions/repo.ApprovalSummary'
+      version_id:
+        type: string
+      version_number:
+        type: integer
+      version_sha256:
         type: string
     type: object
   server.cliExchangePrincipal:
@@ -245,6 +524,10 @@ definitions:
       matched_text:
         type: string
       status:
+        enum:
+        - attached
+        - orphaned
+        - moved
         type: string
       version_id:
         type: string
@@ -276,6 +559,8 @@ definitions:
         type: string
       current_placement:
         $ref: '#/definitions/server.commentPlacementResponse'
+      edited:
+        type: boolean
       id:
         type: string
       mentions:
@@ -298,6 +583,11 @@ definitions:
         type: string
       status:
         type: string
+      unread:
+        description: |-
+          Unread is set on a thread with a message by someone else that the
+          signed-in reader did not read. Anonymous readers get no read state.
+        type: boolean
     type: object
   server.configResponse:
     properties:
@@ -335,6 +625,12 @@ definitions:
         items:
           $ref: '#/definitions/server.commentMentionRequest'
         type: array
+      seq:
+        description: |-
+          Seq is the seq of the document that a text anchor is on: the page
+          shows the document at that seq. The anchor then follows the changes
+          after it. With no seq, the anchor is on the live document.
+        type: integer
       version_id:
         type: string
     type: object
@@ -344,8 +640,12 @@ definitions:
         type: string
       default_grant:
         $ref: '#/definitions/server.defaultGrant'
+      folder_id:
+        type: string
       id:
         type: string
+      permission_warning:
+        $ref: '#/definitions/server.permissionWarning'
     type: object
   server.createGrantResponse:
     properties:
@@ -380,14 +680,31 @@ definitions:
     type: object
   server.createVersionResponse:
     properties:
+      base_version_id:
+        description: BaseVersionID is the version before the new version.
+        type: string
       change_summary:
         type: string
       id:
         type: string
       number:
         type: integer
+      rebased:
+        description: |-
+          Rebased is set when the document changed after the base of the upload,
+          so the new version also holds the changes of other writers, and is
+          not the uploaded file.
+        type: boolean
+      seq:
+        description: Seq is the seq of the new version.
+        type: integer
       sha256:
         type: string
+      unchanged:
+        description: |-
+          Unchanged is set when the content is the document as it is. No
+          version was made, and the response names the current version.
+        type: boolean
     type: object
   server.defaultGrant:
     properties:
@@ -424,6 +741,53 @@ definitions:
       url:
         type: string
     type: object
+  server.documentListResponse:
+    properties:
+      has_more:
+        description: HasMore reports that more documents follow this page.
+        type: boolean
+      items:
+        items:
+          $ref: '#/definitions/repo.Document'
+        type: array
+    type: object
+  server.earlierDecision:
+    properties:
+      decided_at:
+        type: string
+      decision:
+        type: string
+    type: object
+  server.editDocumentRequest:
+    properties:
+      change_summary:
+        type: string
+      edits:
+        items:
+          $ref: '#/definitions/textedit.Edit'
+        type: array
+    type: object
+  server.editDocumentResponse:
+    properties:
+      base_version_id:
+        description: BaseVersionID is the version before the new version.
+        type: string
+      change_summary:
+        type: string
+      edits_applied:
+        type: integer
+      id:
+        type: string
+      number:
+        type: integer
+      sha256:
+        type: string
+      unchanged:
+        description: |-
+          Unchanged is set when the edits left the document as it is. No version
+          was made, and the response names the current version.
+        type: boolean
+    type: object
   server.errorBody:
     properties:
       code:
@@ -436,6 +800,17 @@ definitions:
     properties:
       error:
         $ref: '#/definitions/server.errorBody'
+    type: object
+  server.folderListResponse:
+    properties:
+      folder:
+        $ref: '#/definitions/repo.Folder'
+      has_more:
+        type: boolean
+      items:
+        items:
+          $ref: '#/definitions/repo.FolderEntry'
+        type: array
     type: object
   server.googleGroupSearchItem:
     properties:
@@ -520,6 +895,13 @@ definitions:
       url:
         type: string
     type: object
+  server.listResponse-repo_AccessRequest:
+    properties:
+      items:
+        items:
+          $ref: '#/definitions/repo.AccessRequest'
+        type: array
+    type: object
   server.listResponse-repo_CLICredential:
     properties:
       items:
@@ -527,11 +909,18 @@ definitions:
           $ref: '#/definitions/repo.CLICredential'
         type: array
     type: object
-  server.listResponse-repo_Document:
+  server.listResponse-repo_DocumentAccessRequest:
     properties:
       items:
         items:
-          $ref: '#/definitions/repo.Document'
+          $ref: '#/definitions/repo.DocumentAccessRequest'
+        type: array
+    type: object
+  server.listResponse-repo_InboxItem:
+    properties:
+      items:
+        items:
+          $ref: '#/definitions/repo.InboxItem'
         type: array
     type: object
   server.listResponse-repo_OwnershipTransfer:
@@ -560,6 +949,13 @@ definitions:
       items:
         items:
           $ref: '#/definitions/repo.Version'
+        type: array
+    type: object
+  server.listResponse-server_approvalRequestResponse:
+    properties:
+      items:
+        items:
+          $ref: '#/definitions/server.approvalRequestResponse'
         type: array
     type: object
   server.listResponse-server_commentResponse:
@@ -605,13 +1001,55 @@ definitions:
       name:
         type: string
     type: object
+  server.moveDocResponse:
+    properties:
+      document_id:
+        type: string
+      folder_id:
+        type: string
+      moved:
+        type: boolean
+      permission_warning:
+        $ref: '#/definitions/server.permissionWarning'
+    type: object
   server.notificationPreferencesRequest:
     properties:
       enabled:
         type: boolean
     type: object
+  server.operationRequest:
+    properties:
+      base_seq:
+        description: BaseSeq is the seq of the source that the replacements were made
+          on.
+        type: integer
+      client_op_id:
+        description: |-
+          ClientOpID names the operation, so that a retry applies nothing and
+          gets the answer of the first attempt.
+        type: string
+      replacements:
+        items:
+          $ref: '#/definitions/textedit.Replacement'
+        type: array
+      summary:
+        description: |-
+          Summary, when set, is a line of what History shows for the version.
+          When no operation of a version has one, the server names what a reader
+          sees change.
+        type: string
+    type: object
   server.patchCommentRequest:
     properties:
+      anchor:
+        allOf:
+        - $ref: '#/definitions/repo.Anchor'
+        description: Anchor moves a point comment to a new spot.
+      base_body:
+        description: |-
+          BaseBody is the body that an edit started from. When set, and another
+          edit changed the body since, the patch fails with 409 comment_changed.
+        type: string
       body:
         type: string
       mentions:
@@ -619,6 +1057,13 @@ definitions:
           $ref: '#/definitions/server.commentMentionRequest'
         type: array
       status:
+        type: string
+    type: object
+  server.permissionWarning:
+    properties:
+      kind:
+        type: string
+      message:
         type: string
     type: object
   server.principalRef:
@@ -643,9 +1088,24 @@ definitions:
     type: object
   server.renderTokenResponse:
     properties:
+      seq:
+        description: Seq is the seq of the source that the URL renders.
+        type: integer
       token:
         type: string
       url:
+        type: string
+    type: object
+  server.requestedByJSON:
+    properties:
+      email:
+        type: string
+      id:
+        type: string
+    type: object
+  server.restoreVersionRequest:
+    properties:
+      change_summary:
         type: string
     type: object
   server.serviceAccountKey:
@@ -672,6 +1132,26 @@ definitions:
         type: string
       picture_url:
         type: string
+    type: object
+  textedit.Edit:
+    properties:
+      new_string:
+        type: string
+      old_string:
+        type: string
+      replace_all:
+        type: boolean
+    type: object
+  textedit.Replacement:
+    properties:
+      end:
+        type: integer
+      new_html:
+        type: string
+      old_html:
+        type: string
+      start:
+        type: integer
     type: object
 info:
   contact: {}
@@ -723,6 +1203,11 @@ paths:
         name: token
         required: true
         type: string
+      - description: Seq of the source to render. Without it, or when the server no
+          longer has that seq, the content of the version.
+        in: query
+        name: seq
+        type: integer
       produces:
       - text/html
       responses:
@@ -733,6 +1218,21 @@ paths:
       summary: Render version wrapper
       tags:
       - render
+  /v1/access-requests:
+    get:
+      description: The newest first, across every document on which the caller manages
+        access. Each request names its document.
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/server.listResponse-repo_DocumentAccessRequest'
+      security:
+      - bearerAuth: []
+      - cookieAuth: []
+      summary: List requests for access to the documents that the caller manages
+      tags:
+      - documents
   /v1/auth/cli/credentials:
     get:
       produces:
@@ -915,13 +1415,21 @@ paths:
         in: query
         name: label
         type: string
+      - description: 'Page size: 25 by default, 100 at most'
+        in: query
+        name: limit
+        type: integer
+      - description: The number of documents to skip
+        in: query
+        name: offset
+        type: integer
       produces:
       - application/json
       responses:
         "200":
           description: OK
           schema:
-            $ref: '#/definitions/server.listResponse-repo_Document'
+            $ref: '#/definitions/server.documentListResponse'
       security:
       - bearerAuth: []
       - cookieAuth: []
@@ -942,6 +1450,11 @@ paths:
         name: file
         required: true
         type: file
+      - description: The folder for the document. The caller needs editor on it. The
+          default is the root.
+        in: formData
+        name: folder_id
+        type: string
       - description: 'Default sharing applied at create: viewer, commenter, editor
           or private. Overrides the server-wide default.'
         in: formData
@@ -1014,9 +1527,31 @@ paths:
       tags:
       - documents
   /v1/documents/{id}/access-requests:
+    get:
+      description: The newest first. People who manage access see every request. Other
+        callers see only their own request, so that they know it waits. A grant on
+        the document to the requester removes the request.
+      parameters:
+      - description: Document ID
+        in: path
+        name: id
+        required: true
+        type: string
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/server.listResponse-repo_AccessRequest'
+      security:
+      - bearerAuth: []
+      - cookieAuth: []
+      summary: List requests for access to a document
+      tags:
+      - documents
     post:
-      description: Notifies the current owner without revealing whether the document
-        or owner exists. Repeated requests are coalesced.
+      description: Records the request for the people who manage access, and notifies
+        the current owner when notifications are enabled. The response does not reveal
+        whether the document or owner exists. Repeated requests are coalesced.
       parameters:
       - description: Document ID
         in: path
@@ -1036,6 +1571,240 @@ paths:
       summary: Request access to a document
       tags:
       - documents
+  /v1/documents/{id}/access-requests/{requester_type}/{requester_id}:
+    delete:
+      description: Removes the request without a grant. The requester can ask again.
+      parameters:
+      - description: Document ID
+        in: path
+        name: id
+        required: true
+        type: string
+      - description: Requester type
+        enum:
+        - user
+        - service_account
+        in: path
+        name: requester_type
+        required: true
+        type: string
+      - description: Requester ID
+        in: path
+        name: requester_id
+        required: true
+        type: string
+      responses:
+        "204":
+          description: No Content
+      security:
+      - bearerAuth: []
+      - cookieAuth: []
+      summary: Decline a request for access to a document
+      tags:
+      - documents
+  /v1/documents/{id}/approvals:
+    get:
+      description: Per-approver decisions on the content of a version (current version
+        by default), merged with pending approvers, plus the derived aggregate status.
+        A decision made on an earlier version with the same content counts, and names
+        that version.
+      parameters:
+      - description: Document ID
+        in: path
+        name: id
+        required: true
+        type: string
+      - description: Version ID (defaults to the current version)
+        in: query
+        name: version
+        type: string
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/server.approvalsListResponse'
+      security:
+      - bearerAuth: []
+      - cookieAuth: []
+      summary: List decisions and aggregate status
+      tags:
+      - approvals
+    post:
+      description: 'Records the caller''s decision on the content of a version. The
+        open version is sealed first. The decision vouches for that content, so every
+        version with the same content shows it. Submitting again replaces the previous
+        decision on that content. A rejection needs a note unless the caller has open
+        comment threads on the document (the comments say what to change). Returns
+        409 version_superseded when the document''s content changed since that version,
+        or when seq, the seq that the page of the caller shows, is not the seq of
+        the live document, or when another person typed in the document in the last
+        10 seconds: the message then says to approve when they are done. With no seq,
+        as from the CLI, the decision is on the live document, and version_id in the
+        answer names the sealed version. A decision on an open version that holds
+        the text of the version before it is for that version.'
+      parameters:
+      - description: Document ID
+        in: path
+        name: id
+        required: true
+        type: string
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/server.approvalResponse'
+        "201":
+          description: Created
+          schema:
+            $ref: '#/definitions/server.approvalResponse'
+        "429":
+          description: Too Many Requests
+          schema:
+            $ref: '#/definitions/server.errorEnvelope'
+      security:
+      - bearerAuth: []
+      - cookieAuth: []
+      summary: Submit or update a decision
+      tags:
+      - approvals
+  /v1/documents/{id}/approvals/{approval_id}:
+    delete:
+      description: Removes the caller's decision, returning them to pending. Assignment
+        is unaffected.
+      parameters:
+      - description: Document ID
+        in: path
+        name: id
+        required: true
+        type: string
+      - description: Approval ID
+        in: path
+        name: approval_id
+        required: true
+        type: string
+      responses:
+        "204":
+          description: No Content
+      security:
+      - bearerAuth: []
+      - cookieAuth: []
+      summary: Revoke own decision
+      tags:
+      - approvals
+  /v1/documents/{id}/approvers:
+    get:
+      parameters:
+      - description: Document ID
+        in: path
+        name: id
+        required: true
+        type: string
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/server.listResponse-server_approvalRequestResponse'
+      security:
+      - bearerAuth: []
+      - cookieAuth: []
+      summary: List assigned approvers
+      tags:
+      - approvals
+    post:
+      description: 'Assigns a user or service account as an approver. The approver
+        must already have at least viewer access on the document. An approver who
+        loses viewer access when a grant is revoked stops being an approver. The request
+        is for no version: the approver decides on the version that they read.'
+      parameters:
+      - description: Document ID
+        in: path
+        name: id
+        required: true
+        type: string
+      responses:
+        "201":
+          description: Created
+          schema:
+            $ref: '#/definitions/server.approvalRequestResponse'
+      security:
+      - bearerAuth: []
+      - cookieAuth: []
+      summary: Assign an approver
+      tags:
+      - approvals
+  /v1/documents/{id}/approvers/{approver_id}:
+    delete:
+      description: Removes the assignment and revokes all of that approver's decisions
+        on the document.
+      parameters:
+      - description: Document ID
+        in: path
+        name: id
+        required: true
+        type: string
+      - description: Approval request ID
+        in: path
+        name: approver_id
+        required: true
+        type: string
+      responses:
+        "204":
+          description: No Content
+      security:
+      - bearerAuth: []
+      - cookieAuth: []
+      summary: Remove an approver
+      tags:
+      - approvals
+  /v1/documents/{id}/changes:
+    get:
+      description: 'For the browser, which follows the document while other people
+        edit it. ops are the operations after the seq after, in order. Each one is
+        a list of replacements on the source before it: start and end count UTF-8
+        bytes, and end is exclusive. The caller applies them in order to the source
+        at after, and then has the source at seq, the live document. sum is the CRC-32
+        (IEEE) of the UTF-8 bytes of that source. typed is true when the browser editor
+        made every one of the operations. authors made them, and the author of the
+        newest comes first. The response is 409 stale when the log no longer holds
+        every operation after the seq: load the document again.'
+      parameters:
+      - description: Document ID
+        in: path
+        name: id
+        required: true
+        type: string
+      - description: Seq of the source that the caller has
+        in: query
+        name: after
+        required: true
+        type: integer
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/repo.DocumentChanges'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/server.errorEnvelope'
+        "409":
+          description: Conflict
+          schema:
+            $ref: '#/definitions/server.errorEnvelope'
+        "422":
+          description: Unprocessable Entity
+          schema:
+            $ref: '#/definitions/server.errorEnvelope'
+        "429":
+          description: Too Many Requests
+          schema:
+            $ref: '#/definitions/server.errorEnvelope'
+      security:
+      - bearerAuth: []
+      - cookieAuth: []
+      summary: Get the operations after a seq
+      tags:
+      - versions
   /v1/documents/{id}/comments:
     get:
       parameters:
@@ -1044,7 +1813,8 @@ paths:
         name: id
         required: true
         type: string
-      - description: open|resolved|stale|orphaned|all
+      - description: 'Thread status: open or resolved. Empty or all lists every thread.
+          Replies travel with their thread.'
         in: query
         name: status
         type: string
@@ -1067,8 +1837,9 @@ paths:
       consumes:
       - application/json
       - application/vnd.slashdocs.comment-mentions+json
-      description: Requests with non-empty mentions must use Content-Type application/vnd.slashdocs.comment-mentions+json
-        so mixed-version deployments fail closed instead of dropping metadata.
+      description: |-
+        Requests with non-empty mentions must use Content-Type application/vnd.slashdocs.comment-mentions+json so mixed-version deployments fail closed instead of dropping metadata.
+        The anchor is a text anchor with a non-empty quote, or a point: anchor.point names an element by target (its data-slashdocs-target value or id), path (its child-index path under the body), or both, and x and y are fractions of its box, from 0 to 1 inside it and from -1000 to 1000 in all. A point may also give page_x and page_y, the spot in CSS pixels from the top left of the page, with viewport_w, the viewport width: they place the pin when a later version no longer has the element, and they alone put a point on the body. The text fields of a point hold the start of the element's text, which finds the element again after the document changes.
       parameters:
       - description: Document ID
         in: path
@@ -1120,7 +1891,8 @@ paths:
       - application/vnd.slashdocs.comment-mentions+json
       description: Any request containing the mentions key, including an empty array,
         must use Content-Type application/vnd.slashdocs.comment-mentions+json so mixed-version
-        deployments fail closed.
+        deployments fail closed. An anchor with a point moves a point comment to a
+        new spot. Text comments follow their text.
       parameters:
       - description: Document ID
         in: path
@@ -1144,6 +1916,14 @@ paths:
           description: OK
           schema:
             $ref: '#/definitions/server.commentResponse'
+        "409":
+          description: 'comment_changed: the body is no longer base_body'
+          schema:
+            $ref: '#/definitions/server.errorEnvelope'
+        "429":
+          description: Too Many Requests
+          schema:
+            $ref: '#/definitions/server.errorEnvelope'
       security:
       - bearerAuth: []
       - cookieAuth: []
@@ -1227,6 +2007,35 @@ paths:
       summary: Add comment reaction
       tags:
       - comments
+  /v1/documents/{id}/comments/{comment_id}/read:
+    put:
+      description: 'Sets the caller''s read time of a thread to now. The thread then
+        shows as read to the caller until someone else adds a message to it. Only
+        the thread''s first comment takes a mark: a reply id answers 404.'
+      parameters:
+      - description: Document ID
+        in: path
+        name: id
+        required: true
+        type: string
+      - description: Thread ID, the id of the thread's first comment
+        in: path
+        name: comment_id
+        required: true
+        type: string
+      responses:
+        "204":
+          description: No Content
+        "404":
+          description: 'not_found: no such thread in the document'
+          schema:
+            $ref: '#/definitions/server.errorEnvelope'
+      security:
+      - bearerAuth: []
+      - cookieAuth: []
+      summary: Mark comment thread read
+      tags:
+      - comments
   /v1/documents/{id}/comments/{comment_id}/replies:
     post:
       consumes:
@@ -1262,6 +2071,51 @@ paths:
       summary: Create comment reply
       tags:
       - comments
+  /v1/documents/{id}/edits:
+    post:
+      consumes:
+      - application/json
+      description: Applies exact find-and-replace edits to the live document on the
+        server and saves the result as a new version. Each old_string must occur exactly
+        once. The edits apply in order, and either all apply or none do. The HTML
+        is never parsed, so everything else stays byte-for-byte the same. When the
+        edits together leave the document as it is, the response is 200 with unchanged
+        set and the current version.
+      parameters:
+      - description: Document ID
+        in: path
+        name: id
+        required: true
+        type: string
+      - description: Edits
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/server.editDocumentRequest'
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/server.editDocumentResponse'
+        "201":
+          description: Created
+          schema:
+            $ref: '#/definitions/server.editDocumentResponse'
+        "409":
+          description: Conflict
+          schema:
+            $ref: '#/definitions/server.errorEnvelope'
+        "422":
+          description: Unprocessable Entity
+          schema:
+            $ref: '#/definitions/server.errorEnvelope'
+      security:
+      - bearerAuth: []
+      - cookieAuth: []
+      summary: Edit document text
+      tags:
+      - versions
   /v1/documents/{id}/grants:
     post:
       parameters:
@@ -1382,6 +2236,63 @@ paths:
       summary: Get a shareable link to a document, comment, or heading
       tags:
       - documents
+  /v1/documents/{id}/live:
+    get:
+      description: 'For the browser, which shows the live document, its viewers and
+        their cursors. The request upgrades to a WebSocket. The server sends each
+        event of the document as {"id": revision, "event": event}, with the events
+        and the data of GET /v1/documents/{id}/kv/events. id is absent on an event
+        that is not stored. A connection that names after_revision gets the stored
+        events after it first. Each connection then gets the current viewers, and
+        a document event with the seq of the live document and its current version.
+        A viewer with a session sends {"type": "presence", "version", "anchor"} when
+        their place changes, {"type": "cursor", "version", "points"} as their pointer
+        moves, and {"type": "left"} when they go. These have the validation, the size
+        limits and the rate limits of POST /v1/documents/{id}/presence and POST /v1/documents/{id}/cursor,
+        and the server drops a report that fails them. The server lists the viewer
+        while the connection is open, and marks them gone when it closes. A browser
+        connects only from the origin of the server. The server pings each 25 seconds.
+        It closes with code 4403 when the viewer can no longer read the document,
+        and with 1001 when it stops.'
+      parameters:
+      - description: Document ID
+        in: path
+        name: id
+        required: true
+        type: string
+      - description: Revision to resume after. Omit it to start at the live edge
+        in: query
+        name: after_revision
+        type: integer
+      - description: 'Viewer session: 8 to 64 characters of A-Z, a-z, 0-9, _ and -'
+        in: query
+        name: session
+        type: string
+      responses:
+        "101":
+          description: Switching Protocols
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/server.errorEnvelope'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/server.errorEnvelope'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/server.errorEnvelope'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/server.errorEnvelope'
+      security:
+      - bearerAuth: []
+      - cookieAuth: []
+      summary: Connect to the live events of a document over a WebSocket
+      tags:
+      - documents
   /v1/documents/{id}/notifications:
     get:
       parameters:
@@ -1428,8 +2339,87 @@ paths:
       summary: Enable or mute your document notifications
       tags:
       - notifications
+  /v1/documents/{id}/ops:
+    post:
+      consumes:
+      - application/json
+      description: 'For the browser editor. Applies replacements by position in the
+        source at base_seq to the live document. start and end count UTF-8 bytes,
+        end is exclusive, and old_html must be the source from start to end at base_seq.
+        Replacements are in order and do not overlap. A replacement whose old_html
+        is its new_html changes nothing: the server drops it, and others never holds
+        one. The operation makes no version: the first operation after a sealed version
+        opens the next version, and the server seals it after 10 minutes with no operation,
+        or before a write that is not typing. When the document had operations after
+        base_seq, the replacements move over them, and others holds those operations
+        in order, as they apply to the source that the caller made (the source at
+        base_seq with its replacements). Text that both put in at one point stays
+        twice, text that either takes out goes, and two replacements of the same words
+        both stay whole, the later one first. sum is the CRC-32 (IEEE) of the UTF-8
+        bytes of the source at seq: a caller whose source has another sum loads the
+        document again. A retry with the same client_op_id applies nothing and gets
+        the answer of the first attempt. When the server no longer has that answer,
+        the response is 409 stale with details.applied set: the document has the operation,
+        so the caller gets the live document and does not send that text again. summary
+        holds at most 200 characters. The response is 409 stale when the log no longer
+        holds the operations after base_seq, or when base_seq is more than 2000 operations
+        behind: get the live document, and send the text that is not sent yet again
+        on its seq.'
+      parameters:
+      - description: Document ID
+        in: path
+        name: id
+        required: true
+        type: string
+      - description: Operation
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/server.operationRequest'
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/repo.OperationResult'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/server.errorEnvelope'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/server.errorEnvelope'
+        "409":
+          description: Conflict
+          schema:
+            $ref: '#/definitions/server.errorEnvelope'
+        "413":
+          description: Request Entity Too Large
+          schema:
+            $ref: '#/definitions/server.errorEnvelope'
+        "422":
+          description: Unprocessable Entity
+          schema:
+            $ref: '#/definitions/server.errorEnvelope'
+        "429":
+          description: Too Many Requests
+          schema:
+            $ref: '#/definitions/server.errorEnvelope'
+      security:
+      - bearerAuth: []
+      - cookieAuth: []
+      summary: Write an operation of the browser editor
+      tags:
+      - versions
   /v1/documents/{id}/versions:
     get:
+      description: 'A version is a checkpoint: a burst of editing in the browser,
+        a push, an edit or a restore. The newest version is open while people type
+        in it: its change_summary then says what changed up to now, and it is not
+        in the list while its content is that of the version before. edited_at is
+        the time of the last operation of a version, or created_at when the server
+        holds none. authors are its creator and the people whose operations it holds.'
       parameters:
       - description: Document ID
         in: path
@@ -1450,6 +2440,22 @@ paths:
     post:
       consumes:
       - multipart/form-data
+      description: 'Saves the uploaded HTML, which must be valid UTF-8, as a new version.
+        When people changed the document after the base, the changes from the base
+        to the upload move onto the live document, and the response has rebased set:
+        the new version is then not the uploaded file. When the upload changes text
+        that people changed after the base, the response is 409 version_conflict and
+        their text stays: get the document and make the change again. details.text,
+        when set, is the sentence that holds that text, in plain words, so that a
+        person can find the place. When the upload is the document as it is, the response
+        is 200 with unchanged set and the current version: no version is made. The
+        base is the content of the base version, when the request has no base_seq
+        or the seq of that version. With a base_seq before the seq of the base version,
+        the base is the document at base_seq: the file was made from the version while
+        it was open. The response is 409 stale when the base is an open version with
+        no base_seq, or when the server no longer has the document at base_seq. It
+        is 422 base_version_not_found when base_version_id is not a version of the
+        document.'
       parameters:
       - description: Document ID
         in: path
@@ -1465,16 +2471,41 @@ paths:
         in: formData
         name: change_summary
         type: string
+      - description: Seq of the base version that the file was made from, from the
+          X-Slashdocs-Seq header of its HTML. Necessary when that version was open.
+        in: formData
+        name: base_seq
+        type: integer
       - description: HTML file
         in: formData
         name: file
         required: true
         type: file
       responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/server.createVersionResponse'
         "201":
           description: Created
           schema:
             $ref: '#/definitions/server.createVersionResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/server.errorEnvelope'
+        "409":
+          description: Conflict
+          schema:
+            $ref: '#/definitions/server.errorEnvelope'
+        "413":
+          description: Request Entity Too Large
+          schema:
+            $ref: '#/definitions/server.errorEnvelope'
+        "422":
+          description: Unprocessable Entity
+          schema:
+            $ref: '#/definitions/server.errorEnvelope'
       security:
       - bearerAuth: []
       - cookieAuth: []
@@ -1483,6 +2514,8 @@ paths:
       - versions
   /v1/documents/{id}/versions/{version_id}:
     get:
+      description: The change_summary of the open version says what changed up to
+        now.
       parameters:
       - description: Document ID
         in: path
@@ -1507,6 +2540,11 @@ paths:
       - versions
   /v1/documents/{id}/versions/{version_id}/html:
     get:
+      description: 'Gives the content of the version. For the open version that is
+        the live document, and no read seals a version. The header X-Slashdocs-Seq
+        has the seq of the HTML: send it as base_seq with a push that was made from
+        this HTML. With seq, gives the source at that seq. The response is 409 stale
+        for a seq that the version can no longer give.'
       parameters:
       - description: Document ID
         in: path
@@ -1518,13 +2556,33 @@ paths:
         name: version_id
         required: true
         type: string
+      - description: Seq of the source
+        in: query
+        name: seq
+        type: integer
       produces:
       - text/html
       responses:
         "200":
           description: OK
+          headers:
+            X-Slashdocs-Seq:
+              description: Seq of the HTML
+              type: integer
           schema:
             type: string
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/server.errorEnvelope'
+        "409":
+          description: Conflict
+          schema:
+            $ref: '#/definitions/server.errorEnvelope'
+        "429":
+          description: Too Many Requests
+          schema:
+            $ref: '#/definitions/server.errorEnvelope'
       security:
       - bearerAuth: []
       - cookieAuth: []
@@ -1533,6 +2591,9 @@ paths:
       - versions
   /v1/documents/{id}/versions/{version_id}/render-token:
     post:
+      description: Gives a URL that renders the version, and the seq of the source
+        that the URL renders. For an open version that is the seq of the live document
+        now.
       parameters:
       - description: Document ID
         in: path
@@ -1555,6 +2616,174 @@ paths:
       summary: Create render token
       tags:
       - versions
+  /v1/documents/{id}/versions/{version_id}/restore:
+    post:
+      consumes:
+      - application/json
+      description: Saves the content of an earlier version as the newest version,
+        as an edit by the caller. History keeps every version, so a restore can itself
+        be undone by restoring again. When the document has that content now, the
+        response is 200 with unchanged set and the current version.
+      parameters:
+      - description: Document ID
+        in: path
+        name: id
+        required: true
+        type: string
+      - description: Version ID to restore
+        in: path
+        name: version_id
+        required: true
+        type: string
+      - description: Change summary
+        in: body
+        name: body
+        schema:
+          $ref: '#/definitions/server.restoreVersionRequest'
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/server.createVersionResponse'
+        "201":
+          description: Created
+          schema:
+            $ref: '#/definitions/server.createVersionResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/server.errorEnvelope'
+        "409":
+          description: Conflict
+          schema:
+            $ref: '#/definitions/server.errorEnvelope'
+      security:
+      - bearerAuth: []
+      - cookieAuth: []
+      summary: Restore version
+      tags:
+      - versions
+  /v1/folders:
+    get:
+      description: 'With no parameters, lists the folders and documents at the root
+        of the caller. With folder_id or path, lists the contents of that folder.
+        With q or min_role, searches the folders that the caller can see by title,
+        at most 25: min_role keeps only the folders on which the caller has at least
+        that role, and min_role with no q lists every such folder, for a picker such
+        as the move dialog.'
+      parameters:
+      - description: Folder ID to list
+        in: query
+        name: folder_id
+        type: string
+      - description: Folder path to list, such as /A/B
+        in: query
+        name: path
+        type: string
+      - description: Words of a folder title
+        in: query
+        name: q
+        type: string
+      - description: Least role of the caller on each folder of a search
+        enum:
+        - viewer
+        - commenter
+        - editor
+        - owner
+        in: query
+        name: min_role
+        type: string
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/server.folderListResponse'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/server.errorEnvelope'
+        "409":
+          description: 'ambiguous_path: more than one folder has a name of the path'
+          schema:
+            $ref: '#/definitions/server.ambiguousPathResponse'
+      security:
+      - bearerAuth: []
+      - cookieAuth: []
+      summary: List or search folders
+      tags:
+      - folders
+  /v1/folders/{id}/documents:
+    post:
+      description: The caller needs the editor role on the document and on the folder.
+        The caller also needs the editor role on the folder that the document leaves,
+        unless the caller owns the document. permission_warning is set when the folder
+        gives access to more people than the document had.
+      parameters:
+      - description: Folder ID
+        in: path
+        name: id
+        required: true
+        type: string
+      - description: The document to move
+        in: body
+        name: body
+        required: true
+        schema:
+          properties:
+            document_id:
+              type: string
+          type: object
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/server.moveDocResponse'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/server.errorEnvelope'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/server.errorEnvelope'
+      security:
+      - bearerAuth: []
+      - cookieAuth: []
+      summary: Move a document into a folder
+      tags:
+      - folders
+  /v1/folders/{id}/documents/{doc_id}:
+    delete:
+      description: The caller needs the editor role on the document, and on the folder
+        that it leaves unless the caller owns the document.
+      parameters:
+      - description: Folder ID
+        in: path
+        name: id
+        required: true
+        type: string
+      - description: Document ID
+        in: path
+        name: doc_id
+        required: true
+        type: string
+      responses:
+        "204":
+          description: No Content
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/server.errorEnvelope'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/server.errorEnvelope'
+      security:
+      - bearerAuth: []
+      - cookieAuth: []
+      summary: Move a document out of a folder to the root
+      tags:
+      - folders
   /v1/folders/{id}/grants:
     post:
       parameters:
@@ -1575,6 +2804,10 @@ paths:
           description: Created
           schema:
             $ref: '#/definitions/repo.Grant'
+        "429":
+          description: Too Many Requests
+          schema:
+            $ref: '#/definitions/server.errorEnvelope'
       security:
       - bearerAuth: []
       - cookieAuth: []
@@ -1631,6 +2864,28 @@ paths:
       summary: Current principal
       tags:
       - auth
+  /v1/me/inbox:
+    get:
+      description: 'The newest first, at most 50: each document that the caller approves
+        and did not decide on (kind approval), and each open thread on a document
+        of the caller, that they wrote in, or that mentions them, with a message by
+        someone else after their last read or message (kind thread). It holds only
+        documents that the caller can read now.'
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/server.listResponse-repo_InboxItem'
+        "429":
+          description: Too Many Requests
+          schema:
+            $ref: '#/definitions/server.errorEnvelope'
+      security:
+      - bearerAuth: []
+      - cookieAuth: []
+      summary: List what waits on the caller
+      tags:
+      - documents
   /v1/me/notifications:
     get:
       responses:

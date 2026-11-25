@@ -4,6 +4,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { ChevronRight, FileText, Folder as FolderIcon, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { LoadErrorLine } from "@/components/error-state";
 import { api, docID, docTitle, type FeaturedSection, type FolderEntry } from "@/api";
 import { cn } from "@/lib/cn";
 import { errorMessage } from "@/lib/errors";
@@ -26,6 +27,12 @@ export function FeaturedItems() {
     queryKey: queryKeys.featured(),
     queryFn: api.listFeatured,
   });
+  if (featured.isError && !featured.data)
+    return (
+      <LoadErrorLine boxed query={featured}>
+        Could not load the featured documents.
+      </LoadErrorLine>
+    );
   return (featured.data?.items || []).map((section) => (
     <FeaturedRow key={section.title} section={section} />
   ));
@@ -50,7 +57,7 @@ function FeaturedRow({ section }: { section: FeaturedSection }) {
           aria-expanded={!collapsed}
           aria-controls={contentID}
           onClick={toggle}
-          className="-ml-1 flex cursor-pointer items-center gap-1 rounded-sm py-1 pl-1 pr-1.5 hover:bg-[var(--color-surface-muted)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-accent)]"
+          className="-ml-1 flex cursor-pointer items-center gap-1 rounded-sm py-1 pl-1 pr-1.5 hover:bg-[var(--color-surface-muted)]"
         >
           <ChevronRight
             aria-hidden
@@ -93,7 +100,7 @@ function FeaturedCard({ item, hideable }: { item: FolderEntry; hideable: boolean
   const hide = useMutation({
     mutationFn: () => api.hideFeatured(id),
     onSuccess: () => qc.invalidateQueries({ queryKey: queryKeys.featured() }),
-    onError: (e) => toast.error(errorMessage(e, "Could not hide")),
+    onError: (e) => toast.error(errorMessage(e, `Could not hide “${title}”`)),
   });
   const Icon = isFolder ? FolderIcon : FileText;
 
@@ -119,8 +126,9 @@ function FeaturedCard({ item, hideable }: { item: FolderEntry; hideable: boolean
           variant="ghost"
           size="icon"
           aria-label="Hide"
-          className="absolute right-1 h-10 w-10 cursor-pointer opacity-0 transition-opacity group-hover:opacity-100 focus-visible:opacity-100"
-          disabled={hide.isPending}
+          // A busy Hide still takes the press, so that it does not open the item.
+          className="absolute right-1 h-10 w-10 cursor-pointer opacity-0 transition-opacity group-hover:opacity-100 focus-visible:opacity-100 disabled:pointer-events-auto aria-busy:opacity-100"
+          busy={hide.isPending}
           onClick={() => hide.mutate()}
         >
           <X className="h-3.5 w-3.5" />

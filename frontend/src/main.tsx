@@ -2,10 +2,10 @@ import React from "react";
 import { createRoot } from "react-dom/client";
 import { BrowserRouter, Navigate, Route, Routes, useParams } from "react-router-dom";
 import { QueryCache, QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { Toaster, toast } from "sonner";
+import { toast } from "sonner";
+import { Toaster } from "@/components/ui/toaster";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import "./styles.css";
-import { APIError } from "@/api";
 import { errorMessage } from "@/lib/errors";
 import { ThemeProvider } from "@/lib/theme";
 import { AppShell } from "@/components/layout/app-shell";
@@ -18,25 +18,21 @@ import { ServiceAccountsPage } from "@/pages/service-accounts";
 import { DevelopersPage } from "@/pages/developers";
 import { ProfilePage } from "@/pages/profile";
 import { StartPage } from "@/pages/start";
+import { NotFoundPage } from "@/pages/not-found";
+import { retryQuery, toastQueryError } from "@/lib/query-retry";
 import { migrateLegacyStorage } from "@/lib/legacy-storage";
 import { finishLegacySignOut } from "@/lib/auth-state";
 
-// Query failures (other than auth, handled by route guards) and any mutation
-// without its own onError surface as a toast.
+// A failed refresh of shown data (other than auth, handled by route guards)
+// and any mutation without its own onError surface as a toast.
 const qc = new QueryClient({
   defaultOptions: {
-    queries: { refetchOnWindowFocus: false },
+    queries: { refetchOnWindowFocus: false, retry: retryQuery },
     mutations: {
       onError: (e) => toast.error(errorMessage(e)),
     },
   },
-  queryCache: new QueryCache({
-    onError: (e, query) => {
-      if (query.meta?.suppressGlobalError) return;
-      if (e instanceof APIError && e.status === 401) return;
-      toast.error(errorMessage(e));
-    },
-  }),
+  queryCache: new QueryCache({ onError: toastQueryError }),
 });
 
 function App() {
@@ -59,7 +55,11 @@ function App() {
                   element={<ServiceAccountsPage />}
                 />
                 <Route path="settings/profile" element={<ProfilePage />} />
-                <Route path="developers" element={<DevelopersPage />} />
+                <Route path="settings/developers" element={<DevelopersPage />} />
+                <Route
+                  path="developers"
+                  element={<Navigate to="/app/settings/developers" replace />}
+                />
               </Route>
               {/* legacy redirects */}
               <Route path="/documents/:id" element={<LegacyDocRedirect />} />
@@ -67,9 +67,11 @@ function App() {
                 path="/service-accounts"
                 element={<Navigate to="/app/settings/service-accounts" replace />}
               />
-              <Route path="*" element={<Navigate to="/" replace />} />
+              <Route element={<AppShell />}>
+                <Route path="*" element={<NotFoundPage />} />
+              </Route>
             </Routes>
-            <Toaster position="bottom-right" theme="system" richColors />
+            <Toaster />
           </BrowserRouter>
         </TooltipProvider>
       </QueryClientProvider>

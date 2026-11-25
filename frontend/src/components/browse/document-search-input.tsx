@@ -1,8 +1,18 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { Calendar, Folder, Search, SlidersHorizontal, UserRound } from "lucide-react";
+import {
+  Calendar,
+  Folder,
+  Search,
+  SlidersHorizontal,
+  UserRound,
+  X,
+} from "lucide-react";
 import { api } from "@/api";
-import { Avatar } from "@/components/ui/misc";
+import { useDebounced } from "@/lib/hooks";
+import { Button } from "@/components/ui/button";
+import { Avatar, RetryButton } from "@/components/ui/misc";
+import { principalColor } from "@/lib/principals";
 import { queryKeys } from "@/lib/queryKeys";
 import {
   DATE_KEYS,
@@ -42,6 +52,9 @@ export function DocumentSearchInput({
   const token = useMemo(() => searchTokenAt(value, cursor), [value, cursor]);
   const lookup = remoteQuery(token);
   const lookupText = useDebounced(lookup.query, 150);
+  // While the lookup waits for the words typed last, it shows no older people
+  // or folders.
+  const settled = lookupText === lookup.query;
 
   const people = useQuery({
     queryKey: queryKeys.userSearch(lookupText),
@@ -56,16 +69,25 @@ export function DocumentSearchInput({
     staleTime: 30_000,
   });
 
+  // The people or folders that the field searches. A search that failed says
+  // so, with Retry, and not that nothing matches.
+  const remote =
+    lookup.key === "from" ? people : lookup.key === "in" ? folders : undefined;
   const suggestions = suggestionsFor(token, value, {
-    people: people.data?.items.map((person) => ({
+    people: (settled ? people.data : undefined)?.items.map((person) => ({
       label: person.name || person.email || person.id,
       detail: person.name ? person.email : undefined,
       icon: (
-        <Avatar src={person.picture_url} name={person.name || person.email} size={20} />
+        <Avatar
+          src={person.picture_url}
+          name={person.name || person.email}
+          size={20}
+          color={principalColor(person)}
+        />
       ),
       replacement: `from:${person.email || person.id}`,
     })),
-    folders: folders.data?.items.flatMap(({ folder }) =>
+    folders: (settled ? folders.data : undefined)?.items.flatMap(({ folder }) =>
       folder
         ? [
             {
@@ -77,7 +99,8 @@ export function DocumentSearchInput({
           ]
         : [],
     ),
-    searching: people.isFetching || folders.isFetching,
+    searching: !settled || people.isFetching || folders.isFetching,
+    failed: !!remote?.isError,
   });
   const items = suggestions?.items || [];
   const open = focused && !dismissed && !!suggestions;
@@ -127,6 +150,10 @@ export function DocumentSearchInput({
           setDismissed(false);
         }}
         onKeyDown={(event) => {
+          if (event.key === "ArrowDown" && dismissed) {
+            event.preventDefault();
+            setDismissed(false);
+          }
           if (!open) return;
           if (event.key === "Escape") {
             event.preventDefault();
@@ -142,13 +169,13 @@ export function DocumentSearchInput({
             choose(activeIndex);
           }
         }}
-        placeholder="Search every word, even the footnotes…"
-        className="h-14 w-full rounded-[18px] bg-[var(--color-surface)] pl-14 pr-5 text-base text-transparent caret-[var(--color-fg)] shadow-[0_12px_40px_rgb(20_30_48/0.1)] outline-none placeholder:text-[var(--color-fg-muted)] dark:shadow-[0_14px_36px_rgb(0_0_0/0.42)]"
+        placeholder="Search every word…"
+        className="h-14 w-full rounded-[18px] bg-[var(--color-surface)] pl-14 pr-14 text-base text-transparent caret-[var(--color-fg)] shadow-[0_12px_40px_rgb(20_30_48/0.1)] outline-none placeholder:text-[var(--color-fg-muted)] dark:shadow-[0_14px_36px_rgb(0_0_0/0.42)]"
         role="combobox"
         aria-label="Search documents"
         aria-autocomplete="list"
         aria-expanded={open}
-        aria-controls={open ? "document-search-suggestions" : undefined}
+        aria-controls={open ? "document-search-options" : undefined}
         aria-activedescendant={
           open && items.length > 0
             ? `document-search-suggestion-${activeIndex}`
@@ -156,51 +183,83 @@ export function DocumentSearchInput({
         }
       />
       {/* The input text is transparent. This copy draws it with modifiers
-          highlighted, clipped to the input's content box: pl-14 / pr-5. */}
+          highlighted, clipped to the input's content box: pl-14 / pr-14. */}
       <div
         ref={mirrorRef}
         aria-hidden
-        className="pointer-events-none absolute inset-y-0 left-14 right-5 flex items-center overflow-hidden whitespace-pre text-base text-[var(--color-fg)]"
+        className="pointer-events-none absolute inset-y-0 left-14 right-14 flex items-center overflow-hidden whitespace-pre text-base text-[var(--color-fg)]"
       >
         <HighlightedQuery value={value} />
       </div>
-      {open ? (
-        <div
-          id="document-search-suggestions"
-          role="listbox"
-          aria-label={suggestions.heading}
-          className="absolute inset-x-0 top-[calc(100%+8px)] z-50 rounded-md border border-[var(--color-border)] bg-[var(--color-surface)] p-1 text-left shadow-[var(--shadow-pop)] dark:border-transparent"
+      {value ? (
+        <Button
+          variant="ghost"
+          size="icon"
+          aria-label="Clear search"
+          className="absolute right-2.5 top-1/2 z-10 h-10 w-10 -translate-y-1/2 rounded-full text-[var(--color-fg-muted)] hover:text-[var(--color-fg)]"
+          onMouseDown={(event) => event.preventDefault()}
+          onClick={() => {
+            onChange("");
+            setCursor(0);
+            inputRef.current?.focus();
+          }}
         >
-          <p className="px-3 pb-1 pt-2 text-xs font-medium text-[var(--color-fg-muted)]">
+          <X className="h-4 w-4" />
+        </Button>
+      ) : null}
+      {open ? (
+        // Only options go in the list. The heading names it, and the status
+        // with Retry follows it.
+        <div className="absolute inset-x-0 top-[calc(100%+8px)] z-50 rounded-md border border-[var(--color-border)] bg-[var(--color-surface)] p-1 text-left shadow-[var(--shadow-pop)] dark:border-transparent">
+          <p
+            id="document-search-heading"
+            className="px-3 pb-1 pt-2 text-xs font-medium text-[var(--color-fg-muted)]"
+          >
             {suggestions.heading}
           </p>
-          {items.map((item, index) => (
-            <button
-              id={`document-search-suggestion-${index}`}
-              key={item.replacement}
-              type="button"
-              role="option"
-              aria-selected={index === activeIndex}
-              className="flex min-h-10 w-full items-center gap-3 rounded-sm px-3 py-2 text-left transition-[background-color,color] duration-150 ease-out hover:bg-[var(--color-surface-muted)] aria-selected:bg-[var(--color-surface-muted)]"
-              onMouseDown={(event) => event.preventDefault()}
-              onMouseEnter={() => setActiveIndex(index)}
-              onClick={() => choose(index)}
-            >
-              <span className="flex h-5 w-5 shrink-0 items-center justify-center text-[var(--color-fg-muted)]">
-                {item.icon}
-              </span>
-              <span className="min-w-0 truncate text-sm font-medium">{item.label}</span>
-              {item.detail ? (
-                <span className="ml-auto min-w-0 shrink truncate text-xs text-[var(--color-fg-muted)]">
-                  {item.detail}
+          <div
+            id="document-search-options"
+            role="listbox"
+            aria-labelledby="document-search-heading"
+          >
+            {items.map((item, index) => (
+              // The field keeps the focus, so an option is no tab stop.
+              <div
+                id={`document-search-suggestion-${index}`}
+                key={item.replacement}
+                role="option"
+                aria-selected={index === activeIndex}
+                className="flex min-h-10 w-full cursor-pointer items-center gap-3 rounded-sm px-3 py-2 text-left transition-[background-color,color] duration-150 ease-out hover:bg-[var(--color-highlight)] aria-selected:bg-[var(--color-highlight)]"
+                onMouseDown={(event) => event.preventDefault()}
+                onMouseEnter={() => setActiveIndex(index)}
+                onClick={() => choose(index)}
+              >
+                <span className="flex h-5 w-5 shrink-0 items-center justify-center text-[var(--color-fg-muted)]">
+                  {item.icon}
                 </span>
-              ) : null}
-            </button>
-          ))}
+                <span className="min-w-0 truncate text-sm font-medium">
+                  {item.label}
+                </span>
+                {item.detail ? (
+                  <span className="ml-auto min-w-0 shrink truncate text-xs text-[var(--color-fg-muted)]">
+                    {item.detail}
+                  </span>
+                ) : null}
+              </div>
+            ))}
+          </div>
           {suggestions.status ? (
-            <p className="px-3 py-2 text-sm text-[var(--color-fg-muted)]">
-              {suggestions.status}
-            </p>
+            <div className="flex items-center gap-3 px-3 py-2 text-sm text-[var(--color-fg-muted)]">
+              <p className="min-w-0 flex-1">{suggestions.status}</p>
+              {remote?.isError ? (
+                <RetryButton
+                  query={remote}
+                  variant="outline"
+                  size="sm"
+                  onMouseDown={(event) => event.preventDefault()}
+                />
+              ) : null}
+            </div>
           ) : null}
         </div>
       ) : null}
@@ -238,7 +297,12 @@ function remoteQuery(token: SearchToken): { key?: string; query: string } {
 function suggestionsFor(
   token: SearchToken,
   query: string,
-  found: { people?: Suggestion[]; folders?: Suggestion[]; searching: boolean },
+  found: {
+    people?: Suggestion[];
+    folders?: Suggestion[];
+    searching: boolean;
+    failed: boolean;
+  },
 ): Suggestions | null {
   const typed = token.value.replace(/^[@#]/, "").toLowerCase();
   const { key } = remoteQuery(token);
@@ -268,7 +332,7 @@ function suggestionsFor(
     return {
       heading: "People",
       items,
-      status: statusFor(typed.length >= 2, found.searching, items.length, "people"),
+      status: statusFor(typed.length >= 2, found, items.length, "people"),
     };
   }
   if (key === "in") {
@@ -276,7 +340,7 @@ function suggestionsFor(
     return {
       heading: "Folders",
       items,
-      status: statusFor(!!typed, found.searching, items.length, "folders"),
+      status: statusFor(!!typed, found, items.length, "folders"),
     };
   }
   if (DATE_KEYS.has(key)) {
@@ -297,11 +361,12 @@ function suggestionsFor(
 
 function statusFor(
   searched: boolean,
-  searching: boolean,
+  { searching, failed }: { searching: boolean; failed: boolean },
   count: number,
   noun: string,
 ): string | undefined {
   if (!searched) return `Type to search ${noun}`;
+  if (failed && !searching) return `Could not search ${noun}`;
   if (searching && count === 0) return "Searching…";
   if (count === 0) return `No matching ${noun}`;
   return undefined;
@@ -356,13 +421,4 @@ function dateValues(typed: string): { value: string; detail: string }[] {
 function dayLabel(date: Date): string {
   const pad = (n: number) => String(n).padStart(2, "0");
   return `${pad(date.getDate())}-${pad(date.getMonth() + 1)}-${pad(date.getFullYear() % 100)}`;
-}
-
-function useDebounced(value: string, delay: number): string {
-  const [debounced, setDebounced] = useState(value);
-  useEffect(() => {
-    const timeout = window.setTimeout(() => setDebounced(value), delay);
-    return () => window.clearTimeout(timeout);
-  }, [value, delay]);
-  return debounced;
 }

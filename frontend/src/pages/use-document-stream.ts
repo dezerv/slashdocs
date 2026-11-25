@@ -1,24 +1,43 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import {
-  api,
   type Anchor,
+  type Comment,
+  type CursorPoint,
   type CursorSpot,
   type DocumentCursor,
+  type DocumentEvent,
   type DocumentKVEvent,
   type DocumentPresence,
   type Principal,
 } from "@/api";
 import { queryKeys } from "@/lib/queryKeys";
+import type { Replacement } from "@/lib/source-edits";
 import { createCursorBatch } from "@/lib/live-cursors";
 import { principalColor, principalLabel, samePrincipal } from "@/lib/principals";
 import type { RemoteCursor } from "../../bridge/cursors";
+import { randomId } from "@/lib/uuid";
+import { noticeBuild } from "@/lib/build";
+import { useInvalidateApprovals } from "./use-invalidate-approvals";
+import { withThread } from "./comment-events";
 
-// The server lists a viewer for 45 seconds after their last report.
+// The version of the cursor of a viewer who follows the newest version.
+// Such viewers are a version apart for a moment at each change, and their
+// cursors must not hide then.
+export const LIVE = "live";
+
+// The server lists a viewer for 45 seconds after their last report. While
+// the live connection is open, the server reports again for them.
 const PRESENCE_TTL = 45_000;
-const HEARTBEAT_INTERVAL = 20_000;
 const REPORT_INTERVAL = 2_000;
-const RECONNECT_DELAY = 10_000;
+// A live connection that drops connects again after about this long, and
+// twice as long after each failure that follows, up to RECONNECT_MAX.
+const RECONNECT_MIN = 1_000;
+const RECONNECT_MAX = 30_000;
+// The server closes a connection that it refuses with 4000 plus the HTTP
+// status: 4401 when the viewer must sign in, 4403 when they cannot read the
+// document, or no longer can.
+const REFUSED = 4000;
 
 export type Viewer = {
   session: string;
@@ -31,113 +50,185 @@ export type Viewer = {
 export type DocumentKVListener = (event: DocumentKVEvent) => void;
 export type CursorListener = (cursor: RemoteCursor) => void;
 
-const EVENT_KINDS = ["kv", "document", "comments", "presence", "cursor"] as const;
-
 type DocumentEventHandlers = Partial<
-  Record<(typeof EVENT_KINDS)[number], DocumentKVListener>
-> & { open?: () => void };
+  Record<NonNullable<DocumentKVEvent["kind"]>, DocumentKVListener>
+> & { open?: () => void; closed?: () => void };
 
-// useDocumentEvents holds one connection to the document event stream and
-// passes each event to the handler for its kind. A session marks the
-// connection as a viewer, whom the server lists until the stream ends.
+// A report of this viewer to the others: their place in the document, their
+// pointer, or that they go.
+export type LiveReport =
+  | { type: "presence"; version: string; anchor?: Partial<Anchor> }
+  | { type: "cursor"; version: string; points: CursorPoint[] }
+  | { type: "left" };
+
+// useDocumentEvents holds one live connection to a document, and passes
+// each event to the handler for its kind. A session marks the connection as
+// a viewer, whom the server lists until the connection ends. A connection
+// that drops connects again, at a random time in a wait that grows, and
+// continues after the last event that it took. A connection that the server
+// refuses calls closed, and stops. It returns the function that sends a
+// report while the connection is open.
 export function useDocumentEvents(
   docId: string,
   handlers: DocumentEventHandlers,
   session?: string,
+  enabled = true,
 ) {
   const handlersRef = useRef(handlers);
   handlersRef.current = handlers;
-  const [attempt, setAttempt] = useState(0);
-  const lastRevision = useRef(0);
+  const socket = useRef<WebSocket | null>(null);
 
   useEffect(() => {
-    const params = new URLSearchParams(session ? { session } : {});
-    // The browser resumes dropped streams itself. Only a stream it gave up on
-    // is opened again here, and it continues from the last event it saw.
-    if (lastRevision.current)
-      params.set("after_revision", String(lastRevision.current));
-    const source = new EventSource(
-      `/v1/documents/${encodeURIComponent(docId)}/kv/events?${params}`,
-      { withCredentials: true },
-    );
-    source.onopen = () => handlersRef.current.open?.();
-    // KV changes are unnamed messages; other kinds are named events.
-    for (const kind of EVENT_KINDS) {
-      source.addEventListener(kind === "kv" ? "message" : kind, (message) => {
-        lastRevision.current = Math.max(
-          lastRevision.current,
-          Number(message.lastEventId) || 0,
-        );
-        let event: DocumentKVEvent;
+    if (!enabled) return;
+    let lastRevision = 0;
+    let failures = 0;
+    let reconnect: number | undefined;
+    const connect = () => {
+      const params = new URLSearchParams(session ? { session } : {});
+      if (lastRevision) params.set("after_revision", String(lastRevision));
+      const url = new URL(
+        `/v1/documents/${encodeURIComponent(docId)}/live?${params}`,
+        window.location.href,
+      );
+      url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+      const ws = new WebSocket(url);
+      socket.current = ws;
+      ws.onopen = () => {
+        failures = 0;
+        handlersRef.current.open?.();
+      };
+      ws.onmessage = ({ data }: MessageEvent<string>) => {
+        let message: { id?: number; event?: DocumentKVEvent };
         try {
-          event = JSON.parse(message.data) as DocumentKVEvent;
+          message = JSON.parse(data);
         } catch {
           return;
         }
-        handlersRef.current[kind]?.(event);
-      });
-    }
-    let reconnect: number | undefined;
-    source.onerror = () => {
-      if (source.readyState !== EventSource.CLOSED) return;
-      reconnect = window.setTimeout(() => setAttempt((n) => n + 1), RECONNECT_DELAY);
+        const { id, event } = message;
+        if (!event) return;
+        lastRevision = Math.max(lastRevision, id ?? 0);
+        handlersRef.current[event.kind || "kv"]?.(event);
+      };
+      ws.onclose = ({ code }) => {
+        socket.current = null;
+        if (code >= REFUSED && code < REFUSED + 1000)
+          return handlersRef.current.closed?.();
+        const wait = Math.min(RECONNECT_MAX, RECONNECT_MIN * 2 ** failures++);
+        reconnect = window.setTimeout(connect, wait * (0.5 + Math.random() / 2));
+      };
     };
+    connect();
     return () => {
-      source.close();
       window.clearTimeout(reconnect);
+      const ws = socket.current;
+      socket.current = null;
+      if (!ws) return;
+      ws.onclose = null;
+      if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "left" }));
+      ws.close();
     };
-  }, [docId, session, attempt]);
+  }, [docId, session, enabled]);
+
+  return useCallback((report: LiveReport) => {
+    if (socket.current?.readyState === WebSocket.OPEN)
+      socket.current.send(JSON.stringify(report));
+  }, []);
 }
 
 // useDocumentStream is the document page's view of the event stream. It
-// passes KV changes to subscribers, refreshes comments and the document when
-// they change, and reports and tracks who is viewing and where they point.
+// passes KV changes to subscribers, puts each changed comment thread into
+// the comments, refreshes approvals when they change, tells the page of each
+// change to the document, and reports and tracks who is viewing and where
+// they point.
 export function useDocumentStream({
   docId,
+  enabled,
   version,
+  following,
   principal,
-  onRemoteDocumentChange,
+  onDocumentChange,
 }: {
   docId: string;
+  enabled: boolean;
   version: string;
+  // The page follows the newest version: it is not a preview, and no change
+  // waits for the reader.
+  following: boolean;
   principal?: Principal;
-  onRemoteDocumentChange: () => void;
+  // Called on each change to the document, with what the event tells of
+  // it, if it names a seq. The server also tells where the document is when
+  // the connection opens, because the changes before that sent no event
+  // here. It is called with no event when the event cannot tell the change,
+  // as for a new title, and when the server refuses the connection.
+  onDocumentChange: (event?: DocumentEvent) => void;
 }) {
   const q = useQueryClient();
-  const [session] = useState(() => crypto.randomUUID());
+  const invalidateApprovals = useInvalidateApprovals(docId);
+  const [session] = useState(() => randomId());
   const kvListeners = useRef(new Set<DocumentKVListener>());
   const [sessions, setSessions] = useState<ReadonlyMap<string, Viewer>>(new Map());
   const place = useRef<{ version: string; anchor?: Partial<Anchor> }>({ version });
 
   // The newest point of each remote cursor, so that a frame that loads later
   // can draw it. A cursor on another version than this one is hidden here.
+  const cursorOn = useRef(version);
+  cursorOn.current = following ? LIVE : version;
   const cursors = useRef(new Map<string, { cursor: RemoteCursor; version: string }>());
   const cursorListeners = useRef(new Set<CursorListener>());
+  // The sessions seen so far, to tell when someone arrives, and how to send
+  // them this viewer's cursor then.
+  const knownSessions = useRef(new Set<string>());
+  const resendCursor = useRef<() => void>(() => {});
   const shownCursor = useCallback(
     (cursor: RemoteCursor, on: string) =>
-      on === place.current.version ? cursor : hiddenCursor(cursor),
+      on === cursorOn.current ? cursor : hiddenCursor(cursor),
     [],
   );
   const emitCursor = useCallback((cursor: RemoteCursor) => {
     cursorListeners.current.forEach((listener) => listener(cursor));
   }, []);
 
-  useDocumentEvents(
+  const send = useDocumentEvents(
     docId,
     {
-      open: () => setSessions(new Map()),
+      // The server lists the viewers again, and this viewer is one of them.
+      open: () => {
+        knownSessions.current.clear();
+        setSessions(new Map());
+        report();
+      },
+      // The page asks for the document again, and shows why it cannot.
+      closed: () => onDocumentChange(),
       kv: (event) => kvListeners.current.forEach((listener) => listener(event)),
-      comments: () => q.invalidateQueries({ queryKey: queryKeys.comments(docId) }),
+      // A comments event has the thread that changed. The comments load
+      // again only when the event cannot change them: they did not load
+      // yet, a load is under way, or the event has no thread.
+      comments: (event) => {
+        const key = queryKeys.comments(docId);
+        const data = q.getQueryData<{ items: Comment[] }>(key);
+        const items =
+          data && !q.isFetching({ queryKey: key })
+            ? withThread(data.items, event, principal)
+            : undefined;
+        if (items) q.setQueryData(key, { ...data, items });
+        else q.invalidateQueries({ queryKey: key });
+      },
+      approvals: invalidateApprovals,
       document: (event) => {
-        if (!samePrincipal(event.updated_by, principal)) onRemoteDocumentChange();
-        q.invalidateQueries({ queryKey: queryKeys.document(docId) });
-        q.invalidateQueries({ queryKey: queryKeys.versions(docId) });
+        noticeBuild((event.data as { build?: string } | undefined)?.build);
+        onDocumentChange(documentEvent(event));
       },
       presence: (event) => {
         const presence = event.data as DocumentPresence | undefined;
         const viewer = event.updated_by;
         if (!presence?.session || presence.session === session || !viewer) return;
         const key = `${viewer.type}:${viewer.id}:${presence.session}`;
+        // Someone new sees this viewer's cursor and view at once.
+        if (!presence.left && !knownSessions.current.has(presence.session)) {
+          knownSessions.current.add(presence.session);
+          resendCursor.current();
+        }
+        if (presence.left) knownSessions.current.delete(presence.session);
         setSessions((current) => {
           const next = new Map(current);
           if (presence.left) next.delete(key);
@@ -157,21 +248,26 @@ export function useDocumentStream({
         const viewer = event.updated_by;
         const last = data?.points?.at(-1);
         if (!data || !last || data.session === session || !viewer) return;
-        if (samePrincipal(viewer, principal)) return;
+        // This reader's other tab shows no cursor, only the block it edits.
+        const own = samePrincipal(viewer, principal);
         const cursor = {
           session: data.session,
           name: principalLabel(viewer),
           color: principalColor(viewer),
-          points: data.points,
+          own,
+          points: own
+            ? data.points.map(({ t, e }) => ({ ...hiddenPoint(t), e }))
+            : data.points,
         };
         cursors.current.set(data.session, {
-          cursor: { ...cursor, points: [last] },
+          cursor: { ...cursor, points: cursor.points.slice(-1) },
           version: data.version,
         });
         emitCursor(shownCursor(cursor, data.version));
       },
     },
     session,
+    enabled,
   );
 
   // A cursor goes away with its viewer.
@@ -196,19 +292,18 @@ export function useDocumentStream({
     return () => window.clearInterval(timer);
   }, []);
 
-  // Report this viewer's place: at once on a version change, at most every
-  // REPORT_INTERVAL while scrolling, and as a heartbeat otherwise. Only a
-  // signed-in viewer reports.
+  // Report this viewer's place: at once when the connection opens or the
+  // version changes, and at most every REPORT_INTERVAL while scrolling. Only
+  // a signed-in viewer of an open document reports.
   const lastReport = useRef(0);
   const pendingReport = useRef<number | undefined>(undefined);
-  const signedIn = !!principal;
+  const reporting = enabled && !!principal;
   const report = useCallback(() => {
     window.clearTimeout(pendingReport.current);
     pendingReport.current = undefined;
     lastReport.current = Date.now();
-    if (!signedIn) return;
-    api.postDocumentPresence(docId, { session, ...place.current }).catch(() => {});
-  }, [docId, session, signedIn]);
+    if (reporting) send({ type: "presence", ...place.current });
+  }, [send, reporting]);
   const scheduleReport = useCallback(() => {
     if (pendingReport.current !== undefined) return;
     const wait = Math.max(0, lastReport.current + REPORT_INTERVAL - Date.now());
@@ -225,32 +320,30 @@ export function useDocumentStream({
     place.current = { version };
     scheduleReport();
   }, [version, scheduleReport]);
-  useEffect(() => {
-    const timer = window.setInterval(report, HEARTBEAT_INTERVAL);
-    return () => {
-      window.clearInterval(timer);
+  useEffect(
+    () => () => {
       window.clearTimeout(pendingReport.current);
       pendingReport.current = undefined;
-    };
-  }, [report]);
+    },
+    [report],
+  );
 
   const cursorBatch = useMemo(
     () =>
-      createCursorBatch((points) =>
-        api.postDocumentCursor(docId, {
-          session,
-          version: place.current.version,
-          points,
-        }),
+      createCursorBatch(async (points) =>
+        send({ type: "cursor", version: cursorOn.current, points }),
       ),
-    [docId, session],
+    [send],
   );
   useEffect(() => () => cursorBatch.stop(), [cursorBatch]);
+  useEffect(() => {
+    resendCursor.current = cursorBatch.resend;
+  }, [cursorBatch]);
   const moveCursor = useCallback(
     (spot: CursorSpot | null) => {
-      if (signedIn) cursorBatch.add(spot);
+      if (reporting) cursorBatch.add(spot);
     },
-    [cursorBatch, signedIn],
+    [cursorBatch, reporting],
   );
 
   // A new listener gets the newest point of every cursor at once.
@@ -267,10 +360,11 @@ export function useDocumentStream({
   );
 
   // The version that a viewer's cursor is on, while the cursor is in the
-  // document.
+  // document or the viewer still sends their view.
   const cursorVersion = useCallback((id: string) => {
     const entry = cursors.current.get(id);
-    return entry && !entry.cursor.points[0].hidden ? entry.version : undefined;
+    const point = entry?.cursor.points[0];
+    return point && (!point.hidden || point.v) ? entry.version : undefined;
   }, []);
 
   const subscribeKV = useCallback((listener: DocumentKVListener) => {
@@ -298,14 +392,51 @@ export function useDocumentStream({
     subscribeKV,
     reportViewport,
     moveCursor,
+    holdCursor: cursorBatch.hold,
     subscribeCursors,
     cursorVersion,
   };
 }
 
+function hiddenPoint(t: number) {
+  return { t, path: "", x: 0, y: 0, hidden: true };
+}
+
 // hiddenCursor replaces a cursor's points with one hidden point, at the time
 // of its last point plus after.
 function hiddenCursor(cursor: RemoteCursor, after = 0): RemoteCursor {
-  const t = (cursor.points.at(-1)?.t ?? 0) + after;
-  return { ...cursor, points: [{ t, path: "", x: 0, y: 0, hidden: true }] };
+  return { ...cursor, points: [hiddenPoint((cursor.points.at(-1)?.t ?? 0) + after)] };
+}
+
+// documentEvent reads what a document event tells of the document, or
+// nothing when it names no seq. Each event of an operation names its
+// author, and whether they typed it. A small operation comes with its
+// event. The event of a sealed version says so, and the event of a
+// restore names the person who restored.
+function documentEvent(event: DocumentKVEvent): DocumentEvent | undefined {
+  const data = event.data as
+    | (Partial<DocumentEvent> & { replacements?: Replacement[]; sum?: number })
+    | undefined;
+  if (typeof data?.seq !== "number" || !data.version_id) return undefined;
+  const { seq, version_id, prev_seq, replacements, sum } = data;
+  const typed = data.typed === true;
+  const authors = event.updated_by ? [event.updated_by] : undefined;
+  if (typeof prev_seq !== "number" || !replacements || typeof sum !== "number")
+    return {
+      seq,
+      version_id,
+      typed,
+      authors,
+      ...(data.sealed === true && { sealed: true }),
+      ...(data.restored === true && { restored: true, updated_by: event.updated_by }),
+    };
+  const ops = [replacements];
+  return {
+    seq,
+    version_id,
+    typed,
+    authors,
+    prev_seq,
+    changes: { seq, version_id, ops, typed, authors: authors ?? [], sum },
+  };
 }

@@ -4,89 +4,200 @@ import {
   textLinkFragment,
   TEXT_LINK_PREFIX,
 } from "../../bridge/text-link";
+import { isCaret, type Caret } from "../../bridge/caret";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
 import { useLocation } from "react-router-dom";
-import { useQuery } from "@tanstack/react-query";
+import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import { api, type Anchor } from "@/api";
 import { queryKeys } from "@/lib/queryKeys";
-import { matchesCommentFilter } from "@/lib/constants";
-import { Center } from "@/components/ui/misc";
+import { COMMENT_STATUS } from "@/lib/constants";
+import { Center, CodeBlock } from "@/components/ui/misc";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { LoadError } from "@/components/error-state";
 import { CHORD_KEYS } from "@/lib/esc-chord";
 import { cursorsShownStore, parseCursorSpot } from "@/lib/live-cursors";
+import { agentRequestBody } from "@/lib/agent-request";
+import { principalColor } from "@/lib/principals";
+import { randomId } from "@/lib/uuid";
 import { useDocumentExport } from "./use-document-export";
 import { useDoc } from "./doc-context";
 import { useBridgeHost } from "./use-bridge-host";
+import { useFrameMessage } from "./use-frame-message";
+import { useLiveText } from "./use-live-text";
+import { typingOrInLayer, useCommentPins } from "./use-comment-pins";
+import { CommentPopovers } from "./doc-comment-popover";
+import { useCommentJumps } from "./use-comment-jumps";
+import type { TextEditResult, TextPatchResult } from "./doc-context";
+import type { Render } from "@/lib/script-literals";
+import type { ProbeResult } from "../../bridge/script-text";
+import type {
+  ChildRef,
+  Locator,
+  Patch,
+  Piece,
+  Region,
+  ScriptChange,
+} from "../../bridge/source-pieces";
 
 const FORWARDED_KEYS = new Set<string>([
   "Escape",
   "?",
+  "e",
   ...CHORD_KEYS.map((item) => item.key),
+  // The keys that go from thread to thread.
+  "n",
+  "N",
 ]);
 const VIM_KEYS = new Set(["j", "k", "g", "G"]);
+
+// How long a control in the document shows that it copied.
+const COPIED_MS = 1500;
+// How long a load of the frame waits for the frame on screen to tell its
+// scroll. A frame that failed tells nothing.
+const SCROLL_MS = 500;
 
 // Renders the sandboxed document iframe for the document page. useBridgeHost
 // serves the theme and KV; this adds comments, selection, zoom, and links.
 // Painting is driven by the bridge's ready signal.
-export function RenderFrame() {
+export function RenderFrame({
+  chordArmed = false,
+  cover = 0,
+  onCrowded,
+}: {
+  // The Esc chord waits for a letter. The document gives the letter to it
+  // then, and not to its own keys.
+  chordArmed?: boolean;
+  // A panel covers this many pixels at the right. The document glides left
+  // from under it when its left margin has room, or else onCrowded asks for
+  // room beside the panel.
+  cover?: number;
+  onCrowded?: () => void;
+}) {
   const {
     docId,
     version,
     comments,
-    commentFilter,
     drafts,
     activeComment,
     startDraft,
+    principal,
     signIn,
     handleDocCommentClick,
     setUnanchoredComments,
+    setMovedPins,
     setCommentPositions,
-    setCommentViewport,
+    setDocumentHeight,
     registerDocumentScroller,
     registerDocumentPrinter,
-    syncCommentRail,
     handleRenderedDocumentClick,
     subscribeDocumentKV,
     reportViewport,
     moveCursor,
+    holdCursor,
     subscribeCursors,
     followedCursor,
+    onUnfollowCursor,
+    editing,
+    registerLiveText,
+    setSaveState,
+    setFrameReady,
+    frameShows,
+    frameLoad,
+    reloadFrame,
+    onPage,
+    liveLoads,
+    latest,
+    live,
+    event,
+    madeBy,
+    holdUpdate,
+    leaving,
   } = useDoc();
   const cursorsShown = cursorsShownStore.useStore();
   const versionRef = useRef(version);
   versionRef.current = version;
   const location = useLocation();
 
+  // What the frame shows: the live document, or the preview of a version.
+  // A frame that follows the live document loads the version that is
+  // current then, at the seq that the render token names. A later version
+  // of the document does not load it again: the frame follows the document
+  // in place. Each load asks for a new token, because a token renders one
+  // seq, and so does each frame: a frame that mounts again, as full screen
+  // does, loads again. A token is never asked for again by itself, because
+  // its URL would load the frame under the text of the reader. The frame on
+  // screen stays until the token of the next load of the same document
+  // comes.
+  const showing = live ? "live" : version;
+  const [frame] = useState(randomId);
   const token = useQuery({
-    queryKey: queryKeys.render(docId, version),
-    queryFn: () => api.renderToken(docId, version),
-    staleTime: 4 * 60_000,
+    queryKey: queryKeys.render(docId, showing, frameLoad, frame),
+    queryFn: async () => {
+      const { url, seq } = await api.renderToken(docId, version);
+      return { url: reloadURL(url, frameLoad), seq, version };
+    },
+    staleTime: Infinity,
     enabled: !!version,
+    placeholderData: keepPreviousData,
   });
-  const { ref, frameSrc, frameOrigin, ready, postToFrame, deliverKV } = useBridgeHost(
-    docId,
-    token.data?.url,
-    signIn,
-  );
+  const loaded = { version: "", ...token.data };
+  const {
+    ref,
+    frameSrc,
+    frameOrigin,
+    ready,
+    failed,
+    onLoad,
+    retry,
+    postToFrame,
+    deliverKV,
+  } = useBridgeHost(docId, token.data?.url, { signIn, refresh: token.refetch });
+  // The bar says that the reader can edit only once the frame shows the text.
+  // A frame that loads again what it shows, as after a patch that failed,
+  // keeps the bar as it was, unless that load fails.
+  const [readyFor, setReadyFor] = useState<string>();
+  useEffect(() => {
+    if (ready) setReadyFor(showing);
+  }, [ready, showing]);
+  const usable = ready || (readyFor === showing && !failed && !token.error);
+  useEffect(() => {
+    setFrameReady(usable);
+    return () => setFrameReady(false);
+  }, [usable, setFrameReady]);
   // Paint results from a frame that is navigating away (its WindowProxy
   // survives navigation) must not bring back the state reset below.
   const readyRef = useRef(ready);
   readyRef.current = ready;
 
+  // Open threads on text are highlighted, and a resolved one while it is
+  // open, as from the comments list. Point comments are pins instead.
   const paintPayload = useMemo(
     () => [
       ...comments
-        // Match the sidebar filter so resolved threads can also be positioned
-        // beside their text when browsing All or Resolved.
-        .filter((c) => matchesCommentFilter(c.status, commentFilter))
+        .filter(
+          (c) =>
+            !c.anchor?.point &&
+            (c.status !== COMMENT_STATUS.resolved || c.id === activeComment),
+        )
         .map((c) => ({
           id: c.id,
           quote: c.selected_text || c.anchor?.quote,
           anchor: c.anchor,
+          unread: c.unread,
+          leaving: c.id === leaving,
         })),
-      ...drafts.map(({ id, quote, anchor }) => ({ id, quote, anchor })),
+      ...drafts
+        .filter((d) => !d.anchor?.point)
+        .map(({ id, quote, anchor }) => ({ id, quote, anchor })),
     ],
-    [comments, commentFilter, drafts],
+    [comments, activeComment, drafts, leaving],
   );
 
   useDocumentExport(ref, frameOrigin, ready, registerDocumentPrinter);
@@ -94,15 +205,18 @@ export function RenderFrame() {
   useEffect(() => {
     // Anchoring results belong to the frame that produced them; drop them so
     // "highlight not found" badges never linger across version switches.
-    setUnanchoredComments(new Set());
+    setUnanchoredComments("text", new Set());
+    setUnanchoredComments("pins", new Set());
+    setMovedPins(new Set());
     setCommentPositions(new Map());
-    setCommentViewport({ scrollTop: 0, scrollHeight: 1 });
+    setDocumentHeight(1);
   }, [
     frameOrigin,
     token.data?.url,
     setUnanchoredComments,
+    setMovedPins,
     setCommentPositions,
-    setCommentViewport,
+    setDocumentHeight,
   ]);
 
   useEffect(() => {
@@ -130,6 +244,167 @@ export function RenderFrame() {
       active: activeComment,
     });
   }, [ready, paintPayload, activeComment, postToFrame]);
+  const paintRef = useRef(paint);
+  paintRef.current = paint;
+
+  useEffect(() => {
+    if (ready) postToFrame({ type: "slashdocs:text-editing", on: editing });
+  }, [ready, editing, postToFrame]);
+
+  // The frame answers a request by its id. A request that gets no answer,
+  // or one that cannot be read, fails.
+  const requests = useRef(new Map<string, (result: unknown) => void>());
+  const ask = useCallback(
+    <T,>(message: Record<string, unknown>, timeout = 5000) =>
+      new Promise<T>((resolve, reject) => {
+        const requestId = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+        const timer = window.setTimeout(() => {
+          requests.current.delete(requestId);
+          reject(new Error("The document did not answer."));
+        }, timeout);
+        requests.current.set(requestId, (result) => {
+          window.clearTimeout(timer);
+          requests.current.delete(requestId);
+          if (result) resolve(result as T);
+          else reject(new Error("The document gave an answer that cannot be read."));
+        });
+        postToFrame({ ...message, requestId });
+      }),
+    [postToFrame],
+  );
+  // The frame hands over its text changes on request.
+  const takeTextEdits = useCallback(
+    (timeout?: number) =>
+      ask<TextEditResult>({ type: "slashdocs:text-collect" }, timeout),
+    [ask],
+  );
+  // The frame shows the text of other people in place. It gives no answer
+  // to a patch that it cannot read.
+  const patchFrame = useCallback(
+    (patches: Patch[], edits: number, flash: boolean, hold: boolean) =>
+      ask<TextPatchResult>({
+        type: "slashdocs:text-patch",
+        patches,
+        edits,
+        flash,
+        ask: hold,
+      }),
+    [ask],
+  );
+  // The frame describes the text of the highlight of a comment on request,
+  // on the seq that it shows.
+  const shownSeq = useRef<number>(undefined);
+  const showsAt = useCallback<typeof frameShows>(
+    (seq, version) => {
+      shownSeq.current = seq;
+      frameShows(seq, version);
+    },
+    [frameShows],
+  );
+  const anchorOf = useCallback(
+    (id: string) =>
+      ask<{ anchor?: Anchor }>({ type: "slashdocs:anchor", id }).then(
+        ({ anchor }) => anchor && { anchor, seq: shownSeq.current },
+      ),
+    [ask],
+  );
+  // The frame renders a changed source in a hidden frame on request. A probe
+  // waits for its load for at most five seconds, so this gives it ten.
+  const probe = useCallback<Render>(
+    (html, locator, strings) =>
+      ask({ type: "slashdocs:probe", html, locator, strings }, 10_000),
+    [ask],
+  );
+  // The scroll and the selection of the frame at its last report, which a
+  // load that the hook asks for keeps: the reader stays where they are in
+  // the document, and their caret stays at its characters.
+  const frameTop = useRef(0);
+  const restoreTop = useRef<number | undefined>(undefined);
+  const frameCaret = useRef<Caret | null>(null);
+  const restoreCaret = useRef<Caret | null>(null);
+  const {
+    changed: textChanged,
+    scrolled: textScrolled,
+    restarted: frameRestarted,
+    scriptEditable,
+    focused: textFocused,
+    settle,
+    showUpdate,
+  } = useLiveText({
+    docId,
+    owner: principal?.id,
+    signIn,
+    loaded,
+    latest,
+    event,
+    // The frame that stays while the next token loads follows nothing.
+    live: live && ready && !token.isPlaceholderData,
+    editing,
+    onPage,
+    loads: liveLoads,
+    take: () => takeTextEdits(),
+    patch: patchFrame,
+    setState: setSaveState,
+    holdCursor,
+    frameShows: showsAt,
+    holdUpdate,
+    madeBy,
+    reload: () => {
+      // The frame takes no more keys: the server holds its text, and a key
+      // from now on would go with the frame. The answer of the frame tells
+      // its scroll.
+      postToFrame({ type: "slashdocs:text-editing", on: false });
+      void takeTextEdits(SCROLL_MS)
+        .catch(() => undefined)
+        .then(() => {
+          restoreTop.current = frameTop.current;
+          restoreCaret.current = frameCaret.current;
+          reloadFrame();
+        });
+    },
+    probe,
+    replaceText: (from, to) =>
+      postToFrame({ type: "slashdocs:script-replace", from, to }),
+  });
+  useEffect(() => {
+    registerLiveText({ settle, showUpdate, anchorOf });
+    return () => registerLiveText(null);
+  }, [registerLiveText, settle, showUpdate, anchorOf]);
+  // Each load flashes what changed since the reader saw the document last,
+  // after the scroll, so that the flash is where they look.
+  useEffect(() => {
+    if (!ready) return;
+    // A load takes the focus out of the frame, and the browser can stop a
+    // frame that takes it back with no key or click in it. Thus the app
+    // gives the focus back to the frame before the frame puts the caret.
+    if (restoreCaret.current) ref.current?.focus({ preventScroll: true });
+    if (restoreTop.current !== undefined)
+      postToFrame({
+        type: "slashdocs:scroll-to",
+        top: restoreTop.current,
+        ...(restoreCaret.current && { caret: restoreCaret.current }),
+      });
+    restoreTop.current = undefined;
+    restoreCaret.current = null;
+    postToFrame({ type: "slashdocs:show-changes" });
+  }, [ready, postToFrame, ref]);
+
+  // Undo and Redo of the reader's edits work in both modes, also with the
+  // focus on the bar, as on Done after Edit mode. A field keeps its own.
+  useEffect(() => {
+    if (!ready) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      const key = event.key.toLowerCase();
+      const undo = key === "z" && !event.shiftKey;
+      const redo = (key === "z" && event.shiftKey) || (key === "y" && !event.shiftKey);
+      const command = (event.metaKey || event.ctrlKey) && !event.altKey;
+      if (!command || !(undo || redo) || typingOrInLayer(event)) return;
+      event.preventDefault();
+      postToFrame({ type: "slashdocs:history", redo });
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [ready, postToFrame]);
 
   // Vim scrolling works whether focus is inside the rendered document or on
   // the surrounding viewer chrome. The bridge handles the actual scroll so
@@ -189,24 +464,32 @@ export function RenderFrame() {
   const MAX_SCALE = 4;
   const wrapperRef = useRef<HTMLDivElement>(null);
   const [scale, setScale] = useState(1);
+  // What a screen reader hears of a control in the document that confirms
+  // in place.
+  const [said, setSaid] = useState("");
+  // A heading link that the browser did not let the app copy.
+  const [headingLink, setHeadingLink] = useState<string>();
+  useEffect(() => {
+    if (!said) return;
+    const timer = setTimeout(() => setSaid(""), COPIED_MS);
+    return () => clearTimeout(timer);
+  }, [said]);
   const scaleRef = useRef(1);
   const cursorRef = useRef({ x: 0, y: 0 });
 
-  const scrollDocumentTo = useCallback(
-    (top: number) => {
-      const wrapperScrollTop = wrapperRef.current?.scrollTop || 0;
-      postToFrame({
-        type: "slashdocs:scroll-to",
-        top: Math.max(0, (top - wrapperScrollTop) / scaleRef.current),
-      });
-    },
-    [postToFrame],
-  );
-
+  // The page scrolls the document to a place, in pixels of the page.
   useEffect(() => {
-    registerDocumentScroller(scrollDocumentTo);
+    registerDocumentScroller({
+      to: (top) => {
+        const wrapperScrollTop = wrapperRef.current?.scrollTop || 0;
+        postToFrame({
+          type: "slashdocs:scroll-to",
+          top: Math.max(0, (top - wrapperScrollTop) / scaleRef.current),
+        });
+      },
+    });
     return () => registerDocumentScroller(null);
-  }, [registerDocumentScroller, scrollDocumentTo]);
+  }, [registerDocumentScroller, postToFrame]);
 
   const applyZoom = useCallback(
     (deltaY: number, cursor?: { x: number; y: number }) => {
@@ -297,12 +580,12 @@ export function RenderFrame() {
       if (e.data?.type === "slashdocs:selection") {
         const anchor = e.data.anchor as Partial<Anchor> | undefined;
         const quote = anchor?.quote ?? e.data.quote;
-        const top =
-          typeof e.data.top === "number" ? e.data.top * scaleRef.current : undefined;
-        if (quote) startDraft({ quote, anchor, top });
+        if (quote) startDraft({ quote, anchor });
       }
+      // The frame tells its view when a scroll rests.
       if (e.data?.type === "slashdocs:viewport") {
         reportViewport(textLinkAnchor(e.data.anchor) ?? undefined);
+        textScrolled();
       }
       if (e.data?.type === "slashdocs:pointer") {
         moveCursor(parseCursorSpot(e.data.spot));
@@ -316,26 +599,106 @@ export function RenderFrame() {
         url.searchParams.delete("comment");
         url.searchParams.delete("fullscreen");
         url.hash = e.data.id;
+        // The # control says Copied, over its heading. A toast would cover
+        // the words. When the browser refuses the copy, the link shows to
+        // copy by hand, and the address has the heading too.
+        const id = e.data.id;
         void navigator.clipboard.writeText(url.toString()).then(
-          () => toast.success("Heading link copied."),
-          () => toast.error("Could not copy the heading link."),
+          () => {
+            postToFrame({ type: "slashdocs:heading-copied", id });
+            setSaid("Heading link copied.");
+          },
+          () => {
+            setHeadingLink(url.toString());
+            showHeading(id);
+          },
         );
       }
       if (
         e.data?.type === "slashdocs:heading" &&
         typeof e.data.id === "string" &&
         e.data.id.length <= 1024
-      ) {
-        const url = new URL(window.location.href);
-        url.searchParams.delete("comment");
-        url.hash = e.data.id;
-        window.history.replaceState(window.history.state, "", url);
-      }
+      )
+        showHeading(e.data.id);
       if (e.data?.type === "slashdocs:activate" && typeof e.data.id === "string") {
         handleDocCommentClick(e.data.id);
       }
       if (e.data?.type === "slashdocs:document-click") {
         handleRenderedDocumentClick();
+      }
+      if (e.data?.type === "slashdocs:unfollowed") {
+        onUnfollowCursor?.();
+      }
+      // The document loaded itself again in place, as some do on a theme
+      // change. It has no highlights, and it shows the source that the page
+      // loaded, at its seq: it gets its highlights, and the page follows
+      // the document again from that seq.
+      if (e.data?.type === "slashdocs:ready" && readyRef.current) {
+        paintRef.current();
+        frameRestarted();
+      }
+      const answer = (result: unknown) =>
+        requests.current.get(e.data.requestId)?.(result);
+      if (/^slashdocs:text-(changes|draft|patched)$/.test(e.data?.type)) {
+        if (isOffset(e.data.top)) frameTop.current = e.data.top;
+        if (e.data.type !== "slashdocs:text-draft")
+          frameCaret.current = isCaret(e.data.caret) ? e.data.caret : null;
+        const result = parseTextEditResult(e.data);
+        // The frame sends its edits after each change of the reader.
+        if (e.data.type === "slashdocs:text-draft") textChanged(result);
+        else if (e.data.type === "slashdocs:text-changes") answer(result);
+        else
+          answer(
+            result && {
+              ...result,
+              ok: e.data.ok === true,
+              stale: e.data.stale === true,
+              withdrawn: e.data.withdrawn === true,
+            },
+          );
+      }
+      if (e.data?.type === "slashdocs:probe-result") answer(parseProbeResult(e.data));
+      if (e.data?.type === "slashdocs:anchor-result")
+        answer(
+          e.data.anchor === null
+            ? {}
+            : isAnchor(e.data.anchor) && { anchor: e.data.anchor },
+        );
+      if (
+        e.data?.type === "slashdocs:script-text" &&
+        typeof e.data.requestId === "string" &&
+        typeof e.data.text === "string"
+      ) {
+        const { requestId } = e.data;
+        void scriptEditable(e.data.text).then(
+          (editable) =>
+            postToFrame({ type: "slashdocs:script-text-result", requestId, editable }),
+          () =>
+            postToFrame({
+              type: "slashdocs:script-text-result",
+              requestId,
+              editable: false,
+              failed: true,
+            }),
+        );
+      }
+      // The reader cannot change this script text here, so a comment asks an
+      // agent to.
+      if (e.data?.type === "slashdocs:ask-agent") {
+        const anchor = e.data.anchor as Partial<Anchor> | undefined;
+        if (anchor?.quote)
+          startDraft({
+            quote: anchor.quote,
+            anchor,
+            body: agentRequestBody(anchor.quote),
+          });
+      }
+      if (e.data?.type === "slashdocs:text-focus" && e.data.on === true)
+        void textFocused();
+      if (e.data?.type === "slashdocs:text-refused") {
+        toast.info(REFUSALS.get(e.data.reason) ?? "This change does not work here.", {
+          id: "text-refused",
+        });
       }
       if (
         e.data?.type === "slashdocs:paint-result" &&
@@ -349,21 +712,12 @@ export function RenderFrame() {
           e.data.results as Array<{ id?: unknown; anchored?: unknown }>
         ).slice(0, 10_000);
         setUnanchoredComments(
+          "text",
           new Set(
             results
               .filter((r) => r && r.anchored === false && typeof r.id === "string")
               .map((r) => r.id as string),
           ),
-        );
-      }
-      if (
-        e.data?.type === "slashdocs:comment-scroll" &&
-        typeof e.data.scrollTop === "number" &&
-        Number.isFinite(e.data.scrollTop) &&
-        readyRef.current
-      ) {
-        syncCommentRail(
-          e.data.scrollTop * scaleRef.current + (wrapperRef.current?.scrollTop || 0),
         );
       }
       if (
@@ -390,26 +744,25 @@ export function RenderFrame() {
         }
         setCommentPositions(positions);
         if (
-          typeof e.data.scrollTop === "number" &&
           typeof e.data.scrollHeight === "number" &&
-          Number.isFinite(e.data.scrollTop) &&
           Number.isFinite(e.data.scrollHeight)
-        ) {
-          const scrollTop =
-            e.data.scrollTop * scaleRef.current + (wrapperRef.current?.scrollTop || 0);
-          syncCommentRail(scrollTop);
-          setCommentViewport({
-            scrollTop,
-            scrollHeight: Math.max(1, e.data.scrollHeight * scaleRef.current),
-          });
-        }
+        )
+          setDocumentHeight(Math.max(1, e.data.scrollHeight * scaleRef.current));
       }
       if (
         e.data?.type === "slashdocs:keydown" &&
         typeof e.data.key === "string" &&
         FORWARDED_KEYS.has(e.data.key)
       ) {
-        window.dispatchEvent(new KeyboardEvent("keydown", { key: e.data.key }));
+        // It comes to the app as a key on the page does: the window's capture
+        // listeners, as the Esc chord's, take it first, and may keep it.
+        document.dispatchEvent(
+          new KeyboardEvent("keydown", {
+            key: e.data.key,
+            bubbles: true,
+            cancelable: true,
+          }),
+        );
       }
       if (e.data?.type === "slashdocs:zoom" && typeof e.data.deltaY === "number") {
         const frameRect = ref.current?.getBoundingClientRect();
@@ -437,10 +790,54 @@ export function RenderFrame() {
     handleRenderedDocumentClick,
     setUnanchoredComments,
     setCommentPositions,
-    setCommentViewport,
-    syncCommentRail,
+    setDocumentHeight,
     applyZoom,
+    textChanged,
+    textScrolled,
+    textFocused,
+    frameRestarted,
+    scriptEditable,
+    postToFrame,
+    onUnfollowCursor,
   ]);
+
+  useCommentPins(ref, frameOrigin, ready, postToFrame);
+  useCommentJumps(ready, postToFrame);
+
+  // A signed-in reader chats at their cursor in their cursor color. A
+  // signed-out reader sees the chat of others but cannot send.
+  const chatColor = principal && !signIn ? principalColor(principal) : undefined;
+  useEffect(() => {
+    if (ready) postToFrame({ type: "slashdocs:cursor-chat", color: chatColor });
+  }, [ready, chatColor, postToFrame]);
+  useEffect(() => {
+    if (ready) postToFrame({ type: "slashdocs:chord", armed: chordArmed });
+  }, [ready, chordArmed, postToFrame]);
+  const onCrowdedRef = useRef(onCrowded);
+  onCrowdedRef.current = onCrowded;
+  useEffect(() => {
+    if (ready) postToFrame({ type: "slashdocs:room", cover: cover / scaleRef.current });
+  }, [ready, cover, postToFrame]);
+  useFrameMessage(ref, frameOrigin, ready, (data) => {
+    if (data.type === "slashdocs:room" && data.crowded === true)
+      onCrowdedRef.current?.();
+  });
+
+  // "/" opens cursor chat at the pointer even when the app has the focus, as
+  // right after following someone from the bar. The document opens it only
+  // when the pointer is over it. The key is taken, so that it does not also
+  // open the browser's quick find, which takes the focus from the chat.
+  useEffect(() => {
+    if (!ready || !chatColor) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "/" || e.metaKey || e.ctrlKey || e.altKey || typingOrInLayer(e))
+        return;
+      e.preventDefault();
+      postToFrame({ type: "slashdocs:open-cursor-chat" });
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [ready, chatColor, postToFrame]);
 
   // The page holds the event stream; the bridge host forwards its KV changes.
   useEffect(() => subscribeDocumentKV(deliverKV), [subscribeDocumentKV, deliverKV]);
@@ -457,13 +854,17 @@ export function RenderFrame() {
     };
   }, [ready, cursorsShown, subscribeCursors, postToFrame]);
 
-  // Go to a followed cursor once the frame shows its version. The effect above
-  // gave the frame the cursor first.
+  // Go to a viewer, or follow them, once the frame shows their version, or
+  // stop. The effect above gave the frame the cursor first.
   const followed = useRef(followedCursor);
   useEffect(() => {
-    if (!ready || !followedCursor || followed.current === followedCursor) return;
+    if (!ready || followed.current === followedCursor) return;
     followed.current = followedCursor;
-    postToFrame({ type: "slashdocs:follow-cursor", session: followedCursor.session });
+    postToFrame(
+      followedCursor
+        ? { type: "slashdocs:follow-cursor", ...followedCursor }
+        : { type: "slashdocs:unfollow-cursor" },
+    );
   }, [ready, followedCursor, postToFrame]);
 
   // Push fresh paint data once the frame is ready and whenever it changes.
@@ -473,8 +874,17 @@ export function RenderFrame() {
 
   // The parent (DocPage) only mounts RenderFrame when a current version
   // exists, so version is always set here.
-  if (token.isLoading) return <Center>Preparing secure render…</Center>;
-  if (token.error) return <Center>Could not create render token.</Center>;
+  if (token.isPending) return <Center>Preparing secure render…</Center>;
+  if (token.error || failed)
+    return (
+      <Center>
+        <LoadError
+          title="Could not open the document"
+          error={token.error}
+          query={token.error ? token : retry}
+        />
+      </Center>
+    );
 
   const showZoomBadge = Math.round(scale * 100) !== 100;
 
@@ -504,9 +914,37 @@ export function RenderFrame() {
             background: "#fff",
           }}
           src={frameSrc}
+          onLoad={onLoad}
           sandbox="allow-scripts allow-same-origin allow-popups allow-popups-to-escape-sandbox"
         />
       </div>
+      <CommentPopovers
+        frame={ref}
+        bounds={wrapperRef}
+        panel={cover}
+        origin={frameOrigin}
+        ready={ready}
+        postToFrame={postToFrame}
+      />
+      <p role="status" className="sr-only">
+        {said}
+      </p>
+      <Dialog
+        open={!!headingLink}
+        onOpenChange={(open) => !open && setHeadingLink(undefined)}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Copy the heading link</DialogTitle>
+            <DialogDescription>
+              The browser did not let the app copy it. Select the link and copy it.
+            </DialogDescription>
+          </DialogHeader>
+          <CodeBlock copy="always" wrap onCopied={() => setHeadingLink(undefined)}>
+            {headingLink ?? ""}
+          </CodeBlock>
+        </DialogContent>
+      </Dialog>
       {showZoomBadge && (
         <button
           type="button"
@@ -530,4 +968,112 @@ export function RenderFrame() {
       )}
     </div>
   );
+}
+
+// reloadURL makes a render URL that loads the frame again, as the same URL
+// would not.
+function reloadURL(url: string, reloads: number): string {
+  if (!reloads) return url;
+  return `${url}${url.includes("?") ? "&" : "?"}slashdocs_reload=${reloads}`;
+}
+
+// Messages for the reasons the frame gives when it refuses an edit.
+const REFUSALS = new Map([
+  // The hint at script text says the same.
+  ["script", "A script on the page writes this text."],
+  ["fixed", "You cannot change this part of the page here."],
+  [
+    "crosses-script",
+    "The selection includes content that you cannot change here. Select less text.",
+  ],
+  ["drop", "Dragging content into the document does not work. Copy and paste it."],
+  ["format", "Only bold, italic, links and lists can change here."],
+  ["list", "Only paragraphs can become a list."],
+  ["plain-text", "Text from a script takes plain words only."],
+]);
+
+// parseTextEditResult reads a text-changes message. The frame hosts untrusted
+// HTML on the bridge's origin, so the message is checked, not trusted: a
+// region that is not made of the numbers and strings that source-pieces.ts
+// describes makes the whole result unreadable.
+function parseTextEditResult(
+  data: Record<string, unknown>,
+): TextEditResult | undefined {
+  const { regions, scripts, edits } = data;
+  return Array.isArray(regions) &&
+    regions.every(isRegion) &&
+    Array.isArray(scripts) &&
+    scripts.every(isScriptChange) &&
+    isOffset(edits)
+    ? { regions, scripts, edits }
+    : undefined;
+}
+
+// parseProbeResult reads a probe-result message, checked as the text
+// changes are.
+function parseProbeResult(data: Record<string, unknown>): ProbeResult | undefined {
+  const { text, counts, texts, errors } = data;
+  return (text === null || typeof text === "string") &&
+    Array.isArray(counts) &&
+    counts.every(isOffset) &&
+    isOffset(texts) &&
+    isOffset(errors)
+    ? { text, counts, texts, errors }
+    : undefined;
+}
+
+const isObject = (v: unknown): v is Record<string, unknown> =>
+  typeof v === "object" && v !== null;
+const isOffset = (v: unknown): v is number => Number.isSafeInteger(v) && Number(v) >= 0;
+const isChildRef = (v: unknown): v is ChildRef =>
+  isObject(v) && isOffset(v.parent) && isOffset(v.index);
+const isPieces = (v: unknown): v is Piece[] => Array.isArray(v) && v.every(isPiece);
+
+const isLocator = (v: unknown): v is Locator =>
+  isObject(v) &&
+  (v.at === null || isOffset(v.at)) &&
+  Array.isArray(v.path) &&
+  v.path.every(isOffset);
+const isAnchor = (v: unknown): v is Anchor =>
+  isObject(v) &&
+  ["quote", "prefix", "suffix", "dom_path"].every((k) => typeof v[k] === "string") &&
+  isOffset(v.start_offset) &&
+  isOffset(v.end_offset);
+const isScriptChange = (v: unknown): v is ScriptChange =>
+  isObject(v) &&
+  isLocator(v.locator) &&
+  typeof v.before === "string" &&
+  typeof v.after === "string";
+
+function isRegion(v: unknown): v is Region {
+  return (
+    isObject(v) &&
+    isOffset(v.from) &&
+    isOffset(v.to) &&
+    isPieces(v.pieces) &&
+    Array.isArray(v.removed) &&
+    v.removed.every(isOffset)
+  );
+}
+
+function isPiece(p: unknown): boolean {
+  if (!isObject(p)) return false;
+  if ("keep" in p) return isOffset(p.keep);
+  if ("keepChild" in p) return isChildRef(p.keepChild);
+  if ("text" in p) {
+    return typeof p.text === "string" && (p.was === undefined || isChildRef(p.was));
+  }
+  if ("element" in p) return isOffset(p.element) && isPieces(p.children);
+  return (
+    typeof p.open === "string" && typeof p.close === "string" && isPieces(p.children)
+  );
+}
+
+// showHeading puts a heading of the document in the address, in place of
+// the history entry, with no comment open.
+function showHeading(id: string) {
+  const url = new URL(window.location.href);
+  url.searchParams.delete("comment");
+  url.hash = id;
+  window.history.replaceState(window.history.state, "", url);
 }

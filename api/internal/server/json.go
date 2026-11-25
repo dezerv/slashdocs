@@ -1,8 +1,6 @@
 package server
 
 import (
-	"strings"
-
 	"github.com/razorpay/slashdocs/api/internal/auth"
 	"github.com/razorpay/slashdocs/api/internal/repo"
 )
@@ -26,15 +24,17 @@ type userResponse struct {
 }
 
 // commentPlacementResponse locates a comment's anchor within a version.
+// Status is attached, orphaned when the version no longer has the anchor, or
+// moved for a point that then shows at its page spot.
 type commentPlacementResponse struct {
 	VersionID   string      `json:"version_id"`
-	Status      string      `json:"status"`
+	Status      string      `json:"status" enums:"attached,orphaned,moved"`
 	Anchor      repo.Anchor `json:"anchor"`
 	MatchedText string      `json:"matched_text"`
 	Confidence  float64     `json:"confidence"`
 }
 
-// commentMentionResponse identifies a principal and the exact visible label in
+// commentMentionPrincipalResponse identifies a principal and the exact visible label in
 // the comment body. Offset and length are UTF-16 code units so browser clients
 // can use them directly with JavaScript string slicing.
 type commentMentionPrincipalResponse struct {
@@ -72,6 +72,9 @@ type commentResponse struct {
 	Anchor             *repo.Anchor              `json:"anchor,omitempty"`
 	CurrentPlacement   *commentPlacementResponse `json:"current_placement,omitempty"`
 	Replies            *[]commentResponse        `json:"replies,omitempty"`
+	// Unread is set on a thread with a message by someone else that the
+	// signed-in reader did not read. Anonymous readers get no read state.
+	Unread bool `json:"unread,omitempty"`
 }
 
 // commentReactionResponse is one emoji group on a comment. Reacted reports
@@ -84,9 +87,7 @@ type commentReactionResponse struct {
 	Reactors []principalResponse `json:"reactors"`
 }
 
-func commentsJSON(items []repo.Comment, placementVersionID string, placementHTML []byte, viewer auth.Principal) []commentResponse {
-	// Stringify the version body once for all placement checks below.
-	haystack := string(placementHTML)
+func commentsJSON(items []repo.Comment, placementVersionID string, doc *placementDoc, viewer auth.Principal) []commentResponse {
 	roots := make([]repo.Comment, 0, len(items))
 	byID := map[string]int{}
 	for _, cm := range items {
@@ -112,24 +113,23 @@ func commentsJSON(items []repo.Comment, placementVersionID string, placementHTML
 	}
 	out := make([]commentResponse, 0, len(roots))
 	for _, cm := range roots {
-		out = append(out, commentJSON(cm, placementVersionID, haystack, viewer))
+		out = append(out, commentJSON(cm, placementVersionID, doc, viewer))
 	}
 	return out
 }
 
-// commentPlacement reports whether a comment's selected text still appears in
-// the given version, returning its placement status, a confidence score, and
-// the matched text. placementHTML is the already-stringified version body.
-func commentPlacement(cm repo.Comment, placementVersionID, placementHTML string) (status string, confidence float64, matched string) {
-	status = placementAttached
-	confidence = 1.0
-	matched = cm.SelectedText
-	if placementVersionID != cm.VersionID && len(placementHTML) > 0 && !strings.Contains(placementHTML, cm.SelectedText) {
-		status = placementOrphaned
-		confidence = 0
-		matched = ""
+// commentPlacement reports whether a comment's selected text or point can
+// still be placed on the given version, returning its placement status, a confidence
+// score, and the matched text. doc is the version body, or nil when unknown.
+// A point that is not placed has moved when it has a page spot to show at.
+func commentPlacement(cm repo.Comment, placementVersionID string, doc *placementDoc) (status string, confidence float64, matched string) {
+	if placementVersionID == cm.VersionID || doc == nil || placedOn(cm, doc) {
+		return placementAttached, 1.0, cm.SelectedText
 	}
-	return
+	if p := cm.Anchor.Point; p != nil && p.ViewportW != nil {
+		return placementMoved, 0, ""
+	}
+	return placementOrphaned, 0, ""
 }
 
 func userJSON(p auth.Principal) userResponse {
@@ -140,13 +140,13 @@ func principalJSON(p auth.Principal) principalResponse {
 	return principalResponse{Type: p.Type, ID: p.ID, Email: p.Email, Name: p.Name, PictureURL: p.PictureURL}
 }
 
-func commentJSON(cm repo.Comment, placementVersionID, placementHTML string, viewer auth.Principal) commentResponse {
+func commentJSON(cm repo.Comment, placementVersionID string, doc *placementDoc, viewer auth.Principal) commentResponse {
 	out := commentBaseJSON(cm, viewer)
 	if cm.ParentCommentID == "" {
 		if placementVersionID == "" {
 			placementVersionID = cm.VersionID
 		}
-		status, confidence, matched := commentPlacement(cm, placementVersionID, placementHTML)
+		status, confidence, matched := commentPlacement(cm, placementVersionID, doc)
 		out.CurrentPlacement = &commentPlacementResponse{
 			VersionID:   placementVersionID,
 			Status:      status,
@@ -176,7 +176,7 @@ func commentBaseJSON(cm repo.Comment, viewer auth.Principal) commentResponse {
 		Mentions:           commentMentionsJSON(cm.Mentions),
 		Reactions:          commentReactionsJSON(cm.Reactions, viewer),
 	}
-	if cm.SelectedText != "" {
+	if cm.SelectedText != "" || cm.Anchor.Point != nil {
 		out.SelectedText = cm.SelectedText
 		anchor := cm.Anchor
 		out.Anchor = &anchor
